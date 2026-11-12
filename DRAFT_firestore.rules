@@ -1,0 +1,328 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net (Default-Deny Catch-All)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Reusable Hardened Global Helpers
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isWorkspaceOwner(userId) {
+      return isOwner(userId) &&
+        exists(/databases/$(database)/documents/workspaces/$(userId)) &&
+        get(/databases/$(database)/documents/workspaces/$(userId)).data.ownerId == request.auth.uid;
+    }
+
+    // 3. Entity Validation Blueprints (Anti-Update-Gap)
+    function isValidWorkspace(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'managerName',
+          'managerRole',
+          'sectorName',
+          'hospitalName',
+          'onboardingCompleted',
+          'pushEnabled',
+          'pushTime',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerId',
+          'managerName',
+          'managerRole',
+          'sectorName',
+          'hospitalName',
+          'onboardingCompleted',
+          'pushEnabled',
+          'pushTime',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.managerName is string && data.managerName.size() >= 1 && data.managerName.size() <= 120 &&
+        data.managerRole is string && data.managerRole.size() >= 1 && data.managerRole.size() <= 100 &&
+        data.sectorName is string && data.sectorName.size() >= 1 && data.sectorName.size() <= 100 &&
+        data.hospitalName is string && data.hospitalName.size() >= 1 && data.hospitalName.size() <= 150 &&
+        data.onboardingCompleted is bool &&
+        data.pushEnabled is bool &&
+        data.pushTime is string && data.pushTime.size() >= 4 && data.pushTime.size() <= 10 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidHospitalUnit(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'name',
+          'shiftMode',
+          'minStaffDay',
+          'minStaffNight',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerId',
+          'name',
+          'shiftMode',
+          'minStaffDay',
+          'minStaffNight',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 100 &&
+        data.shiftMode is string && data.shiftMode.size() >= 2 && data.shiftMode.size() <= 20 &&
+        (data.shiftMode == '24H' || data.shiftMode == 'DIURNO' || data.shiftMode == 'NOTURNO') &&
+        data.minStaffDay is int && data.minStaffDay >= 0 && data.minStaffDay <= 500 &&
+        data.minStaffNight is int && data.minStaffNight >= 0 && data.minStaffNight <= 500 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidEmployee(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'name',
+          'role',
+          'registrationId',
+          'unitId',
+          'defaultShift',
+          'workHours',
+          'regime',
+          'active',
+          'phone',
+          'preferredOffDay',
+          'hourBankBalance',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerId',
+          'name',
+          'role',
+          'registrationId',
+          'unitId',
+          'defaultShift',
+          'workHours',
+          'regime',
+          'active',
+          'phone',
+          'preferredOffDay',
+          'hourBankBalance',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 140 &&
+        data.role is string && data.role.size() >= 1 && data.role.size() <= 100 &&
+        data.registrationId is string && data.registrationId.size() <= 60 &&
+        isValidId(data.unitId) &&
+        data.defaultShift is string && data.defaultShift.size() >= 5 && data.defaultShift.size() <= 20 &&
+        (data.defaultShift == 'Diurno' || data.defaultShift == 'Noturno') &&
+        data.workHours is string && data.workHours.size() >= 1 && data.workHours.size() <= 40 &&
+        data.regime is string && data.regime.size() >= 1 && data.regime.size() <= 40 &&
+        data.active is bool &&
+        data.phone is string && data.phone.size() <= 40 &&
+        data.preferredOffDay is int && data.preferredOffDay >= 0 && data.preferredOffDay <= 6 &&
+        data.hourBankBalance is number && data.hourBankBalance >= -10000 && data.hourBankBalance <= 10000 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAbsenceRecord(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'employeeId',
+          'type',
+          'startDate',
+          'endDate',
+          'daysCount',
+          'nextShiftDate',
+          'reason',
+          'cid',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerId',
+          'employeeId',
+          'type',
+          'startDate',
+          'endDate',
+          'daysCount',
+          'nextShiftDate',
+          'reason',
+          'cid',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        isValidId(data.employeeId) &&
+        data.type is string && data.type.size() >= 4 && data.type.size() <= 30 &&
+        (data.type == 'FALTA' || data.type == 'ATESTADO' || data.type == 'DECLARACAO_HORAS' || data.type == 'FERIAS' || data.type == 'PERMUTA' || data.type == 'BANCO_HORAS') &&
+        data.startDate is string && data.startDate.size() >= 8 && data.startDate.size() <= 20 &&
+        data.endDate is string && data.endDate.size() >= 8 && data.endDate.size() <= 20 &&
+        data.daysCount is int && data.daysCount >= 1 && data.daysCount <= 365 &&
+        data.nextShiftDate is string && data.nextShiftDate.size() <= 20 &&
+        data.reason is string && data.reason.size() >= 1 && data.reason.size() <= 500 &&
+        data.cid is string && data.cid.size() <= 30 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidScheduleCellDoc(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'yearMonth',
+          'employeeId',
+          'day',
+          'status',
+          'note',
+          'extraHours',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerId',
+          'yearMonth',
+          'employeeId',
+          'day',
+          'status',
+          'note',
+          'extraHours',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.yearMonth is string && data.yearMonth.size() >= 7 && data.yearMonth.size() <= 10 &&
+        isValidId(data.employeeId) &&
+        data.day is int && data.day >= 1 && data.day <= 31 &&
+        data.status is string && data.status.size() >= 1 && data.status.size() <= 5 &&
+        (data.status == 'D' || data.status == 'N' || data.status == 'F' || data.status == 'AT' || data.status == 'FA' || data.status == 'FE' || data.status == 'TR') &&
+        data.note is string && data.note.size() <= 300 &&
+        data.extraHours is number && data.extraHours >= -24 && data.extraHours <= 24 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // 4. Collection Match Blocks
+    match /workspaces/{userId} {
+      allow get: if isOwner(userId) && isValidId(userId) && existing().ownerId == request.auth.uid;
+      allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+      allow create: if isOwner(userId) && isValidId(userId) && isValidWorkspace(incoming()) && incoming().createdAt == request.time && incoming().updatedAt == request.time;
+      allow update: if isValidWorkspace(incoming()) && isOwner(userId) && isValidId(userId) && existing().ownerId == request.auth.uid && incoming().ownerId == existing().ownerId && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && (
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'managerName',
+          'managerRole',
+          'sectorName',
+          'hospitalName',
+          'onboardingCompleted',
+          'pushEnabled',
+          'pushTime',
+          'updatedAt'
+        ])
+      );
+      allow delete: if isOwner(userId) && isValidId(userId) && existing().ownerId == request.auth.uid;
+
+      match /units/{unitId} {
+        allow get: if isValidId(userId) && isValidId(unitId) && isWorkspaceOwner(userId) && existing().ownerId == request.auth.uid;
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(unitId) && isValidHospitalUnit(incoming()) && incoming().createdAt == request.time && incoming().updatedAt == request.time && isWorkspaceOwner(userId);
+        allow update: if isValidHospitalUnit(incoming()) && isValidId(userId) && isValidId(unitId) && existing().ownerId == request.auth.uid && incoming().ownerId == existing().ownerId && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && isWorkspaceOwner(userId) && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name',
+            'shiftMode',
+            'minStaffDay',
+            'minStaffNight',
+            'updatedAt'
+          ])
+        );
+        allow delete: if isValidId(userId) && isValidId(unitId) && isWorkspaceOwner(userId) && existing().ownerId == request.auth.uid;
+      }
+
+      match /employees/{employeeId} {
+        allow get: if isValidId(userId) && isValidId(employeeId) && isWorkspaceOwner(userId) && existing().ownerId == request.auth.uid;
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(employeeId) && isValidEmployee(incoming()) && incoming().createdAt == request.time && incoming().updatedAt == request.time && isWorkspaceOwner(userId) && exists(/databases/$(database)/documents/workspaces/$(userId)/units/$(incoming().unitId));
+        allow update: if isValidEmployee(incoming()) && isValidId(userId) && isValidId(employeeId) && existing().ownerId == request.auth.uid && incoming().ownerId == existing().ownerId && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && isWorkspaceOwner(userId) && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name',
+            'role',
+            'registrationId',
+            'unitId',
+            'defaultShift',
+            'workHours',
+            'regime',
+            'active',
+            'phone',
+            'preferredOffDay',
+            'hourBankBalance',
+            'updatedAt'
+          ])
+        );
+        allow delete: if isValidId(userId) && isValidId(employeeId) && isWorkspaceOwner(userId) && existing().ownerId == request.auth.uid;
+      }
+
+      match /absences/{absenceId} {
+        allow get: if isValidId(userId) && isValidId(absenceId) && isWorkspaceOwner(userId) && existing().ownerId == request.auth.uid;
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(absenceId) && isValidAbsenceRecord(incoming()) && incoming().createdAt == request.time && incoming().updatedAt == request.time && isWorkspaceOwner(userId) && exists(/databases/$(database)/documents/workspaces/$(userId)/employees/$(incoming().employeeId));
+        allow update: if isValidAbsenceRecord(incoming()) && isValidId(userId) && isValidId(absenceId) && existing().ownerId == request.auth.uid && incoming().ownerId == existing().ownerId && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && isWorkspaceOwner(userId) && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'type',
+            'startDate',
+            'endDate',
+            'daysCount',
+            'nextShiftDate',
+            'reason',
+            'cid',
+            'updatedAt'
+          ])
+        );
+        allow delete: if isValidId(userId) && isValidId(absenceId) && isWorkspaceOwner(userId) && existing().ownerId == request.auth.uid;
+      }
+
+      match /scheduleCells/{cellId} {
+        allow get: if isValidId(userId) && isValidId(cellId) && isWorkspaceOwner(userId) && existing().ownerId == request.auth.uid;
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(cellId) && isValidScheduleCellDoc(incoming()) && incoming().createdAt == request.time && incoming().updatedAt == request.time && isWorkspaceOwner(userId) && exists(/databases/$(database)/documents/workspaces/$(userId)/employees/$(incoming().employeeId));
+        allow update: if isValidScheduleCellDoc(incoming()) && isValidId(userId) && isValidId(cellId) && existing().ownerId == request.auth.uid && incoming().ownerId == existing().ownerId && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && isWorkspaceOwner(userId) && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'status',
+            'note',
+            'extraHours',
+            'updatedAt'
+          ])
+        );
+        allow delete: if isValidId(userId) && isValidId(cellId) && isWorkspaceOwner(userId) && existing().ownerId == request.auth.uid;
+      }
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "EscalaPro — Gestão Inteligente de Escalas Hospitalares",
+  "description": "Sistema SaaS e PWA híbrido para gestão inteligente de escalas hospitalares, controle de plantões, atestados, banco de horas e leitura automática de escalas em PDF.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

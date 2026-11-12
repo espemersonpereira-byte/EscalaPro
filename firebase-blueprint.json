@@ -1,0 +1,410 @@
+{
+  "entities": {
+    "Workspace": {
+      "title": "Workspace",
+      "description": "Configuração principal do gestor hospitalar no EscalaPro.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "UID do usuário proprietário no Firebase Auth.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "managerName": {
+          "type": "string",
+          "description": "Nome do gestor ou coordenador de escala.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "managerRole": {
+          "type": "string",
+          "description": "Cargo do gestor hospitalar.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "sectorName": {
+          "type": "string",
+          "description": "Nome do setor principal gerenciado.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "hospitalName": {
+          "type": "string",
+          "description": "Nome da instituição ou hospital.",
+          "minLength": 1,
+          "maxLength": 150
+        },
+        "onboardingCompleted": {
+          "type": "boolean",
+          "description": "Indica se o gestor já concluiu a configuração inicial."
+        },
+        "pushEnabled": {
+          "type": "boolean",
+          "description": "Indica se os alertas push diários estão ativos."
+        },
+        "pushTime": {
+          "type": "string",
+          "description": "Horário do resumo diário no formato HH:MM.",
+          "minLength": 4,
+          "maxLength": 10
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp de criação no servidor."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp da última atualização no servidor."
+        }
+      },
+      "required": [
+        "ownerId",
+        "managerName",
+        "managerRole",
+        "sectorName",
+        "hospitalName",
+        "onboardingCompleted",
+        "pushEnabled",
+        "pushTime",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "HospitalUnit": {
+      "title": "HospitalUnit",
+      "description": "Unidade ou sub-setor hospitalar gerenciado pelo usuário.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "UID do usuário proprietário.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Nome da unidade hospitalar (ex: UTI Adulto).",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "shiftMode": {
+          "type": "string",
+          "description": "Modo de funcionamento da unidade.",
+          "enum": ["24H", "DIURNO", "NOTURNO"],
+          "minLength": 2,
+          "maxLength": 20
+        },
+        "minStaffDay": {
+          "type": "number",
+          "description": "Lotação mínima para o plantão diurno."
+        },
+        "minStaffNight": {
+          "type": "number",
+          "description": "Lotação mínima para o plantão noturno."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp de criação."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp de atualização."
+        }
+      },
+      "required": [
+        "ownerId",
+        "name",
+        "shiftMode",
+        "minStaffDay",
+        "minStaffNight",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Employee": {
+      "title": "Employee",
+      "description": "Colaborador ou profissional da equipe hospitalar.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "UID do usuário proprietário.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Nome completo do profissional.",
+          "minLength": 1,
+          "maxLength": 140
+        },
+        "role": {
+          "type": "string",
+          "description": "Cargo ou função no hospital.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "registrationId": {
+          "type": "string",
+          "description": "Registro profissional (COREN, CRM, Matrícula).",
+          "minLength": 0,
+          "maxLength": 60
+        },
+        "unitId": {
+          "type": "string",
+          "description": "ID da unidade hospitalar de lotação.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "defaultShift": {
+          "type": "string",
+          "description": "Turno padrão (Diurno ou Noturno).",
+          "enum": ["Diurno", "Noturno"],
+          "minLength": 5,
+          "maxLength": 20
+        },
+        "workHours": {
+          "type": "string",
+          "description": "Horário contratual de trabalho.",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "regime": {
+          "type": "string",
+          "description": "Regime de escala do colaborador.",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "active": {
+          "type": "boolean",
+          "description": "Indica se o colaborador está ativo."
+        },
+        "phone": {
+          "type": "string",
+          "description": "Telefone ou WhatsApp de contato.",
+          "minLength": 0,
+          "maxLength": 40
+        },
+        "preferredOffDay": {
+          "type": "number",
+          "description": "Dia da semana preferencial de folga (0 a 6)."
+        },
+        "hourBankBalance": {
+          "type": "number",
+          "description": "Saldo acumulado no banco de horas."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp de criação."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp de atualização."
+        }
+      },
+      "required": [
+        "ownerId",
+        "name",
+        "role",
+        "registrationId",
+        "unitId",
+        "defaultShift",
+        "workHours",
+        "regime",
+        "active",
+        "phone",
+        "preferredOffDay",
+        "hourBankBalance",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AbsenceRecord": {
+      "title": "AbsenceRecord",
+      "description": "Registro de atestado médico, declaração de horas, falta ou férias.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "UID do usuário proprietário.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "employeeId": {
+          "type": "string",
+          "description": "ID do colaborador associado.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "type": {
+          "type": "string",
+          "description": "Tipo da ocorrência.",
+          "enum": ["FALTA", "ATESTADO", "DECLARACAO_HORAS", "FERIAS", "PERMUTA", "BANCO_HORAS"],
+          "minLength": 4,
+          "maxLength": 30
+        },
+        "startDate": {
+          "type": "string",
+          "description": "Data inicial YYYY-MM-DD.",
+          "minLength": 8,
+          "maxLength": 20
+        },
+        "endDate": {
+          "type": "string",
+          "description": "Data final YYYY-MM-DD.",
+          "minLength": 8,
+          "maxLength": 20
+        },
+        "daysCount": {
+          "type": "number",
+          "description": "Quantidade de dias de afastamento."
+        },
+        "nextShiftDate": {
+          "type": "string",
+          "description": "Data calculada do próximo plantão YYYY-MM-DD.",
+          "minLength": 0,
+          "maxLength": 20
+        },
+        "reason": {
+          "type": "string",
+          "description": "Observação ou justificativa da ocorrência.",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "cid": {
+          "type": "string",
+          "description": "Código CID opcional.",
+          "minLength": 0,
+          "maxLength": 30
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp de criação."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp de atualização."
+        }
+      },
+      "required": [
+        "ownerId",
+        "employeeId",
+        "type",
+        "startDate",
+        "endDate",
+        "daysCount",
+        "nextShiftDate",
+        "reason",
+        "cid",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ScheduleCellDoc": {
+      "title": "ScheduleCellDoc",
+      "description": "Célula customizada na grade mensal de escala.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "UID do usuário proprietário.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "yearMonth": {
+          "type": "string",
+          "description": "Ano e mês no formato YYYY-MM.",
+          "minLength": 7,
+          "maxLength": 10
+        },
+        "employeeId": {
+          "type": "string",
+          "description": "ID do colaborador.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "day": {
+          "type": "number",
+          "description": "Dia do mês (1 a 31)."
+        },
+        "status": {
+          "type": "string",
+          "description": "Código do plantão (D, N, F, AT, FA, FE, TR).",
+          "enum": ["D", "N", "F", "AT", "FA", "FE", "TR"],
+          "minLength": 1,
+          "maxLength": 5
+        },
+        "note": {
+          "type": "string",
+          "description": "Nota opcional do plantão.",
+          "minLength": 0,
+          "maxLength": 300
+        },
+        "extraHours": {
+          "type": "number",
+          "description": "Horas extras ou banco de horas no dia."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp de criação."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp de atualização."
+        }
+      },
+      "required": [
+        "ownerId",
+        "yearMonth",
+        "employeeId",
+        "day",
+        "status",
+        "note",
+        "extraHours",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/workspaces/{userId}": {
+      "schema": { "$ref": "#/entities/Workspace" },
+      "description": "Documento principal do espaço de trabalho de cada usuário autenticado."
+    },
+    "/workspaces/{userId}/units/{unitId}": {
+      "schema": { "$ref": "#/entities/HospitalUnit" },
+      "description": "Unidades hospitalares pertencentes ao espaço de trabalho do usuário."
+    },
+    "/workspaces/{userId}/employees/{employeeId}": {
+      "schema": { "$ref": "#/entities/Employee" },
+      "description": "Colaboradores cadastrados no espaço de trabalho do usuário."
+    },
+    "/workspaces/{userId}/absences/{absenceId}": {
+      "schema": { "$ref": "#/entities/AbsenceRecord" },
+      "description": "Registros de atestados, faltas, horas e férias dos colaboradores."
+    },
+    "/workspaces/{userId}/scheduleCells/{cellId}": {
+      "schema": { "$ref": "#/entities/ScheduleCellDoc" },
+      "description": "Alterações e registros de células na escala mensal."
+    }
+  }
+}
