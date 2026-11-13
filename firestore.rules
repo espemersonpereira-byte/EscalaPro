@@ -216,6 +216,7 @@ service cloud.firestore {
           'status',
           'note',
           'extraHours',
+          'unitOverrideId',
           'createdAt',
           'updatedAt'
         ]) &&
@@ -228,6 +229,7 @@ service cloud.firestore {
         (data.status == 'D' || data.status == 'N' || data.status == 'F' || data.status == 'AT' || data.status == 'FA' || data.status == 'FE' || data.status == 'TR') &&
         data.note is string && data.note.size() <= 300 &&
         data.extraHours is number && data.extraHours >= -24 && data.extraHours <= 24 &&
+        (!('unitOverrideId' in data) || (data.unitOverrideId is string && data.unitOverrideId.size() <= 128 && (data.unitOverrideId == '' || isValidId(data.unitOverrideId)))) &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
@@ -318,6 +320,7 @@ service cloud.firestore {
             'status',
             'note',
             'extraHours',
+            'unitOverrideId',
             'updatedAt'
           ])
         );

@@ -337,10 +337,12 @@ export async function loadWorkspaceFromFirestore(userId: string): Promise<Escala
       if (!ym || !empId) return;
       if (!schedules[ym]) schedules[ym] = {};
       if (!schedules[ym][empId]) schedules[ym][empId] = {};
+      const rawUnitOverride = d.unitOverrideId ? String(d.unitOverrideId).trim() : '';
       const cell: ScheduleCellData = {
         status: (d.status as ShiftStatus) || 'D',
         note: d.note ? String(d.note) : undefined,
         extraHours: d.extraHours ? Number(d.extraHours) : undefined,
+        unitOverrideId: rawUnitOverride.length > 0 ? rawUnitOverride : undefined,
       };
       schedules[ym][empId][dayNum] = cell;
     });
@@ -541,7 +543,8 @@ export async function syncWorkspaceToFirestore(userId: string, state: EscalaProS
           cell.status === 'FE' ||
           cell.status === 'TR' ||
           cell.note ||
-          cell.extraHours
+          cell.extraHours ||
+          cell.unitOverrideId !== undefined
         ) {
           const cellId = sanitizeId(`${ymKey}_${empId}_${dayNum}`);
           const cellRef = doc(db, 'workspaces', safeUid, 'scheduleCells', cellId);
@@ -553,6 +556,11 @@ export async function syncWorkspaceToFirestore(userId: string, state: EscalaProS
             handleFirestoreError(error, OperationType.GET, cellPath);
           }
 
+          const cleanUnitOverride =
+            cell.unitOverrideId && cell.unitOverrideId.trim().length > 0
+              ? sanitizeId(cell.unitOverrideId)
+              : '';
+
           const cellPayload = {
             ownerId: safeUid,
             yearMonth: clampString(ymKey, 7, 10, '2026-11'),
@@ -561,6 +569,7 @@ export async function syncWorkspaceToFirestore(userId: string, state: EscalaProS
             status: cell.status,
             note: clampString(cell.note || '', 0, 300, ''),
             extraHours: Math.max(-24, Math.min(24, Number(cell.extraHours) || 0)),
+            unitOverrideId: cleanUnitOverride,
             createdAt: existingCell?.exists() ? existingCell.data().createdAt : serverTimestamp(),
             updatedAt: serverTimestamp(),
           };

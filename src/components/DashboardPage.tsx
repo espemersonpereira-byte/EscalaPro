@@ -1,9 +1,11 @@
 import React, { useMemo, useState } from 'react';
 import {
+  AbsenceRecord,
   Employee,
   EscalaProState,
   HospitalUnit,
   NavigationContext,
+  ScheduleCellData,
   SHIFT_STATUS_META,
   ShiftStatus,
 } from '../types';
@@ -16,6 +18,7 @@ import {
 } from '../services/storageService';
 import {
   AlertTriangle,
+  ArrowLeftRight,
   Building2,
   Calendar,
   CheckCircle2,
@@ -24,10 +27,12 @@ import {
   Clock,
   FileWarning,
   Moon,
+  RotateCcw,
   Sun,
   UserCheck,
   Users,
   UserX,
+  X,
 } from 'lucide-react';
 
 interface DashboardPageProps {
@@ -38,6 +43,19 @@ interface DashboardPageProps {
     employeeId?: string | null,
     initialType?: 'ATESTADO' | 'DECLARACAO_HORAS' | 'FALTA' | 'FERIAS'
   ) => void;
+  onUpdateScheduleCell?: (
+    year: number,
+    monthIndex0: number,
+    employeeId: string,
+    day: number,
+    cellData: ScheduleCellData,
+    extraOptions?: {
+      swapPartnerId?: string;
+      swapReturnDate?: string;
+      extraHoursDelta?: number;
+      historyRecord?: AbsenceRecord;
+    }
+  ) => void;
 }
 
 export const DashboardPage: React.FC<DashboardPageProps> = ({
@@ -45,6 +63,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   onNavigate,
   onOpenEmployeeModal,
   onOpenQuickLeaveWizard,
+  onUpdateScheduleCell,
 }) => {
   const now = new Date();
   const todayIso = formatIsoDate(now.getFullYear(), now.getMonth(), now.getDate());
@@ -57,9 +76,17 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
   const [selectedDateIso, setSelectedDateIso] = useState<string>(todayIso);
   const [expandedOffUnits, setExpandedOffUnits] = useState<Record<string, boolean>>({});
+  const [redirectModal, setRedirectModal] = useState<{
+    employeeId: string;
+    targetUnitId: string;
+    shiftStatus: ShiftStatus;
+    note: string;
+  } | null>(null);
+  const [redirectToast, setRedirectToast] = useState<string | null>(null);
 
   const { year, monthIndex0, day } = parseIsoDateParts(selectedDateIso);
   const ymKey = getYearMonthKey(year, monthIndex0);
+  const shortSelectedDate = `${String(day).padStart(2, '0')}/${String(monthIndex0 + 1).padStart(2, '0')}`;
 
   // Obtém o status efetivo de um colaborador na data selecionada
   const getEmployeeStatusOnDate = (emp: Employee, y: number, m0: number, d: number): ShiftStatus => {
@@ -67,6 +94,20 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     const saved = state.schedules[k]?.[emp.id]?.[d]?.status;
     if (saved) return saved;
     return computeRegimeShiftForDay(emp, y, m0, d);
+  };
+
+  // Obtém a unidade efetiva de um colaborador somente na data selecionada (respeitando direcionamento pontual)
+  const getEmployeeUnitOnDate = (emp: Employee, y: number, m0: number, d: number): string => {
+    const k = getYearMonthKey(y, m0);
+    const overrideId = state.schedules[k]?.[emp.id]?.[d]?.unitOverrideId;
+    if (overrideId && state.units.some((u) => u.id === overrideId)) {
+      return overrideId;
+    }
+    return emp.unitId;
+  };
+
+  const getUnitName = (unitId: string): string => {
+    return state.units.find((u) => u.id === unitId)?.name || 'Setor';
   };
 
   // Cálculo dos KPIs do mês e do dia selecionado
@@ -97,10 +138,12 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       }
     }
 
-    // Verifica postos descobertos no dia selecionado
+    // Verifica postos descobertos no dia selecionado (considerando direcionamento pontual de setor)
     let uncoveredUnitsCount = 0;
     for (const unit of state.units) {
-      const unitEmployees = activeEmployees.filter((e) => e.unitId === unit.id);
+      const unitEmployees = activeEmployees.filter(
+        (e) => getEmployeeUnitOnDate(e, year, monthIndex0, day) === unit.id
+      );
       const dayStaff = unitEmployees.filter((e) => {
         const s = getEmployeeStatusOnDate(e, year, monthIndex0, day);
         return s === 'D' || (s === 'TR' && e.defaultShift === 'Diurno');
@@ -147,6 +190,93 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       .slice(0, 2)
       .map((n) => n[0]?.toUpperCase())
       .join('');
+  };
+
+  const openRedirectModal = (emp?: Employee) => {
+    const activeEmployees = state.employees.filter((e) => e.active);
+    const chosen =
+      emp ||
+      activeEmployees.find((e) => {
+        const st = getEmployeeStatusOnDate(e, year, monthIndex0, day);
+        return st === 'D' || st === 'N' || st === 'TR';
+      }) ||
+      activeEmployees[0];
+
+    if (!chosen) return;
+    const currentUnitId = getEmployeeUnitOnDate(chosen, year, monthIndex0, day);
+    const currentStatus = getEmployeeStatusOnDate(chosen, year, monthIndex0, day);
+    const savedCell = state.schedules[ymKey]?.[chosen.id]?.[day];
+    setRedirectModal({
+      employeeId: chosen.id,
+      targetUnitId: currentUnitId,
+      shiftStatus: currentStatus,
+      note: savedCell?.note || '',
+    });
+  };
+
+  const handleSelectRedirectEmployee = (newEmpId: string) => {
+    const chosen = state.employees.find((e) => e.id === newEmpId);
+    if (!chosen) return;
+    const currentUnitId = getEmployeeUnitOnDate(chosen, year, monthIndex0, day);
+    const currentStatus = getEmployeeStatusOnDate(chosen, year, monthIndex0, day);
+    const savedCell = state.schedules[ymKey]?.[chosen.id]?.[day];
+    setRedirectModal({
+      employeeId: chosen.id,
+      targetUnitId: currentUnitId,
+      shiftStatus: currentStatus,
+      note: savedCell?.note || '',
+    });
+  };
+
+  const handleSaveRedirectForDay = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!redirectModal || !onUpdateScheduleCell) return;
+    const targetEmp = state.employees.find((emp) => emp.id === redirectModal.employeeId);
+    if (!targetEmp) return;
+
+    const existingCell = state.schedules[ymKey]?.[targetEmp.id]?.[day];
+    const isBackToOriginal = redirectModal.targetUnitId === targetEmp.unitId;
+    const targetUnitName = getUnitName(redirectModal.targetUnitId);
+    const originalUnitName = getUnitName(targetEmp.unitId);
+
+    const updatedCell: ScheduleCellData = {
+      ...(existingCell || {}),
+      status: redirectModal.shiftStatus,
+      unitOverrideId: isBackToOriginal ? '' : redirectModal.targetUnitId,
+      note: redirectModal.note.trim()
+        ? redirectModal.note.trim()
+        : isBackToOriginal
+        ? existingCell?.note
+        : `Direcionado para ${targetUnitName} apenas em ${shortSelectedDate}`,
+    };
+
+    onUpdateScheduleCell(year, monthIndex0, targetEmp.id, day, updatedCell);
+    setRedirectModal(null);
+    setRedirectToast(
+      isBackToOriginal
+        ? `${targetEmp.name} retornou para ${originalUnitName} no dia ${shortSelectedDate}.`
+        : `${targetEmp.name} direcionado(a) para ${targetUnitName} apenas em ${shortSelectedDate}. Os outros dias permanecem em ${originalUnitName}.`
+    );
+    window.setTimeout(() => setRedirectToast(null), 5000);
+  };
+
+  const handleRestoreOriginalUnitForDay = () => {
+    if (!redirectModal || !onUpdateScheduleCell) return;
+    const targetEmp = state.employees.find((emp) => emp.id === redirectModal.employeeId);
+    if (!targetEmp) return;
+
+    const existingCell = state.schedules[ymKey]?.[targetEmp.id]?.[day];
+    onUpdateScheduleCell(year, monthIndex0, targetEmp.id, day, {
+      ...(existingCell || {}),
+      status: redirectModal.shiftStatus,
+      unitOverrideId: '',
+      note: undefined,
+    });
+    setRedirectModal(null);
+    setRedirectToast(
+      `${targetEmp.name} restaurado(a) para ${getUnitName(targetEmp.unitId)} no dia ${shortSelectedDate}.`
+    );
+    window.setTimeout(() => setRedirectToast(null), 4500);
   };
 
   return (
@@ -383,21 +513,40 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
       {/* Blocos Separados por Unidade / Sub-setor */}
       <section className="space-y-4">
-        <div className="flex items-center justify-between">
+        {redirectToast && (
+          <div className="p-3.5 rounded-2xl bg-teal-50 border border-teal-200 text-teal-900 text-xs font-semibold flex items-center gap-2.5">
+            <CheckCircle2 className="w-4 h-4 text-teal-600 shrink-0" />
+            <span>{redirectToast}</span>
+          </div>
+        )}
+
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="text-lg font-bold text-slate-900">
               Quem Está de Plantão por Unidade
             </h2>
             <p className="text-xs text-slate-500">
-              Toque na unidade para filtrar a escala ou no nome do profissional para abrir o prontuário
+              Toque no profissional para ver o prontuário ou em <strong>Setor</strong> para direcioná-lo apenas no dia {shortSelectedDate}
             </p>
           </div>
+          {onUpdateScheduleCell &&
+            state.units.length > 1 &&
+            state.employees.some((e) => e.active) && (
+              <button
+                type="button"
+                onClick={() => openRedirectModal()}
+                className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold transition-colors cursor-pointer shrink-0"
+              >
+                <ArrowLeftRight className="w-3.5 h-3.5 text-teal-400" />
+                <span>Direcionar Setor ({shortSelectedDate})</span>
+              </button>
+            )}
         </div>
 
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
           {state.units.map((unit: HospitalUnit) => {
             const unitEmployees = state.employees.filter(
-              (e) => e.active && e.unitId === unit.id
+              (e) => e.active && getEmployeeUnitOnDate(e, year, monthIndex0, day) === unit.id
             );
 
             const dayShiftTeam = unitEmployees.filter((e) => {
@@ -536,14 +685,22 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                           <div className="space-y-2">
                             {dayShiftTeam.map((emp) => {
                               const cell = state.schedules[ymKey]?.[emp.id]?.[day];
+                              const effectiveUnitId = getEmployeeUnitOnDate(emp, year, monthIndex0, day);
+                              const isRedirectedToday = effectiveUnitId !== emp.unitId;
                               return (
-                                <button
+                                <div
                                   key={emp.id}
-                                  type="button"
-                                  onClick={() => onOpenEmployeeModal(emp.id)}
-                                  className="w-full text-left p-2.5 rounded-xl border border-slate-200 hover:border-teal-600 hover:bg-teal-50/30 transition-colors flex items-center justify-between gap-2 cursor-pointer"
+                                  className={`w-full p-2.5 rounded-xl border transition-colors flex items-center justify-between gap-2 ${
+                                    isRedirectedToday
+                                      ? 'border-cyan-300 bg-cyan-50/40'
+                                      : 'border-slate-200 hover:border-teal-600 hover:bg-teal-50/30'
+                                  }`}
                                 >
-                                  <div className="flex items-center gap-2.5 min-w-0">
+                                  <button
+                                    type="button"
+                                    onClick={() => onOpenEmployeeModal(emp.id)}
+                                    className="flex items-center gap-2.5 min-w-0 flex-1 text-left cursor-pointer"
+                                  >
                                     <div className="w-8 h-8 rounded-full bg-teal-600 text-white text-xs font-bold flex items-center justify-center shrink-0">
                                       {getInitials(emp.name)}
                                     </div>
@@ -554,14 +711,32 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                                       <p className="text-[11px] text-slate-500 truncate">
                                         {emp.role} · {emp.workHours}
                                       </p>
+                                      {isRedirectedToday && (
+                                        <p className="text-[10px] font-bold text-cyan-800 truncate mt-0.5">
+                                          Só em {shortSelectedDate} · origem: {getUnitName(emp.unitId)}
+                                        </p>
+                                      )}
                                     </div>
+                                  </button>
+                                  <div className="flex items-center gap-1.5 shrink-0">
+                                    {cell?.status === 'TR' && (
+                                      <span className="text-[10px] font-bold text-violet-700">
+                                        Permuta
+                                      </span>
+                                    )}
+                                    {onUpdateScheduleCell && state.units.length > 1 && (
+                                      <button
+                                        type="button"
+                                        onClick={() => openRedirectModal(emp)}
+                                        title={`Direcionar ${emp.name} para outro setor apenas em ${shortSelectedDate}`}
+                                        className="inline-flex items-center gap-1 px-2 py-1.5 rounded-lg bg-slate-100 hover:bg-teal-600 text-slate-700 hover:text-white border border-slate-200 hover:border-teal-600 text-[11px] font-bold transition-colors cursor-pointer"
+                                      >
+                                        <ArrowLeftRight className="w-3 h-3" />
+                                        <span>Setor</span>
+                                      </button>
+                                    )}
                                   </div>
-                                  {cell?.status === 'TR' && (
-                                    <span className="text-[10px] font-bold text-violet-700 shrink-0">
-                                      Permuta
-                                    </span>
-                                  )}
-                                </button>
+                                </div>
                               );
                             })}
                           </div>
@@ -604,14 +779,22 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                           <div className="space-y-2">
                             {nightShiftTeam.map((emp) => {
                               const cell = state.schedules[ymKey]?.[emp.id]?.[day];
+                              const effectiveUnitId = getEmployeeUnitOnDate(emp, year, monthIndex0, day);
+                              const isRedirectedToday = effectiveUnitId !== emp.unitId;
                               return (
-                                <button
+                                <div
                                   key={emp.id}
-                                  type="button"
-                                  onClick={() => onOpenEmployeeModal(emp.id)}
-                                  className="w-full text-left p-2.5 rounded-xl border border-slate-200 hover:border-indigo-600 hover:bg-indigo-50/30 transition-colors flex items-center justify-between gap-2 cursor-pointer"
+                                  className={`w-full p-2.5 rounded-xl border transition-colors flex items-center justify-between gap-2 ${
+                                    isRedirectedToday
+                                      ? 'border-cyan-300 bg-cyan-50/40'
+                                      : 'border-slate-200 hover:border-indigo-600 hover:bg-indigo-50/30'
+                                  }`}
                                 >
-                                  <div className="flex items-center gap-2.5 min-w-0">
+                                  <button
+                                    type="button"
+                                    onClick={() => onOpenEmployeeModal(emp.id)}
+                                    className="flex items-center gap-2.5 min-w-0 flex-1 text-left cursor-pointer"
+                                  >
                                     <div className="w-8 h-8 rounded-full bg-indigo-700 text-white text-xs font-bold flex items-center justify-center shrink-0">
                                       {getInitials(emp.name)}
                                     </div>
@@ -622,14 +805,32 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                                       <p className="text-[11px] text-slate-500 truncate">
                                         {emp.role} · {emp.workHours}
                                       </p>
+                                      {isRedirectedToday && (
+                                        <p className="text-[10px] font-bold text-cyan-800 truncate mt-0.5">
+                                          Só em {shortSelectedDate} · origem: {getUnitName(emp.unitId)}
+                                        </p>
+                                      )}
                                     </div>
+                                  </button>
+                                  <div className="flex items-center gap-1.5 shrink-0">
+                                    {cell?.status === 'TR' && (
+                                      <span className="text-[10px] font-bold text-violet-700">
+                                        Permuta
+                                      </span>
+                                    )}
+                                    {onUpdateScheduleCell && state.units.length > 1 && (
+                                      <button
+                                        type="button"
+                                        onClick={() => openRedirectModal(emp)}
+                                        title={`Direcionar ${emp.name} para outro setor apenas em ${shortSelectedDate}`}
+                                        className="inline-flex items-center gap-1 px-2 py-1.5 rounded-lg bg-slate-100 hover:bg-indigo-700 text-slate-700 hover:text-white border border-slate-200 hover:border-indigo-700 text-[11px] font-bold transition-colors cursor-pointer"
+                                      >
+                                        <ArrowLeftRight className="w-3 h-3" />
+                                        <span>Setor</span>
+                                      </button>
+                                    )}
                                   </div>
-                                  {cell?.status === 'TR' && (
-                                    <span className="text-[10px] font-bold text-violet-700 shrink-0">
-                                      Permuta
-                                    </span>
-                                  )}
-                                </button>
+                                </div>
                               );
                             })}
                           </div>
@@ -700,6 +901,214 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
           })}
         </div>
       </section>
+
+      {/* MODAL DE DIRECIONAMENTO PONTUAL DE SETOR (SOMENTE NA DATA SELECIONADA) */}
+      {redirectModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 no-print">
+          <div className="bg-white rounded-3xl max-w-lg w-full border border-slate-200 shadow-2xl overflow-hidden max-h-[90vh] flex flex-col">
+            <div className="bg-slate-900 text-white px-6 py-4 flex items-center justify-between shrink-0">
+              <div>
+                <p className="text-xs text-teal-400 font-bold uppercase tracking-wider">
+                  Direcionamento Pontual · Só {shortSelectedDate}
+                </p>
+                <h3 className="text-base font-bold text-white mt-0.5">
+                  Direcionar Colaborador para Outro Setor
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setRedirectModal(null)}
+                className="p-2 rounded-xl bg-slate-800 text-slate-300 hover:text-white cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveRedirectForDay} className="p-6 space-y-4 overflow-y-auto">
+              {(() => {
+                const selectedEmp = state.employees.find(
+                  (e) => e.id === redirectModal.employeeId
+                );
+                if (!selectedEmp) return null;
+                const currentEffectiveUnitId = getEmployeeUnitOnDate(
+                  selectedEmp,
+                  year,
+                  monthIndex0,
+                  day
+                );
+                const isAlreadyOverridden = currentEffectiveUnitId !== selectedEmp.unitId;
+
+                return (
+                  <>
+                    <div className="p-3.5 rounded-2xl bg-teal-50 border border-teal-200 text-xs text-teal-950 leading-relaxed">
+                      Esta mudança vale <strong>somente para {shortSelectedDate}</strong>. Todos os outros dias da escala de{' '}
+                      <strong>{selectedEmp.name}</strong> permanecem normalmente em{' '}
+                      <strong>{getUnitName(selectedEmp.unitId)}</strong>.
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">
+                        Colaborador
+                      </label>
+                      <select
+                        value={redirectModal.employeeId}
+                        onChange={(e) => handleSelectRedirectEmployee(e.target.value)}
+                        className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900 focus:outline-none focus:ring-2 focus:ring-teal-600"
+                      >
+                        {state.employees
+                          .filter((e) => e.active)
+                          .map((emp) => {
+                            const effUnit = getEmployeeUnitOnDate(emp, year, monthIndex0, day);
+                            const st = getEmployeeStatusOnDate(emp, year, monthIndex0, day);
+                            return (
+                              <option key={emp.id} value={emp.id}>
+                                {emp.name} · {getUnitName(effUnit)} ({SHIFT_STATUS_META[st].shortLabel})
+                              </option>
+                            );
+                          })}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-2">
+                        Setor de Destino em {shortSelectedDate}
+                      </label>
+                      <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
+                        {state.units.map((u) => {
+                          const isSelected = redirectModal.targetUnitId === u.id;
+                          const isOriginal = selectedEmp.unitId === u.id;
+                          const unitEmps = state.employees.filter(
+                            (e) => e.active && getEmployeeUnitOnDate(e, year, monthIndex0, day) === u.id
+                          );
+                          const scheduledInUnit = unitEmps.filter((e) => {
+                            const s = getEmployeeStatusOnDate(e, year, monthIndex0, day);
+                            return s === 'D' || s === 'N' || s === 'TR';
+                          }).length;
+                          const minTotal =
+                            (u.shiftMode !== 'NOTURNO' ? u.minStaffDay : 0) +
+                            (u.shiftMode !== 'DIURNO' ? u.minStaffNight : 0);
+                          const hasDeficit = scheduledInUnit < minTotal;
+
+                          return (
+                            <button
+                              key={u.id}
+                              type="button"
+                              onClick={() =>
+                                setRedirectModal((prev) =>
+                                  prev ? { ...prev, targetUnitId: u.id } : null
+                                )
+                              }
+                              className={`w-full p-3 rounded-xl border text-left flex items-center justify-between gap-2 transition-all cursor-pointer ${
+                                isSelected
+                                  ? 'border-teal-600 bg-teal-50/70 ring-2 ring-teal-600/20'
+                                  : 'border-slate-200 hover:bg-slate-50'
+                              }`}
+                            >
+                              <div className="min-w-0">
+                                <p className="text-xs font-bold text-slate-900 truncate">
+                                  {u.name}{' '}
+                                  {isOriginal && (
+                                    <span className="text-[10px] font-semibold text-slate-500">
+                                      (Setor original)
+                                    </span>
+                                  )}
+                                </p>
+                                <p className="text-[11px] text-slate-500 mt-0.5">
+                                  {scheduledInUnit}/{minTotal} escalados hoje
+                                </p>
+                              </div>
+                              <span
+                                className={`text-[10px] font-bold px-2 py-0.5 rounded shrink-0 ${
+                                  hasDeficit
+                                    ? 'bg-red-100 text-red-700'
+                                    : 'bg-emerald-100 text-emerald-700'
+                                }`}
+                              >
+                                {hasDeficit ? 'Precisa de reforço' : 'Completo'}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-xs font-bold text-slate-700 mb-1">
+                          Turno neste dia
+                        </label>
+                        <select
+                          value={redirectModal.shiftStatus}
+                          onChange={(e) =>
+                            setRedirectModal((prev) =>
+                              prev
+                                ? { ...prev, shiftStatus: e.target.value as ShiftStatus }
+                                : null
+                            )
+                          }
+                          className="w-full px-3 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900"
+                        >
+                          <option value="D">Plantão Diurno (D)</option>
+                          <option value="N">Plantão Noturno (N)</option>
+                          <option value="TR">Permuta (TR)</option>
+                          {redirectModal.shiftStatus === 'F' && (
+                            <option value="F">Folga (F)</option>
+                          )}
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-bold text-slate-700 mb-1">
+                          Observação (opcional)
+                        </label>
+                        <input
+                          type="text"
+                          value={redirectModal.note}
+                          onChange={(e) =>
+                            setRedirectModal((prev) =>
+                              prev ? { ...prev, note: e.target.value } : null
+                            )
+                          }
+                          placeholder="Ex: Cobertura de déficit"
+                          className="w-full px-3 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="pt-3 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2">
+                      {isAlreadyOverridden ? (
+                        <button
+                          type="button"
+                          onClick={handleRestoreOriginalUnitForDay}
+                          className="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold cursor-pointer"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                          <span>Restaurar setor original</span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setRedirectModal(null)}
+                          className="px-4 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold cursor-pointer"
+                        >
+                          Cancelar
+                        </button>
+                      )}
+
+                      <button
+                        type="submit"
+                        className="px-5 py-2.5 rounded-xl bg-[#0d9488] hover:bg-teal-700 text-white text-xs font-bold cursor-pointer shadow-xs"
+                      >
+                        Salvar apenas para {shortSelectedDate}
+                      </button>
+                    </div>
+                  </>
+                );
+              })()}
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

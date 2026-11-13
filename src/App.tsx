@@ -1051,6 +1051,7 @@ export default function App() {
               onNavigate={updateNav}
               onOpenEmployeeModal={(empId) => setModalEmployeeTarget(empId)}
               onOpenQuickLeaveWizard={handleOpenQuickLeaveWizard}
+              onUpdateScheduleCell={handleUpdateScheduleCell}
             />
           )}
 

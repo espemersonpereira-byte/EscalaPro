@@ -361,6 +361,13 @@
           "type": "number",
           "description": "Horas extras ou banco de horas no dia."
         },
+        "unitOverrideId": {
+          "type": "string",
+          "description": "ID opcional do setor para direcionamento pontual somente neste dia.",
+          "minLength": 0,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]*$"
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time",

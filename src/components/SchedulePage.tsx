@@ -92,6 +92,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
 
   const [modalTab, setModalTab] = useState<'STATUS' | 'PERMUTA' | 'HORA_EXTRA'>('STATUS');
   const [cellStatus, setCellStatus] = useState<ShiftStatus>('D');
+  const [cellUnitId, setCellUnitId] = useState<string>('');
   const [cellNote, setCellNote] = useState<string>('');
   const [swapPartnerId, setSwapPartnerId] = useState<string>('');
   const [swapReturnDate, setSwapReturnDate] = useState<string>('');
@@ -180,7 +181,32 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
 
     for (const day of allDaysArray) {
       let scheduledCount = 0;
-      for (const emp of filteredEmployees) {
+      const poolForCoverage =
+        navContext.selectedUnitFilter === 'TODAS'
+          ? filteredEmployees
+          : state.employees.filter((emp) => {
+              if (!emp.active) return false;
+              if (
+                navContext.selectedShiftFilter !== 'TODOS' &&
+                emp.defaultShift !== navContext.selectedShiftFilter
+              ) {
+                return false;
+              }
+              if (
+                navContext.selectedRoleFilter !== 'TODAS' &&
+                emp.role !== navContext.selectedRoleFilter
+              ) {
+                return false;
+              }
+              const cell = getCellForEmployeeDay(emp, day);
+              const effUnit =
+                cell.unitOverrideId && state.units.some((u) => u.id === cell.unitOverrideId)
+                  ? cell.unitOverrideId
+                  : emp.unitId;
+              return effUnit === navContext.selectedUnitFilter;
+            });
+
+      for (const emp of poolForCoverage) {
         const cell = getCellForEmployeeDay(emp, day);
         if (cell.status === 'D' || cell.status === 'N' || cell.status === 'TR') {
           scheduledCount++;
@@ -197,8 +223,10 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
   }, [
     allDaysArray,
     filteredEmployees,
+    state.employees,
     navContext.selectedUnitFilter,
     navContext.selectedShiftFilter,
+    navContext.selectedRoleFilter,
     state.units,
     state.schedules,
     ymKey,
@@ -232,6 +260,11 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
     setEditingCell({ employee: emp, day, currentCell: cell });
     setModalTab('STATUS');
     setCellStatus(cell.status);
+    setCellUnitId(
+      cell.unitOverrideId && state.units.some((u) => u.id === cell.unitOverrideId)
+        ? cell.unitOverrideId
+        : emp.unitId
+    );
     setCellNote(cell.note || '');
     const potentialPartners = state.employees.filter(
       (e) => e.active && e.id !== emp.id
@@ -280,6 +313,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
         day,
         {
           status: cellStatus,
+          unitOverrideId: cellUnitId && cellUnitId !== employee.unitId ? cellUnitId : '',
           note: cellNote.trim() || undefined,
         },
         { historyRecord }
@@ -375,7 +409,13 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
 
     for (const unit of state.units) {
       lines.push(`\n📍 *${unit.name.toUpperCase()}*`);
-      const unitEmps = state.employees.filter((e) => e.active && e.unitId === unit.id);
+      const unitEmps = state.employees.filter((e) => {
+        if (!e.active) return false;
+        const overrideId = state.schedules[tKey]?.[e.id]?.[tDay]?.unitOverrideId;
+        const effectiveUnit =
+          overrideId && state.units.some((u) => u.id === overrideId) ? overrideId : e.unitId;
+        return effectiveUnit === unit.id;
+      });
 
       const dayEmps = unitEmps.filter((e) => {
         const st =
@@ -809,6 +849,8 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                         const meta = SHIFT_STATUS_META[cell.status];
                         const dateObj = new Date(selectedYear, selectedMonth0, d);
                         const isWeekend = dateObj.getDay() === 0 || dateObj.getDay() === 6;
+                        const hasUnitOverride =
+                          Boolean(cell.unitOverrideId) && cell.unitOverrideId !== emp.unitId;
 
                         return (
                           <td
@@ -821,13 +863,18 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                               type="button"
                               onClick={() => openCellEditor(emp, d)}
                               title={`${emp.name} — Dia ${d}: ${meta.label}${
-                                cell.note ? ` (${cell.note})` : ''
-                              }`}
+                                hasUnitOverride && cell.unitOverrideId
+                                  ? ` · Direcionado para ${getUnitName(cell.unitOverrideId)}`
+                                  : ''
+                              }${cell.note ? ` (${cell.note})` : ''}`}
                               className={`w-7 h-7 mx-auto rounded-lg text-[11px] font-bold flex items-center justify-center transition-transform active:scale-95 cursor-pointer relative ${meta.bgClass} ${meta.textClass}`}
                             >
                               <span>{meta.code}</span>
                               {cell.extraHours && cell.extraHours > 0 ? (
                                 <span className="w-1.5 h-1.5 rounded-full bg-amber-300 absolute top-0.5 right-0.5" />
+                              ) : null}
+                              {hasUnitOverride ? (
+                                <span className="w-1.5 h-1.5 rounded-full bg-cyan-300 ring-1 ring-slate-900/40 absolute bottom-0.5 right-0.5" />
                               ) : null}
                             </button>
                           </td>
@@ -1007,6 +1054,26 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                       })}
                     </div>
                   </div>
+
+                  {state.units.length > 1 && (
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">
+                        Setor apenas neste dia (não altera os outros dias)
+                      </label>
+                      <select
+                        value={cellUnitId || editingCell.employee.unitId}
+                        onChange={(e) => setCellUnitId(e.target.value)}
+                        className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900"
+                      >
+                        {state.units.map((u) => (
+                          <option key={u.id} value={u.id}>
+                            {u.name}
+                            {u.id === editingCell.employee.unitId ? ' (Setor original)' : ''}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
 
                   <div>
                     <label className="block text-xs font-bold text-slate-700 mb-1">
