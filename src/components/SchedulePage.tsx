@@ -573,13 +573,18 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
     state.units.find((u) => u.id === unitId)?.name || 'Unidade';
 
   const activePeriodTitle =
-    periodViewMode === 'CALENDAR_MONTH'
-      ? `${MONTH_NAMES[selectedMonth0]} de ${selectedYear} (01/${startMonthNumStr} a ${startDaysInMonth}/${startMonthNumStr})`
-      : periodViewMode === 'FORTNIGHT_16_END'
-      ? `2ª Quinzena de ${MONTH_NAMES[selectedMonth0]} (${fortnight1RangeLabel})`
+    periodViewMode === 'FORTNIGHT_16_END'
+      ? `2ª Quinzena de ${MONTH_NAMES[selectedMonth0]} de ${selectedYear} (Dias 16 a ${startDaysInMonth})`
       : periodViewMode === 'FORTNIGHT_01_15'
-      ? `1ª Quinzena de ${MONTH_NAMES[nextYm.monthIndex0]} (${fortnight2RangeLabel})`
-      : `Escala Quinzenal: ${fortnight1RangeLabel} (${MONTH_SHORT[selectedMonth0]}) e ${fortnight2RangeLabel} (${MONTH_SHORT[nextYm.monthIndex0]})`;
+      ? `1ª Quinzena de ${MONTH_NAMES[nextYm.monthIndex0]} de ${nextYm.year} (Dias 01 a 15)`
+      : `Escala Quinzenal: ${MONTH_NAMES[selectedMonth0]} / ${MONTH_NAMES[nextYm.monthIndex0]} (16 de ${MONTH_NAMES[selectedMonth0]} a 15 de ${MONTH_NAMES[nextYm.monthIndex0]} de ${nextYm.year})`;
+
+  const availableYears = [
+    now.getFullYear() - 1,
+    now.getFullYear(),
+    now.getFullYear() + 1,
+    now.getFullYear() + 2,
+  ];
 
   return (
     <div className="space-y-5 print-container">
@@ -602,50 +607,75 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
         </div>
       </div>
 
-      {/* Barra Superior de Ações e Período Quinzenal (16 a 15) */}
+      {/* Barra Superior de Ações e Período Quinzenal Contínuo (Todos os Meses do Ano: 16 a 15) */}
       <section className="no-print bg-white rounded-2xl border border-slate-200 p-4 md:p-5 space-y-4">
-        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
-          {/* Seletor de Ciclo Quinzenal (ex: 16/Nov a 15/Dez) */}
-          <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+        <div className="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-4">
+          {/* Seletor de Ciclo Quinzenal Universal (Qualquer Mês/Ano: Nov/Dez, Dez/Jan, Jan/Fev, Fev/Mar...) */}
+          <div className="flex flex-wrap items-center gap-2.5">
             <div className="flex items-center bg-slate-100 rounded-xl p-1 border border-slate-200">
               <button
                 type="button"
                 onClick={handlePrevCycle}
                 className="p-2 rounded-lg hover:bg-white text-slate-700 transition-colors cursor-pointer"
-                title="Ciclo anterior"
+                title="Ciclo quinzenal anterior"
               >
                 <ChevronLeft className="w-4 h-4" />
               </button>
-              <div className="px-3.5 py-1 text-center min-w-[210px]">
-                {periodViewMode === 'CALENDAR_MONTH' ? (
-                  <div className="text-sm font-bold text-slate-900">
-                    {MONTH_NAMES[selectedMonth0]} {selectedYear}
-                  </div>
-                ) : (
-                  <>
-                    <div className="text-xs sm:text-sm font-bold text-slate-900 leading-tight">
-                      16/{MONTH_SHORT[selectedMonth0]} a 15/{MONTH_SHORT[nextYm.monthIndex0]}{' '}
-                      {nextYm.year}
-                    </div>
-                    <div className="text-[10px] font-semibold text-teal-700 leading-tight mt-0.5">
-                      {fortnight1RangeLabel} + {fortnight2RangeLabel}
-                    </div>
-                  </>
-                )}
+
+              <div className="flex items-center gap-1.5 px-2">
+                <select
+                  value={selectedMonth0}
+                  onChange={(e) => setSelectedMonth0(Number(e.target.value))}
+                  aria-label="Selecionar ciclo quinzenal de meses"
+                  className="bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 text-base font-bold text-slate-900 cursor-pointer"
+                >
+                  {MONTH_NAMES.map((mName, idx) => {
+                    const nxtIdx = (idx + 1) % 12;
+                    return (
+                      <option key={mName} value={idx}>
+                        {mName} / {MONTH_NAMES[nxtIdx]} (16/{MONTH_SHORT[idx]} a 15/
+                        {MONTH_SHORT[nxtIdx]})
+                      </option>
+                    );
+                  })}
+                </select>
+
+                <select
+                  value={selectedYear}
+                  onChange={(e) => setSelectedYear(Number(e.target.value))}
+                  aria-label="Selecionar ano inicial do ciclo"
+                  className="bg-white border border-slate-200 rounded-lg px-2 py-1.5 text-base font-bold text-slate-900 cursor-pointer"
+                >
+                  {availableYears.map((yr) => (
+                    <option key={yr} value={yr}>
+                      {yr}
+                    </option>
+                  ))}
+                </select>
               </div>
+
               <button
                 type="button"
                 onClick={handleNextCycle}
                 className="p-2 rounded-lg hover:bg-white text-slate-700 transition-colors cursor-pointer"
-                title="Próximo ciclo"
+                title="Próximo ciclo quinzenal"
               >
                 <ChevronRight className="w-4 h-4" />
               </button>
             </div>
 
-            <span className="hidden xl:inline-block text-xs text-slate-500">
-              Toque em qualquer dia ({fortnight1RangeLabel} ou {fortnight2RangeLabel}) para ajustar plantão ou folga
-            </span>
+            <button
+              type="button"
+              onClick={handleNextCycle}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-teal-50 hover:bg-teal-100 text-teal-900 border border-teal-200 text-xs font-bold transition-colors cursor-pointer"
+              title="Avançar para a próxima escala quinzenal"
+            >
+              <span>
+                Próxima: {MONTH_SHORT[nextYm.monthIndex0]}/
+                {MONTH_SHORT[(nextYm.monthIndex0 + 1) % 12]}
+              </span>
+              <ChevronRight className="w-3.5 h-3.5 text-teal-700" />
+            </button>
           </div>
 
           {/* Botões de Ação Principal */}
@@ -655,7 +685,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
               onClick={() => {
                 onGenerateAutoSchedule(selectedYear, selectedMonth0);
                 setAutoGenBanner(
-                  `Escala Quinzenal (${fullCycleRangeLabel}) gerada automaticamente respeitando regimes (12x36, 5x2, 6x1) e preservando folgas, férias e atestados!`
+                  `Escala Quinzenal de ${MONTH_NAMES[selectedMonth0]} / ${MONTH_NAMES[nextYm.monthIndex0]} gerada automaticamente respeitando regimes (12x36, 5x2, 6x1) e preservando folgas, férias e atestados!`
                 );
                 setTimeout(() => setAutoGenBanner(null), 5000);
               }}
@@ -694,62 +724,51 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
           </div>
         </div>
 
-        {/* Seletor Rápido das Quinzenas do Ciclo (16/11 a 30/11 | 01/12 a 15/12) */}
+        {/* Seletor Rápido das Quinzenas do Ciclo Ativo (Funciona para todos os meses do ano) */}
         <div className="pt-3 border-t border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
           <div className="flex items-center gap-2">
             <Calendar className="w-4 h-4 text-teal-600 shrink-0" />
             <span className="text-xs font-bold text-slate-700">
-              Visualização Quinzenal da Escala:
+              Período de {MONTH_NAMES[selectedMonth0]} / {MONTH_NAMES[nextYm.monthIndex0]}:
             </span>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:flex lg:flex-wrap items-center gap-2">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
             <button
               type="button"
               onClick={() => setPeriodViewMode('CYCLE_16_15_FULL')}
-              className={`px-3 py-2 rounded-xl text-xs font-bold border transition-colors cursor-pointer ${
+              className={`px-3.5 py-2 rounded-xl text-xs font-bold border transition-colors cursor-pointer ${
                 periodViewMode === 'CYCLE_16_15_FULL'
                   ? 'bg-[#0f172a] text-white border-slate-900'
                   : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
               }`}
             >
-              Ciclo Completo ({fortnight1RangeLabel} + {fortnight2RangeLabel})
+              Escala Completa ({MONTH_SHORT[selectedMonth0]} 16–{startDaysInMonth} +{' '}
+              {MONTH_SHORT[nextYm.monthIndex0]} 01–15)
             </button>
 
             <button
               type="button"
               onClick={() => setPeriodViewMode('FORTNIGHT_16_END')}
-              className={`px-3 py-2 rounded-xl text-xs font-bold border transition-colors cursor-pointer ${
+              className={`px-3.5 py-2 rounded-xl text-xs font-bold border transition-colors cursor-pointer ${
                 periodViewMode === 'FORTNIGHT_16_END'
                   ? 'bg-[#0d9488] text-white border-teal-700'
                   : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
               }`}
             >
-              2ª Quinzena {MONTH_SHORT[selectedMonth0]} ({fortnight1RangeLabel})
+              2ª Quinzena de {MONTH_NAMES[selectedMonth0]} (Dias 16 a {startDaysInMonth})
             </button>
 
             <button
               type="button"
               onClick={() => setPeriodViewMode('FORTNIGHT_01_15')}
-              className={`px-3 py-2 rounded-xl text-xs font-bold border transition-colors cursor-pointer ${
+              className={`px-3.5 py-2 rounded-xl text-xs font-bold border transition-colors cursor-pointer ${
                 periodViewMode === 'FORTNIGHT_01_15'
                   ? 'bg-indigo-600 text-white border-indigo-700'
                   : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
               }`}
             >
-              1ª Quinzena {MONTH_SHORT[nextYm.monthIndex0]} ({fortnight2RangeLabel})
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setPeriodViewMode('CALENDAR_MONTH')}
-              className={`px-3 py-2 rounded-xl text-xs font-semibold border transition-colors cursor-pointer ${
-                periodViewMode === 'CALENDAR_MONTH'
-                  ? 'bg-slate-800 text-white border-slate-900'
-                  : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50'
-              }`}
-            >
-              Mês Civil (01/{startMonthNumStr} a {startDaysInMonth}/{startMonthNumStr})
+              1ª Quinzena de {MONTH_NAMES[nextYm.monthIndex0]} (Dias 01 a 15)
             </button>
           </div>
         </div>
@@ -932,30 +951,28 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
           <div className="overflow-x-auto">
             <table className="w-full border-collapse text-left print-table">
               <thead>
-                {/* Linha Superior Agrupada identificando claramente as 2 Quinzenas (16/11 a 30/11 e 01/12 a 15/12) */}
-                {periodViewMode !== 'CALENDAR_MONTH' && (
-                  <tr className="bg-slate-950 text-white border-b border-slate-800">
-                    <th className="sticky left-0 z-20 bg-slate-950 px-3.5 py-2 text-[11px] font-bold text-teal-400 border-r border-slate-800">
-                      Ciclo Quinzenal (16 a 15)
+                {/* Linha Superior Agrupada identificando os meses das 2 Quinzenas (sem repetir o mês em cada dia abaixo) */}
+                <tr className="bg-slate-950 text-white border-b border-slate-800">
+                  <th className="sticky left-0 z-20 bg-slate-950 px-3.5 py-2 text-[11px] font-bold text-teal-400 border-r border-slate-800">
+                    {MONTH_NAMES[selectedMonth0]} / {MONTH_NAMES[nextYm.monthIndex0]}
+                  </th>
+                  {part1VisibleCount > 0 && (
+                    <th
+                      colSpan={part1VisibleCount}
+                      className="px-2 py-1.5 text-center text-[11px] font-bold tracking-wide text-teal-300 bg-teal-950/60 border-r-2 border-teal-500/60"
+                    >
+                      2ª Quinzena de {MONTH_NAMES[selectedMonth0]} (Dias 16 a {startDaysInMonth})
                     </th>
-                    {part1VisibleCount > 0 && (
-                      <th
-                        colSpan={part1VisibleCount}
-                        className="px-2 py-1.5 text-center text-[11px] font-bold tracking-wide text-teal-300 bg-teal-950/60 border-r-2 border-teal-500/60"
-                      >
-                        2ª Quinzena de {MONTH_NAMES[selectedMonth0]} ({fortnight1RangeLabel})
-                      </th>
-                    )}
-                    {part2VisibleCount > 0 && (
-                      <th
-                        colSpan={part2VisibleCount}
-                        className="px-2 py-1.5 text-center text-[11px] font-bold tracking-wide text-indigo-300 bg-indigo-950/60 border-r border-slate-800"
-                      >
-                        1ª Quinzena de {MONTH_NAMES[nextYm.monthIndex0]} ({fortnight2RangeLabel})
-                      </th>
-                    )}
-                  </tr>
-                )}
+                  )}
+                  {part2VisibleCount > 0 && (
+                    <th
+                      colSpan={part2VisibleCount}
+                      className="px-2 py-1.5 text-center text-[11px] font-bold tracking-wide text-indigo-300 bg-indigo-950/60 border-r border-slate-800"
+                    >
+                      1ª Quinzena de {MONTH_NAMES[nextYm.monthIndex0]} (Dias 01 a 15)
+                    </th>
+                  )}
+                </tr>
 
                 <tr className="bg-slate-900 text-white border-b border-slate-800">
                   <th className="sticky left-0 z-20 bg-slate-900 px-3.5 py-3 min-w-[210px] max-w-[230px] text-xs font-bold tracking-tight border-r border-slate-800">
@@ -978,14 +995,14 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                     return (
                       <th
                         key={slot.isoDate}
-                        className={`px-1 py-2 text-center min-w-[40px] border-r border-slate-800 select-none ${
+                        className={`px-1 py-2 text-center min-w-[36px] border-r border-slate-800 select-none ${
                           isFirstOfSecondFortnight ? 'border-l-2 border-l-teal-400' : ''
                         } ${
                           isToday
                             ? 'bg-teal-600 text-white'
                             : isWeekend
                             ? 'bg-slate-800 text-amber-300'
-                            : slot.fortnightPart === 2 && periodViewMode !== 'CALENDAR_MONTH'
+                            : slot.fortnightPart === 2
                             ? 'bg-slate-900/90 text-indigo-200'
                             : 'text-slate-200'
                         }`}
@@ -993,8 +1010,8 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                         <div className="text-[10px] font-medium opacity-80">
                           {WEEKDAY_SHORT[dow]}
                         </div>
-                        <div className="text-[11px] font-bold tabular-nums leading-tight mt-0.5">
-                          {slot.shortDateLabel}
+                        <div className="text-xs font-bold tabular-nums leading-tight mt-0.5">
+                          {String(slot.day).padStart(2, '0')}
                         </div>
                       </th>
                     );
