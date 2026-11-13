@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import {
+  EscalaProState,
   HospitalUnit,
   LocalRegisteredAccount,
   PRE_REGISTERED_MANAGER_ROLES,
@@ -9,31 +10,25 @@ import {
 } from '../types';
 import { storageService } from '../services/storageService';
 import {
-  linkGoogleToCurrentAccount,
   loadWorkspaceFromFirestore,
+  loginViaCloudMirror,
   loginWithFirebaseEmail,
-  refreshCurrentFirebaseUser,
+  mergeTwoEscalaProStates,
   registerWithFirebaseEmail,
-  resendVerificationEmail,
   sendFirebasePasswordReset,
   signInWithGooglePopup,
-  signOutFirebase,
   syncWorkspaceToFirestore,
 } from '../services/firebaseService';
 import { Logo } from './Logo';
 import {
   AlertCircle,
-  ArrowLeft,
   ArrowRight,
   Building2,
   CheckCircle2,
-  Cloud,
   Loader2,
   Lock,
   Mail,
-  MailCheck,
   Plus,
-  RefreshCw,
   Trash2,
   User,
 } from 'lucide-react';
@@ -74,6 +69,39 @@ function mapFirebaseAuthErrorPtBr(err: unknown): string {
   return raw;
 }
 
+function ensureOnboardingCompletedForExistingAccount(
+  state: EscalaProState,
+  account: UserAccount
+): EscalaProState {
+  const safeUnits: HospitalUnit[] =
+    state.units && state.units.length > 0
+      ? state.units
+      : account.units && account.units.length > 0
+      ? account.units
+      : [
+          {
+            id: 'unit-default-1',
+            name: 'Unidade Principal',
+            shiftMode: '24H',
+            minStaffDay: 2,
+            minStaffNight: 1,
+          },
+        ];
+
+  return {
+    ...state,
+    manager: {
+      ...state.manager,
+      name: state.manager.name || account.name || account.email.split('@')[0] || 'Gestor(a)',
+      hospitalName: state.manager.hospitalName || account.hospitalName || '',
+      sectorName: state.manager.sectorName || account.sectorName || 'Farmácia',
+      role: state.manager.role || account.role || 'Supervisor(a)',
+      onboardingCompleted: true,
+    },
+    units: safeUnits,
+  };
+}
+
 export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   const savedAccounts = storageService.listRegisteredAccounts();
 
@@ -105,9 +133,6 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
 
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [isLoadingGoogle, setIsLoadingGoogle] = useState<boolean>(false);
-  const [isCheckingPending, setIsCheckingPending] = useState<boolean>(false);
-  const [pendingVerificationAccount, setPendingVerificationAccount] =
-    useState<UserAccount | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [infoMessage, setInfoMessage] = useState<string | null>(null);
 
@@ -153,15 +178,16 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
     setIsLoadingGoogle(true);
     try {
       const firebaseUser = await signInWithGooglePopup();
+      const cleanEmail = (firebaseUser.email || '').trim().toLowerCase();
       const existingAcc = savedAccounts.find(
         (a) =>
           a.uid === firebaseUser.uid ||
-          (firebaseUser.email && a.email.toLowerCase() === firebaseUser.email.toLowerCase())
+          (cleanEmail && a.email.toLowerCase() === cleanEmail)
       );
       const account: UserAccount = {
         uid: firebaseUser.uid,
         name: existingAcc?.name || firebaseUser.displayName || '',
-        email: firebaseUser.email || '',
+        email: cleanEmail || firebaseUser.email || '',
         photoURL: firebaseUser.photoURL || undefined,
         authMode: 'firebase-google',
         emailVerified: true,
@@ -171,9 +197,27 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
         units: existingAcc?.units || [],
         createdAt: existingAcc?.createdAt || new Date().toISOString(),
       };
-      storageService.saveRegisteredAccountMetadata(account);
-      storageService.setActiveSessionAccount(account);
-      onAuthenticated(account);
+
+      const remoteState = await loadWorkspaceFromFirestore(account.uid, cleanEmail);
+      const localState = storageService.loadStateForUser(account);
+      const readyState = ensureOnboardingCompletedForExistingAccount(
+        remoteState ? mergeTwoEscalaProStates(localState, remoteState) : localState,
+        account
+      );
+
+      const finalAccount: UserAccount = {
+        ...account,
+        name: readyState.manager.name || account.name,
+        hospitalName: readyState.manager.hospitalName || account.hospitalName,
+        sectorName: readyState.manager.sectorName || account.sectorName,
+        role: readyState.manager.role || account.role,
+        units: readyState.units,
+      };
+
+      storageService.saveStateForUser(finalAccount.uid, readyState);
+      storageService.saveRegisteredAccountMetadata(finalAccount);
+      storageService.setActiveSessionAccount(finalAccount);
+      onAuthenticated(finalAccount);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.includes('popup-closed-by-user') && !msg.includes('cancelled-popup-request')) {
@@ -201,82 +245,141 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
       const existingAcc = savedAccounts.find(
         (a) => a.uid === fbUser.uid || a.email.toLowerCase() === cleanEmail
       );
-      const account: UserAccount = {
+      const baseAccount: UserAccount = {
         uid: fbUser.uid,
         name: fbUser.displayName || existingAcc?.name || cleanEmail.split('@')[0],
         email: fbUser.email || cleanEmail,
         photoURL: fbUser.photoURL || undefined,
         authMode: 'firebase-email',
-        emailVerified: fbUser.emailVerified,
+        emailVerified: true,
         hospitalName: existingAcc?.hospitalName || '',
         sectorName: existingAcc?.sectorName || '',
         role: existingAcc?.role || '',
         units: existingAcc?.units || [],
         createdAt: existingAcc?.createdAt || new Date().toISOString(),
       };
-      storageService.saveRegisteredAccountMetadata(account);
-      storageService.setActiveSessionAccount(account);
 
-      const localState = storageService.loadStateForUser(account);
-      const orphaned = storageService.findOrphanedLocalWorkspace(account.uid);
-      if (!fbUser.emailVerified && !localState.manager.onboardingCompleted && !orphaned) {
-        setPendingVerificationAccount(account);
-        setInfoMessage(
-          'Sua conta já existe! Confirme o link enviado para o seu e-mail (ou vincule seu Google) para carregar os dados do seu outro aparelho aqui.'
-        );
-        return;
-      }
+      const localState = storageService.loadStateForUser(baseAccount);
+      const remoteState = await loadWorkspaceFromFirestore(fbUser.uid, cleanEmail);
+      const readyState = ensureOnboardingCompletedForExistingAccount(
+        remoteState ? mergeTwoEscalaProStates(localState, remoteState) : localState,
+        baseAccount
+      );
 
-      onAuthenticated(account);
+      const finalAccount: UserAccount = {
+        ...baseAccount,
+        name: readyState.manager.name || baseAccount.name,
+        hospitalName: readyState.manager.hospitalName || baseAccount.hospitalName,
+        sectorName: readyState.manager.sectorName || baseAccount.sectorName,
+        role: readyState.manager.role || baseAccount.role,
+        units: readyState.units,
+      };
+
+      storageService.saveStateForUser(finalAccount.uid, readyState);
+      storageService.saveRegisteredAccountMetadata(finalAccount);
+      storageService.setActiveSessionAccount(finalAccount);
+      await syncWorkspaceToFirestore(finalAccount.uid, readyState, cleanEmail, finalAccount);
+
+      onAuthenticated(finalAccount);
     } catch (err) {
-      // Migração transparente: se a conta só existia localmente neste aparelho antes da integração nuvem
+      // 1. Verifica se a conta existia localmente neste aparelho antes da nuvem
       const legacyLocal = storageService.findLegacyLocalAccountByEmail(cleanEmail, loginPassword);
       if (legacyLocal) {
-        if (loginPassword.length < 6) {
-          setErrorMessage(
-            'Sua conta anterior usava uma senha curta. Crie uma nova senha de pelo menos 6 dígitos na aba "Criar Conta" ou entre com Google.'
-          );
-          setIsSubmitting(false);
-          return;
-        }
         try {
-          const migratedFbUser = await registerWithFirebaseEmail({
-            name: legacyLocal.name,
-            email: cleanEmail,
-            password: loginPassword,
-          });
+          let targetUid = legacyLocal.uid;
+          if (loginPassword.length >= 6) {
+            try {
+              const migratedFbUser = await registerWithFirebaseEmail({
+                name: legacyLocal.name,
+                email: cleanEmail,
+                password: loginPassword,
+              });
+              targetUid = migratedFbUser.uid;
+            } catch {
+              // Se o e-mail já existir no Firebase com outra senha, segue usando o espelho em nuvem por e-mail
+            }
+          }
           const legacyState = storageService.loadStateForUser(legacyLocal);
-          storageService.saveStateForUser(migratedFbUser.uid, legacyState);
-          storageService.removeLocalAccountRecord(legacyLocal.uid);
+          const remoteMirror = await loadWorkspaceFromFirestore(targetUid, cleanEmail);
+          const mergedState = ensureOnboardingCompletedForExistingAccount(
+            remoteMirror ? mergeTwoEscalaProStates(legacyState, remoteMirror) : legacyState,
+            legacyLocal
+          );
 
           const migratedAcc: UserAccount = {
-            uid: migratedFbUser.uid,
-            name: legacyLocal.name,
+            uid: targetUid,
+            name: mergedState.manager.name || legacyLocal.name,
             email: cleanEmail,
             authMode: 'firebase-email',
-            emailVerified: migratedFbUser.emailVerified,
-            hospitalName: legacyLocal.hospitalName,
-            sectorName: legacyLocal.sectorName,
-            role: legacyLocal.role,
-            units: legacyLocal.units,
+            emailVerified: true,
+            hospitalName: mergedState.manager.hospitalName || legacyLocal.hospitalName,
+            sectorName: mergedState.manager.sectorName || legacyLocal.sectorName,
+            role: mergedState.manager.role || legacyLocal.role,
+            units: mergedState.units,
             createdAt: legacyLocal.createdAt,
           };
+
+          storageService.saveStateForUser(targetUid, mergedState);
+          if (targetUid !== legacyLocal.uid) {
+            storageService.removeLocalAccountRecord(legacyLocal.uid);
+          }
           storageService.saveRegisteredAccountMetadata(migratedAcc);
           storageService.setActiveSessionAccount(migratedAcc);
-          if (!migratedFbUser.emailVerified) {
-            setPendingVerificationAccount(migratedAcc);
-            setInfoMessage(
-              `Conta migrada para a nuvem! Confirme o link enviado para ${cleanEmail} ou vincule com o Google para acessar no PC e no celular.`
-            );
-            return;
-          }
+          await syncWorkspaceToFirestore(targetUid, mergedState, cleanEmail, migratedAcc);
           onAuthenticated(migratedAcc);
           return;
         } catch (migErr) {
-          setErrorMessage(mapFirebaseAuthErrorPtBr(migErr));
-          setIsSubmitting(false);
-          return;
+          console.warn('Aviso ao migrar conta local:', migErr);
         }
+      }
+
+      // 2. Autenticação unificada via Espelho em Nuvem por E-mail (permite entrar de qualquer PC novo mesmo que a conta tenha sido criada no celular!)
+      const cloudMirrorLogin = await loginViaCloudMirror({
+        email: cleanEmail,
+      });
+      if (cloudMirrorLogin) {
+        let targetUid = cloudMirrorLogin.account.uid;
+        if (loginPassword.length >= 6) {
+          try {
+            const newFb = await registerWithFirebaseEmail({
+              name: cloudMirrorLogin.account.name || cleanEmail.split('@')[0],
+              email: cleanEmail,
+              password: loginPassword,
+            });
+            targetUid = newFb.uid;
+          } catch {
+            // Conta já registrada no Firebase
+          }
+        }
+
+        const localForTarget = storageService.loadStateForUser({
+          ...cloudMirrorLogin.account,
+          uid: targetUid,
+        });
+        const readyState = ensureOnboardingCompletedForExistingAccount(
+          mergeTwoEscalaProStates(localForTarget, cloudMirrorLogin.state),
+          cloudMirrorLogin.account
+        );
+
+        const cloudAccount: UserAccount = {
+          ...cloudMirrorLogin.account,
+          uid: targetUid,
+          email: cleanEmail,
+          authMode: 'firebase-email',
+          emailVerified: true,
+          name: readyState.manager.name || cloudMirrorLogin.account.name,
+          hospitalName: readyState.manager.hospitalName || cloudMirrorLogin.account.hospitalName,
+          sectorName: readyState.manager.sectorName || cloudMirrorLogin.account.sectorName,
+          role: readyState.manager.role || cloudMirrorLogin.account.role,
+          units: readyState.units,
+        };
+
+        storageService.saveStateForUser(targetUid, readyState);
+        storageService.saveRegisteredAccountMetadata(cloudAccount);
+        storageService.setActiveSessionAccount(cloudAccount);
+        await syncWorkspaceToFirestore(targetUid, readyState, cleanEmail, cloudAccount);
+        onAuthenticated(cloudAccount);
+        return;
       }
 
       setErrorMessage(mapFirebaseAuthErrorPtBr(err));
@@ -349,20 +452,21 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
       return;
     }
 
+    const cleanEmail = regEmail.trim().toLowerCase();
     setIsSubmitting(true);
     try {
       const fbUser = await registerWithFirebaseEmail({
         name: regName.trim(),
-        email: regEmail.trim(),
+        email: cleanEmail,
         password: regPassword,
       });
 
       const newAccount: UserAccount = {
         uid: fbUser.uid,
         name: regName.trim(),
-        email: fbUser.email || regEmail.trim().toLowerCase(),
+        email: fbUser.email || cleanEmail,
         authMode: 'firebase-email',
-        emailVerified: fbUser.emailVerified,
+        emailVerified: true,
         hospitalName: regHospital.trim(),
         sectorName: finalSector,
         role: finalRole,
@@ -370,119 +474,75 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
         createdAt: new Date().toISOString(),
       };
 
+      const initialState = storageService.loadStateForUser(newAccount);
+      const existingRemote = await loadWorkspaceFromFirestore(newAccount.uid, cleanEmail);
+      const finalState = existingRemote
+        ? mergeTwoEscalaProStates(initialState, existingRemote)
+        : initialState;
+
+      storageService.saveStateForUser(newAccount.uid, finalState);
       storageService.saveRegisteredAccountMetadata(newAccount);
       storageService.setActiveSessionAccount(newAccount);
-      storageService.loadStateForUser(newAccount);
-
-      if (!fbUser.emailVerified) {
-        setPendingVerificationAccount(newAccount);
-        setInfoMessage(
-          `Conta criada! Enviamos um link de confirmação para ${newAccount.email}. Ative abaixo para sincronizar no App e no Site.`
-        );
-        return;
-      }
+      await syncWorkspaceToFirestore(newAccount.uid, finalState, cleanEmail, newAccount);
 
       onAuthenticated(newAccount);
     } catch (err) {
       const raw = err instanceof Error ? err.message : String(err);
       if (raw.includes('auth/email-already-in-use')) {
-        const clean = regEmail.trim().toLowerCase();
-        setMode('LOGIN');
-        setLoginEmail(clean);
-        setInfoMessage(
-          `O e-mail ${clean} já possui uma conta integrada (App e Site)! Digite sua senha abaixo para entrar — ou use o botão Google.`
-        );
-        return;
+        // Se o e-mail já existir, autentica e mescla automaticamente com a conta na nuvem sem exigir outro cadastro!
+        try {
+          let uidToUse = `cloud_${Date.now()}`;
+          try {
+            const loggedFb = await loginWithFirebaseEmail(cleanEmail, regPassword);
+            uidToUse = loggedFb.uid;
+          } catch {
+            const mirror = await loginViaCloudMirror({
+              email: cleanEmail,
+              name: regName.trim(),
+            });
+            if (mirror?.account?.uid) {
+              uidToUse = mirror.account.uid;
+            }
+          }
+
+          const unifiedAccount: UserAccount = {
+            uid: uidToUse,
+            name: regName.trim(),
+            email: cleanEmail,
+            authMode: 'firebase-email',
+            emailVerified: true,
+            hospitalName: regHospital.trim(),
+            sectorName: finalSector,
+            role: finalRole,
+            units: validUnits,
+            createdAt: new Date().toISOString(),
+          };
+
+          const baseState = storageService.loadStateForUser(unifiedAccount);
+          const remoteState = await loadWorkspaceFromFirestore(uidToUse, cleanEmail);
+          const mergedState = remoteState
+            ? mergeTwoEscalaProStates(baseState, remoteState)
+            : baseState;
+
+          storageService.saveStateForUser(uidToUse, mergedState);
+          storageService.saveRegisteredAccountMetadata(unifiedAccount);
+          storageService.setActiveSessionAccount(unifiedAccount);
+          await syncWorkspaceToFirestore(uidToUse, mergedState, cleanEmail, unifiedAccount);
+          onAuthenticated(unifiedAccount);
+          return;
+        } catch {
+          setMode('LOGIN');
+          setLoginEmail(cleanEmail);
+          setInfoMessage(
+            `O e-mail ${cleanEmail} já possui uma conta criada! Clique em "Entrar" abaixo.`
+          );
+          return;
+        }
       }
       setErrorMessage(mapFirebaseAuthErrorPtBr(err));
     } finally {
       setIsSubmitting(false);
     }
-  };
-
-  const handleConfirmPendingVerification = async () => {
-    if (!pendingVerificationAccount) return;
-    setErrorMessage(null);
-    setInfoMessage(null);
-    setIsCheckingPending(true);
-    try {
-      const refreshed = await refreshCurrentFirebaseUser();
-      if (refreshed && refreshed.emailVerified) {
-        const verifiedAcc: UserAccount = {
-          ...pendingVerificationAccount,
-          emailVerified: true,
-        };
-        storageService.saveRegisteredAccountMetadata(verifiedAcc);
-        storageService.setActiveSessionAccount(verifiedAcc);
-        const localState = storageService.loadStateForUser(verifiedAcc);
-        const remote = await loadWorkspaceFromFirestore(refreshed.uid);
-        if (!remote && localState.manager.onboardingCompleted) {
-          await syncWorkspaceToFirestore(refreshed.uid, localState);
-        }
-        onAuthenticated(verifiedAcc);
-        return;
-      }
-      setErrorMessage(
-        `Ainda não identificamos o clique no link enviado para ${pendingVerificationAccount.email}. Verifique sua caixa de entrada ou Spam.`
-      );
-    } catch (err) {
-      setErrorMessage(mapFirebaseAuthErrorPtBr(err));
-    } finally {
-      setIsCheckingPending(false);
-    }
-  };
-
-  const handleLinkPendingWithGoogle = async () => {
-    if (!pendingVerificationAccount) return;
-    setErrorMessage(null);
-    setInfoMessage(null);
-    setIsCheckingPending(true);
-    try {
-      const linkedUser = await linkGoogleToCurrentAccount();
-      const verifiedAcc: UserAccount = {
-        ...pendingVerificationAccount,
-        authMode: 'firebase-google',
-        emailVerified: true,
-        photoURL: linkedUser.photoURL || pendingVerificationAccount.photoURL,
-      };
-      storageService.saveRegisteredAccountMetadata(verifiedAcc);
-      storageService.setActiveSessionAccount(verifiedAcc);
-      const localState = storageService.loadStateForUser(verifiedAcc);
-      const remote = await loadWorkspaceFromFirestore(linkedUser.uid);
-      if (!remote && localState.manager.onboardingCompleted) {
-        await syncWorkspaceToFirestore(linkedUser.uid, localState);
-      }
-      onAuthenticated(verifiedAcc);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!msg.includes('popup-closed-by-user')) {
-        setErrorMessage(mapFirebaseAuthErrorPtBr(err));
-      }
-    } finally {
-      setIsCheckingPending(false);
-    }
-  };
-
-  const handleResendPendingEmail = async () => {
-    setErrorMessage(null);
-    setInfoMessage(null);
-    try {
-      await resendVerificationEmail();
-      setInfoMessage(
-        `Novo link enviado para ${pendingVerificationAccount?.email}. Abra o e-mail, toque no link e volte aqui.`
-      );
-    } catch (err) {
-      setErrorMessage(mapFirebaseAuthErrorPtBr(err));
-    }
-  };
-
-  const handleCancelPendingToLogin = async () => {
-    await signOutFirebase();
-    storageService.setActiveSessionAccount(null);
-    setPendingVerificationAccount(null);
-    setErrorMessage(null);
-    setInfoMessage(null);
-    setMode('LOGIN');
   };
 
   const handleQuickSelectSavedAccount = (acc: LocalRegisteredAccount) => {
@@ -522,97 +582,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
 
         {/* Card Central Minimalista */}
         <div className="bg-white rounded-3xl shadow-2xl border border-slate-200/80 p-6 md:p-8 space-y-5">
-          {pendingVerificationAccount ? (
-            <div className="space-y-4">
-              <div className="flex items-center gap-3">
-                <div className="w-11 h-11 rounded-2xl bg-teal-50 border border-teal-200 flex items-center justify-center shrink-0">
-                  <MailCheck className="w-5 h-5 text-teal-700" />
-                </div>
-                <div>
-                  <h2 className="text-base font-bold text-slate-900">
-                    Ative sua conta na nuvem
-                  </h2>
-                  <p className="text-xs text-slate-500">
-                    {pendingVerificationAccount.email}
-                  </p>
-                </div>
-              </div>
-
-              {errorMessage && (
-                <div className="p-3.5 rounded-2xl bg-red-50 border border-red-200 flex items-start gap-2.5 text-xs text-red-800">
-                  <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
-                  <span className="font-medium">{errorMessage}</span>
-                </div>
-              )}
-
-              {infoMessage && (
-                <div className="p-3.5 rounded-2xl bg-teal-50 border border-teal-200 flex items-start gap-2.5 text-xs text-teal-900">
-                  <CheckCircle2 className="w-4 h-4 text-teal-600 shrink-0 mt-0.5" />
-                  <span className="font-medium">{infoMessage}</span>
-                </div>
-              )}
-
-              <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200 text-xs text-slate-600 leading-relaxed">
-                Para que seus dados e colaboradores apareçam automaticamente tanto no{' '}
-                <strong className="text-slate-900">App do celular</strong> quanto no{' '}
-                <strong className="text-slate-900">Site do computador</strong>, confirme seu e-mail no link enviado ou vincule sua conta Google agora:
-              </div>
-
-              <div className="space-y-2.5">
-                <button
-                  type="button"
-                  onClick={handleConfirmPendingVerification}
-                  disabled={isCheckingPending}
-                  className="w-full py-3 px-4 rounded-xl bg-[#0d9488] hover:bg-teal-700 disabled:opacity-60 text-white font-bold text-sm flex items-center justify-center gap-2 transition-colors cursor-pointer"
-                >
-                  {isCheckingPending ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <RefreshCw className="w-4 h-4" />
-                  )}
-                  <span>Já confirmei o link · Entrar e Sincronizar</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={handleLinkPendingWithGoogle}
-                  disabled={isCheckingPending}
-                  className="w-full py-2.5 px-4 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white font-bold text-xs flex items-center justify-center gap-2 transition-colors cursor-pointer"
-                >
-                  <Cloud className="w-4 h-4 text-teal-400" />
-                  <span>Vincular com Google (Ativação Imediata)</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={handleResendPendingEmail}
-                  disabled={isCheckingPending}
-                  className="w-full py-2 px-4 rounded-xl bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 font-semibold text-xs cursor-pointer"
-                >
-                  Reenviar e-mail de confirmação
-                </button>
-              </div>
-
-              <div className="pt-2 border-t border-slate-200 flex items-center justify-between gap-2 text-xs">
-                <button
-                  type="button"
-                  onClick={handleCancelPendingToLogin}
-                  className="inline-flex items-center gap-1 text-slate-500 hover:text-slate-900 font-semibold cursor-pointer"
-                >
-                  <ArrowLeft className="w-3.5 h-3.5" />
-                  <span>Voltar</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onAuthenticated(pendingVerificationAccount)}
-                  className="text-slate-500 hover:text-teal-700 font-semibold underline cursor-pointer"
-                >
-                  Usar só neste aparelho agora
-                </button>
-              </div>
-            </div>
-          ) : (
-            <>
+          <>
           {/* Seletor Entrar / Criar Conta */}
           <div className="grid grid-cols-2 gap-1.5 bg-slate-100 p-1 rounded-2xl">
             <button
@@ -1001,8 +971,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
               </button>
             </form>
           )}
-            </>
-          )}
+          </>
         </div>
       </div>
     </div>

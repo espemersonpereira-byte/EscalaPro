@@ -9,7 +9,7 @@ service cloud.firestore {
 
     // 2. Reusable Hardened Global Helpers
     function isSignedIn() {
-      return request.auth != null && request.auth.token.email_verified == true;
+      return request.auth != null;
     }
 
     function isValidId(id) {

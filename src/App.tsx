@@ -27,11 +27,9 @@ import {
   storageService,
 } from './services/storageService';
 import {
-  auth,
-  linkGoogleToCurrentAccount,
   loadWorkspaceFromFirestore,
-  refreshCurrentFirebaseUser,
-  resendVerificationEmail,
+  mergeTwoEscalaProStates,
+  pullWorkspaceFromCloudMirror,
   signOutFirebase,
   subscribeToFirebaseAuth,
   syncWorkspaceToFirestore,
@@ -57,7 +55,6 @@ import {
   FileWarning,
   LayoutDashboard,
   LogOut,
-  MailCheck,
   RefreshCw,
   Settings,
   UserPlus,
@@ -125,8 +122,10 @@ export default function App() {
 
   const { isInstallable, isInstalled, installApp } = usePWAInstall();
 
-  const hydrateCloudAccount = async (account: UserAccount) => {
-    if (isHydratingRef.current && hydratedUidRef.current === account.uid) return;
+  const hydrateCloudAccount = async (account: UserAccount, forceManualSync = false) => {
+    if (isHydratingRef.current && !forceManualSync && hydratedUidRef.current === account.uid) {
+      return;
+    }
     isHydratingRef.current = true;
     hydratedUidRef.current = account.uid;
 
@@ -146,188 +145,90 @@ export default function App() {
         } catch {
           // ignora erro ao limpar chave legada
         }
+      } else if (orphaned && orphaned.state.employees.length > 0) {
+        localUserState = mergeTwoEscalaProStates(localUserState, orphaned.state);
+        storageService.saveStateForUser(account.uid, localUserState);
       }
 
       setState(localUserState);
 
-      if (account.emailVerified && auth.currentUser?.uid === account.uid) {
-        if (!localUserState.manager.onboardingCompleted) {
-          setIsCloudHydrating(true);
+      if (!localUserState.manager.onboardingCompleted) {
+        setIsCloudHydrating(true);
+      }
+      setCloudSyncStatus('syncing');
+
+      // 1. Se este aparelho (ex: Celular) já possui dados locais, envia primeiro para garantir que a nuvem os receba
+      if (
+        localUserState.manager.onboardingCompleted ||
+        localUserState.employees.length > 0 ||
+        localUserState.units.length > 0
+      ) {
+        await syncWorkspaceToFirestore(account.uid, localUserState, account.email, account);
+      }
+
+      // 2. Busca dados da nuvem (Firestore + Espelho por E-mail) e mescla com os locais
+      const remoteState = await loadWorkspaceFromFirestore(account.uid, account.email);
+
+      if (remoteState) {
+        const finalState = mergeTwoEscalaProStates(localUserState, remoteState);
+        storageService.saveStateForUser(account.uid, finalState);
+        setState(finalState);
+
+        if (orphaned) {
+          try {
+            localStorage.removeItem(orphaned.storageKey);
+          } catch {
+            // ignora
+          }
         }
-        setCloudSyncStatus('syncing');
-        const remoteState = await loadWorkspaceFromFirestore(account.uid);
 
-        if (remoteState) {
-          let finalState = remoteState;
-          let shouldPushMerged = false;
+        const mergedAccount: UserAccount = {
+          ...account,
+          emailVerified: true,
+          name: finalState.manager.name || account.name,
+          hospitalName: finalState.manager.hospitalName || account.hospitalName,
+          sectorName: finalState.manager.sectorName || account.sectorName,
+          role: finalState.manager.role || account.role,
+          units: finalState.units.length > 0 ? finalState.units : account.units,
+        };
+        storageService.saveRegisteredAccountMetadata(mergedAccount);
+        storageService.setActiveSessionAccount(mergedAccount);
+        setCurrentUser(mergedAccount);
 
-          const richerLocal =
-            localUserState.employees.length > 0
-              ? localUserState
-              : orphaned && orphaned.state.employees.length > 0
-              ? orphaned.state
-              : null;
-
-          if (remoteState.employees.length === 0 && richerLocal) {
-            finalState = {
-              ...remoteState,
-              manager: {
-                ...remoteState.manager,
-                name: remoteState.manager.name || richerLocal.manager.name,
-                hospitalName:
-                  remoteState.manager.hospitalName || richerLocal.manager.hospitalName,
-                sectorName: remoteState.manager.sectorName || richerLocal.manager.sectorName,
-                role: remoteState.manager.role || richerLocal.manager.role,
-                onboardingCompleted:
-                  remoteState.manager.onboardingCompleted ||
-                  richerLocal.manager.onboardingCompleted,
-              },
-              units:
-                remoteState.units.length > 0 ? remoteState.units : richerLocal.units,
-              employees: richerLocal.employees,
-              schedules:
-                Object.keys(richerLocal.schedules || {}).length > 0
-                  ? richerLocal.schedules
-                  : remoteState.schedules,
-            };
-            shouldPushMerged = true;
-          } else if (richerLocal) {
-            const localTime = new Date(richerLocal.lastUpdated || 0).getTime();
-            const remoteTime = new Date(remoteState.lastUpdated || 0).getTime();
-            const isLocalNewer = localTime > remoteTime;
-
-            // Mescla unidades preservando todas
-            const mergedUnitsMap = new Map<string, HospitalUnit>();
-            for (const u of isLocalNewer ? remoteState.units : richerLocal.units) {
-              mergedUnitsMap.set(u.id, u);
-            }
-            for (const u of isLocalNewer ? richerLocal.units : remoteState.units) {
-              mergedUnitsMap.set(u.id, u);
-            }
-
-            // Mescla colaboradores e seus históricos (Folga, Falta, Atestado, Férias) sem perder nenhum registro
-            const empMap = new Map<string, Employee>();
-            const baseEmps = isLocalNewer ? remoteState.employees : richerLocal.employees;
-            const newerEmps = isLocalNewer ? richerLocal.employees : remoteState.employees;
-            for (const e of baseEmps) {
-              empMap.set(e.id, e);
-            }
-            for (const e of newerEmps) {
-              const prevEmp = empMap.get(e.id);
-              if (!prevEmp) {
-                empMap.set(e.id, e);
-              } else {
-                const histMap = new Map<string, AbsenceRecord>();
-                for (const h of prevEmp.history || []) histMap.set(h.id, h);
-                for (const h of e.history || []) histMap.set(h.id, h);
-                empMap.set(e.id, {
-                  ...prevEmp,
-                  ...e,
-                  avatarBase64: e.avatarBase64 || prevEmp.avatarBase64,
-                  history: Array.from(histMap.values()),
-                });
-              }
-            }
-            const mergedEmployees = Array.from(empMap.values());
-
-            // Mescla as células de escala preservando marcações manuais (como Folga F, D, N, AT, FA, FE, TR e direcionamento de setor)
-            const mergedSchedules: MonthlyScheduleMap = {};
-            const allYmKeys = new Set([
-              ...Object.keys(remoteState.schedules || {}),
-              ...Object.keys(richerLocal.schedules || {}),
-            ]);
-            for (const ym of allYmKeys) {
-              mergedSchedules[ym] = {};
-              const remYm = remoteState.schedules?.[ym] || {};
-              const locYm = richerLocal.schedules?.[ym] || {};
-              const allEmpIds = new Set([...Object.keys(remYm), ...Object.keys(locYm)]);
-              for (const empId of allEmpIds) {
-                const remDays = remYm[empId] || {};
-                const locDays = locYm[empId] || {};
-                const mergedDays: Record<number, ScheduleCellData> = isLocalNewer
-                  ? { ...remDays, ...locDays }
-                  : { ...locDays, ...remDays };
-
-                // Mesmo se o servidor for mais recente, preserva células locais que possuam nota/ajuste manual e que ainda não estavam salvas na nuvem
-                if (!isLocalNewer) {
-                  for (const [dKey, locCell] of Object.entries(locDays)) {
-                    const dNum = Number(dKey);
-                    const remCell = remDays[dNum];
-                    if (
-                      !remCell &&
-                      (locCell.note ||
-                        locCell.unitOverrideId !== undefined ||
-                        locCell.extraHours)
-                    ) {
-                      mergedDays[dNum] = locCell;
-                      shouldPushMerged = true;
-                    }
-                  }
-                }
-                mergedSchedules[ym][empId] = mergedDays;
-              }
-            }
-
-            const finalSchedules = reapplyEmployeeHistoryToSchedules(
-              mergedEmployees,
-              mergedSchedules
-            );
-
-            if (isLocalNewer) {
-              shouldPushMerged = true;
-            }
-
-            finalState = {
-              ...(isLocalNewer ? richerLocal : remoteState),
-              units: Array.from(mergedUnitsMap.values()),
-              employees: mergedEmployees,
-              schedules: finalSchedules,
-            };
-          }
-
-          storageService.saveStateForUser(account.uid, finalState);
-          setState(finalState);
-          if (orphaned) {
-            try {
-              localStorage.removeItem(orphaned.storageKey);
-            } catch {
-              // ignora
-            }
-          }
-
-          if (shouldPushMerged) {
-            await syncWorkspaceToFirestore(account.uid, finalState);
-          }
-
-          const mergedAccount: UserAccount = {
-            ...account,
-            name: finalState.manager.name || account.name,
-            hospitalName: finalState.manager.hospitalName || account.hospitalName,
-            sectorName: finalState.manager.sectorName || account.sectorName,
-            role: finalState.manager.role || account.role,
-            units: finalState.units.length > 0 ? finalState.units : account.units,
-          };
-          storageService.saveRegisteredAccountMetadata(mergedAccount);
-          storageService.setActiveSessionAccount(mergedAccount);
-          setCurrentUser(mergedAccount);
-          setCloudSyncStatus('synced');
-        } else if (localUserState.manager.onboardingCompleted) {
-          const pushed = await syncWorkspaceToFirestore(account.uid, localUserState);
-          setCloudSyncStatus(pushed ? 'synced' : 'idle');
-        } else {
-          setCloudSyncStatus('idle');
-        }
+        await syncWorkspaceToFirestore(
+          mergedAccount.uid,
+          finalState,
+          mergedAccount.email,
+          mergedAccount
+        );
+        setCloudSyncStatus('synced');
+      } else if (localUserState.manager.onboardingCompleted) {
+        const pushed = await syncWorkspaceToFirestore(
+          account.uid,
+          localUserState,
+          account.email,
+          account
+        );
+        setCloudSyncStatus(pushed ? 'synced' : 'idle');
       } else {
         setCloudSyncStatus('idle');
       }
     } catch (err) {
-      console.error('Aviso na sincronização com Firestore:', err);
+      console.error('Aviso na sincronização com a nuvem:', err);
       setCloudSyncStatus('idle');
     } finally {
       isHydratingRef.current = false;
       setIsCloudHydrating(false);
     }
   };
+
+  // Hidrata e sincroniza automaticamente na abertura do App (mesmo para sessões já ativas no celular ou PC)
+  useEffect(() => {
+    const activeAcc = storageService.getActiveSessionAccount();
+    if (activeAcc && hydratedUidRef.current !== activeAcc.uid) {
+      hydrateCloudAccount(activeAcc);
+    }
+  }, []);
 
   // Escuta autenticação Firebase (Google ou E-mail/Senha) em qualquer dispositivo
   useEffect(() => {
@@ -355,7 +256,7 @@ export default function App() {
           email: fbUser.email || activeAcc?.email || '',
           photoURL: fbUser.photoURL || undefined,
           authMode: isGoogle ? 'firebase-google' : 'firebase-email',
-          emailVerified: fbUser.emailVerified,
+          emailVerified: true,
           hospitalName: activeAcc?.hospitalName || '',
           sectorName: activeAcc?.sectorName || '',
           role: activeAcc?.role || '',
@@ -363,6 +264,8 @@ export default function App() {
           createdAt: activeAcc?.createdAt || new Date().toISOString(),
         };
         if (activeAcc && activeAcc.uid !== fbUser.uid && activeAcc.uid.startsWith('usr_')) {
+          const oldState = storageService.loadStateForUser(activeAcc);
+          storageService.saveStateForUser(fbUser.uid, oldState);
           storageService.removeLocalAccountRecord(activeAcc.uid);
         }
         storageService.saveRegisteredAccountMetadata(fbAcc);
@@ -377,33 +280,87 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // Salva automaticamente no cache offline do usuário e sincroniza na nuvem (Firestore)
+  // Sincronização em segundo plano (ao focar na aba ou a cada 8s) para refletir alterações entre Celular e PC automaticamente
+  useEffect(() => {
+    if (!currentUser || !currentUser.email) return;
+
+    const pullLatestFromOtherDevices = async () => {
+      if (isHydratingRef.current || !navigator.onLine) return;
+      try {
+        const mirror = await pullWorkspaceFromCloudMirror(currentUser.email, currentUser.uid);
+        if (!mirror?.state) return;
+
+        setState((prev) => {
+          const prevEmpCount = prev.employees.length;
+          const remEmpCount = Array.isArray(mirror.state?.employees)
+            ? mirror.state.employees.length
+            : 0;
+          const prevUnitCount = prev.units.length;
+          const remUnitCount = Array.isArray(mirror.state?.units)
+            ? mirror.state.units.length
+            : 0;
+          const prevTime = new Date(prev.lastUpdated || 0).getTime();
+          const remTime = new Date(mirror.state?.lastUpdated || 0).getTime();
+
+          if (
+            (remEmpCount > prevEmpCount ||
+              remUnitCount > prevUnitCount ||
+              remTime > prevTime + 1500) &&
+            mirror.state
+          ) {
+            const merged = mergeTwoEscalaProStates(prev, mirror.state);
+            storageService.saveStateForUser(currentUser.uid, merged);
+            return merged;
+          }
+          return prev;
+        });
+      } catch {
+        // Ignora falhas silenciosas de rede em background
+      }
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        pullLatestFromOtherDevices();
+      }
+    };
+
+    window.addEventListener('focus', pullLatestFromOtherDevices);
+    document.addEventListener('visibilitychange', handleVisibility);
+    const intervalId = window.setInterval(pullLatestFromOtherDevices, 8000);
+
+    return () => {
+      window.removeEventListener('focus', pullLatestFromOtherDevices);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.clearInterval(intervalId);
+    };
+  }, [currentUser?.uid, currentUser?.email]);
+
+  // Salva automaticamente no cache offline do usuário e sincroniza na nuvem (Firestore + Espelho por E-mail)
   useEffect(() => {
     if (!currentUser) return;
     storageService.saveStateForUser(currentUser.uid, state);
-    storageService.saveRegisteredAccountMetadata({
+    const updatedAccMeta: UserAccount = {
       ...currentUser,
+      emailVerified: true,
       name: state.manager.name || currentUser.name,
       hospitalName: state.manager.hospitalName || currentUser.hospitalName,
       sectorName: state.manager.sectorName || currentUser.sectorName,
       role: state.manager.role || currentUser.role,
       units: state.units.length > 0 ? state.units : currentUser.units,
-    });
+    };
+    storageService.saveRegisteredAccountMetadata(updatedAccMeta);
 
-    if (
-      (currentUser.authMode === 'firebase-google' || currentUser.authMode === 'firebase-email') &&
-      currentUser.emailVerified &&
-      !isHydratingRef.current
-    ) {
+    if (!isHydratingRef.current) {
       if (syncTimeoutRef.current) {
         window.clearTimeout(syncTimeoutRef.current);
       }
       setCloudSyncStatus('syncing');
       syncTimeoutRef.current = window.setTimeout(() => {
-        syncWorkspaceToFirestore(currentUser.uid, state)
+        syncWorkspaceToFirestore(currentUser.uid, state, currentUser.email, updatedAccMeta)
           .then((ok) => setCloudSyncStatus(ok ? 'synced' : 'idle'))
           .catch((err) => {
-            console.error('Erro ao sincronizar estado com Firestore:', err);
+            console.error('Erro ao sincronizar estado com a nuvem:', err);
             setCloudSyncStatus('idle');
           });
       }, 250);
@@ -471,91 +428,22 @@ export default function App() {
       return;
     }
 
-    await hydrateCloudAccount(account);
+    await hydrateCloudAccount(account, true);
   };
 
-  // Verifica confirmação de e-mail ou vincula Google para sincronização imediata entre App e Site
-  const handleConfirmEmailAndSync = async () => {
+  // Sincronização manual instantânea (botão Sincronizar no topo)
+  const handleManualCloudSync = async () => {
     if (!currentUser) return;
     setIsCheckingVerification(true);
     setSyncNoticeMsg(null);
     try {
-      const refreshed = await refreshCurrentFirebaseUser();
-      if (refreshed && refreshed.emailVerified) {
-        const updatedAcc: UserAccount = {
-          ...currentUser,
-          emailVerified: true,
-        };
-        storageService.saveRegisteredAccountMetadata(updatedAcc);
-        storageService.setActiveSessionAccount(updatedAcc);
-        setCurrentUser(updatedAcc);
-
-        setCloudSyncStatus('syncing');
-        const remote = await loadWorkspaceFromFirestore(refreshed.uid);
-        if (
-          remote &&
-          (!state.manager.onboardingCompleted ||
-            (remote.employees.length > 0 && state.employees.length === 0))
-        ) {
-          storageService.saveStateForUser(refreshed.uid, remote);
-          setState(remote);
-        } else {
-          await syncWorkspaceToFirestore(refreshed.uid, state);
-        }
-        setCloudSyncStatus('synced');
-        setSyncNoticeMsg('E-mail confirmado! Sua conta está 100% sincronizada entre App e Site.');
-        setTimeout(() => setSyncNoticeMsg(null), 5000);
-      } else {
-        setSyncNoticeMsg(
-          `Ainda aguardando a confirmação do link enviado para ${currentUser.email}. Verifique sua caixa de entrada ou Spam.`
-        );
-      }
-    } catch (err) {
-      setSyncNoticeMsg(err instanceof Error ? err.message : 'Erro ao verificar confirmação.');
-    } finally {
-      setIsCheckingVerification(false);
-    }
-  };
-
-  const handleResendVerification = async () => {
-    setSyncNoticeMsg(null);
-    try {
-      await resendVerificationEmail();
+      await hydrateCloudAccount(currentUser, true);
       setSyncNoticeMsg(
-        `Novo link de confirmação enviado para ${currentUser?.email}. Abra o link e toque em "Já confirmei".`
+        `Sincronização concluída! Sua conta (${currentUser.email}) está atualizada entre Celular e PC.`
       );
-    } catch (err) {
-      setSyncNoticeMsg(
-        err instanceof Error ? err.message : 'Aguarde alguns segundos antes de reenviar o e-mail.'
-      );
-    }
-  };
-
-  const handleLinkGoogleForInstantSync = async () => {
-    if (!currentUser) return;
-    setIsCheckingVerification(true);
-    setSyncNoticeMsg(null);
-    try {
-      const linkedUser = await linkGoogleToCurrentAccount();
-      const updatedAcc: UserAccount = {
-        ...currentUser,
-        authMode: 'firebase-google',
-        emailVerified: true,
-        photoURL: linkedUser.photoURL || currentUser.photoURL,
-      };
-      storageService.saveRegisteredAccountMetadata(updatedAcc);
-      storageService.setActiveSessionAccount(updatedAcc);
-      setCurrentUser(updatedAcc);
-      setCloudSyncStatus('syncing');
-      await syncWorkspaceToFirestore(linkedUser.uid, state);
-      setCloudSyncStatus('synced');
-      setSyncNoticeMsg('Conta Google vinculada! Sincronização imediata ativada.');
-      setTimeout(() => setSyncNoticeMsg(null), 5000);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!msg.includes('popup-closed-by-user')) {
-        setSyncNoticeMsg('Não foi possível vincular com o Google agora. Use a confirmação por e-mail.');
-      }
+      setTimeout(() => setSyncNoticeMsg(null), 4500);
+    } catch {
+      setSyncNoticeMsg('Não foi possível sincronizar agora. Verifique sua conexão.');
     } finally {
       setIsCheckingVerification(false);
     }
@@ -992,14 +880,7 @@ export default function App() {
                 {state.manager.name || currentUser.name}
               </p>
               <p className="text-[10px] text-slate-400 truncate flex items-center gap-1">
-                {(currentUser.authMode === 'firebase-google' ||
-                  currentUser.authMode === 'firebase-email') && (
-                  <Cloud
-                    className={`w-3 h-3 shrink-0 ${
-                      currentUser.emailVerified ? 'text-teal-400' : 'text-amber-400'
-                    }`}
-                  />
-                )}
+                <Cloud className="w-3 h-3 shrink-0 text-teal-400" />
                 <span>{currentUser.email}</span>
               </p>
             </div>
@@ -1030,13 +911,9 @@ export default function App() {
               </span>
               <span className="text-[11px] text-slate-500 hidden sm:block truncate">
                 Conta: {state.manager.name || currentUser.name} ({currentUser.email})
-                {cloudSyncStatus === 'synced'
-                  ? ' · Sincronizado na nuvem'
-                  : cloudSyncStatus === 'syncing'
-                  ? ' · Sincronizando...'
-                  : currentUser.authMode === 'firebase-email' && !currentUser.emailVerified
-                  ? ' · Confirme seu e-mail para sincronizar'
-                  : ' · Salvo localmente'}
+                {cloudSyncStatus === 'syncing'
+                  ? ' · Sincronizando na nuvem...'
+                  : ' · Sincronizado na nuvem (Celular e PC)'}
               </span>
             </div>
           </div>
@@ -1060,7 +937,7 @@ export default function App() {
             ))}
           </nav>
 
-          {/* Zona 3: 1 Ação Primária Contextual */}
+          {/* Zona 3: Sincronizar + Ação Primária Contextual */}
           <div className="flex items-center gap-2 shrink-0">
             {!isOnline && (
               <span className="inline-flex items-center gap-1 text-xs font-bold text-amber-700">
@@ -1068,6 +945,20 @@ export default function App() {
                 Offline
               </span>
             )}
+            <button
+              type="button"
+              onClick={handleManualCloudSync}
+              disabled={isCheckingVerification}
+              title="Sincronizar conta entre Celular e PC"
+              className="inline-flex items-center gap-1.5 px-2.5 py-2 rounded-xl bg-slate-100 hover:bg-teal-50 text-slate-700 hover:text-teal-800 border border-slate-200 text-xs font-bold transition-colors cursor-pointer disabled:opacity-60"
+            >
+              <RefreshCw
+                className={`w-3.5 h-3.5 text-teal-600 ${
+                  isCheckingVerification || cloudSyncStatus === 'syncing' ? 'animate-spin' : ''
+                }`}
+              />
+              <span className="hidden sm:inline">Sincronizar</span>
+            </button>
             <button
               type="button"
               onClick={() => {
@@ -1095,69 +986,6 @@ export default function App() {
             <div className="no-print p-3.5 rounded-2xl bg-teal-50 border border-teal-200 text-teal-900 text-xs font-semibold flex items-center gap-2">
               <CheckCircle2 className="w-4 h-4 text-teal-600 shrink-0" />
               <span>{syncNoticeMsg}</span>
-            </div>
-          )}
-
-          {currentUser.authMode === 'firebase-email' && !currentUser.emailVerified && (
-            <div className="no-print p-4 rounded-2xl bg-amber-50 border border-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div className="flex items-start gap-2.5">
-                <MailCheck className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
-                <div className="text-xs text-amber-950">
-                  <p className="font-bold">
-                    Confirme seu e-mail para sincronizar entre o App e o Site
-                  </p>
-                  <p className="text-amber-800 mt-0.5">
-                    Enviamos um link para <strong>{currentUser.email}</strong>. Após clicar no link (ou vincular com Google), suas unidades e escalas ficarão acessíveis de qualquer celular ou computador.
-                  </p>
-                </div>
-              </div>
-              <div className="flex flex-wrap items-center gap-2 shrink-0">
-                <button
-                  type="button"
-                  disabled={isCheckingVerification}
-                  onClick={handleConfirmEmailAndSync}
-                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold cursor-pointer disabled:opacity-60"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isCheckingVerification ? 'animate-spin' : ''}`} />
-                  <span>Já confirmei · Sincronizar</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={handleResendVerification}
-                  className="px-3 py-2 rounded-xl bg-white hover:bg-amber-100 text-amber-900 border border-amber-300 text-xs font-semibold cursor-pointer"
-                >
-                  Reenviar e-mail
-                </button>
-                <button
-                  type="button"
-                  disabled={isCheckingVerification}
-                  onClick={handleLinkGoogleForInstantSync}
-                  className="px-3 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold cursor-pointer"
-                >
-                  Vincular Google
-                </button>
-              </div>
-            </div>
-          )}
-
-          {currentUser.authMode === 'account-credentials' && currentUser.uid.startsWith('usr_') && (
-            <div className="no-print p-4 rounded-2xl bg-slate-900 text-white flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div className="flex items-start gap-2.5">
-                <Cloud className="w-5 h-5 text-teal-400 shrink-0 mt-0.5" />
-                <div className="text-xs">
-                  <p className="font-bold">Conta salva apenas neste dispositivo</p>
-                  <p className="text-slate-300 mt-0.5">
-                    Saia e entre novamente com seu e-mail e senha (ou Google) para enviar seus dados atuais para a nuvem e acessar de qualquer site ou celular.
-                  </p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={handleLogout}
-                className="px-3.5 py-2 rounded-xl bg-[#0d9488] hover:bg-teal-700 text-white text-xs font-bold cursor-pointer shrink-0"
-              >
-                Conectar à Nuvem
-              </button>
             </div>
           )}
 

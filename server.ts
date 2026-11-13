@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
 import { fileURLToPath } from 'url';
@@ -9,6 +10,7 @@ import mammoth from 'mammoth';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const CLOUD_STORE_PATH = path.join(__dirname, '.cloud-workspaces.json');
 
 interface ExtractedEmployeeItem {
   name: string;
@@ -788,11 +790,383 @@ async function callGeminiWithFallback(
   throw lastError || new Error('Serviço de análise temporariamente indisponível.');
 }
 
+interface CloudWorkspaceEntry {
+  email: string;
+  uid: string;
+  passwordHash?: string;
+  account: Record<string, unknown>;
+  state: Record<string, unknown>;
+  updatedAt: string;
+}
+
+function readCloudStore(): Record<string, CloudWorkspaceEntry> {
+  try {
+    if (!fs.existsSync(CLOUD_STORE_PATH)) return {};
+    const raw = fs.readFileSync(CLOUD_STORE_PATH, 'utf-8');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeCloudStore(store: Record<string, CloudWorkspaceEntry>): void {
+  try {
+    fs.writeFileSync(CLOUD_STORE_PATH, JSON.stringify(store, null, 2), 'utf-8');
+  } catch (err) {
+    console.warn('Aviso ao persistir .cloud-workspaces.json:', err);
+  }
+}
+
+function mergeWorkspacesOnServer(
+  existingStateRaw: Record<string, unknown> | undefined,
+  incomingStateRaw: Record<string, unknown> | undefined
+): Record<string, unknown> {
+  if (!existingStateRaw || typeof existingStateRaw !== 'object') {
+    return incomingStateRaw || {};
+  }
+  if (!incomingStateRaw || typeof incomingStateRaw !== 'object') {
+    return existingStateRaw;
+  }
+
+  const ex = existingStateRaw as {
+    manager?: Record<string, unknown>;
+    units?: Array<Record<string, unknown>>;
+    customRoles?: string[];
+    employees?: Array<Record<string, unknown>>;
+    schedules?: Record<string, Record<string, Record<string, Record<string, unknown>>>>;
+    pushConfig?: Record<string, unknown>;
+    lastUpdated?: string;
+  };
+  const inc = incomingStateRaw as typeof ex;
+
+  const exTime = new Date(String(ex.lastUpdated || 0)).getTime();
+  const incTime = new Date(String(inc.lastUpdated || 0)).getTime();
+  const exEmpCount = Array.isArray(ex.employees) ? ex.employees.length : 0;
+  const incEmpCount = Array.isArray(inc.employees) ? inc.employees.length : 0;
+
+  // Se o novo estado veio de um PC recém-logado sem funcionários e o estado salvo já possui funcionários, preserva os dados ricos do outro aparelho
+  const preferIncoming =
+    incEmpCount > 0 && exEmpCount === 0
+      ? true
+      : exEmpCount > 0 && incEmpCount === 0
+      ? false
+      : incTime >= exTime;
+
+  const primaryMgr = (preferIncoming ? inc.manager : ex.manager) || {};
+  const secondaryMgr = (preferIncoming ? ex.manager : inc.manager) || {};
+
+  const isPlaceholderHospital = (h: unknown) =>
+    !h || String(h).trim() === '' || String(h).trim() === 'Instituição' || String(h).trim() === 'Hospital / Instituição';
+
+  const mergedManager = {
+    ...secondaryMgr,
+    ...primaryMgr,
+    name: String(primaryMgr.name || secondaryMgr.name || ''),
+    hospitalName: !isPlaceholderHospital(primaryMgr.hospitalName)
+      ? String(primaryMgr.hospitalName)
+      : String(secondaryMgr.hospitalName || primaryMgr.hospitalName || ''),
+    role: String(primaryMgr.role || secondaryMgr.role || ''),
+    sectorName:
+      primaryMgr.sectorName && String(primaryMgr.sectorName) !== 'Geral'
+        ? String(primaryMgr.sectorName)
+        : String(secondaryMgr.sectorName || primaryMgr.sectorName || ''),
+    avatarBase64: String(primaryMgr.avatarBase64 || secondaryMgr.avatarBase64 || ''),
+    onboardingCompleted: Boolean(
+      primaryMgr.onboardingCompleted || secondaryMgr.onboardingCompleted
+    ),
+  };
+
+  // Mescla unidades (evitando que "Unidade Principal" genérica substitua unidades reais criadas pelo usuário)
+  const exUnits = Array.isArray(ex.units) ? ex.units : [];
+  const incUnits = Array.isArray(inc.units) ? inc.units : [];
+  const unitMap = new Map<string, Record<string, unknown>>();
+  const firstList = preferIncoming ? exUnits : incUnits;
+  const secondList = preferIncoming ? incUnits : exUnits;
+
+  for (const u of firstList) {
+    if (u && u.id) unitMap.set(String(u.id), u);
+  }
+  for (const u of secondList) {
+    if (u && u.id) unitMap.set(String(u.id), u);
+  }
+
+  let mergedUnits = Array.from(unitMap.values());
+  if (mergedUnits.length > 1) {
+    const hasCustomUnits = mergedUnits.some(
+      (u) => String(u.id) !== 'unit-default-1' && String(u.name) !== 'Unidade Principal'
+    );
+    if (hasCustomUnits) {
+      mergedUnits = mergedUnits.filter(
+        (u) => !(String(u.id) === 'unit-default-1' && String(u.name) === 'Unidade Principal')
+      );
+    }
+  }
+
+  // Mescla colaboradores e seus históricos (Folgas, Faltas, Atestados, Férias)
+  const exEmps = Array.isArray(ex.employees) ? ex.employees : [];
+  const incEmps = Array.isArray(inc.employees) ? inc.employees : [];
+  const empMap = new Map<string, Record<string, unknown>>();
+  const baseEmps = preferIncoming ? exEmps : incEmps;
+  const newerEmps = preferIncoming ? incEmps : exEmps;
+
+  for (const e of baseEmps) {
+    if (e && e.id) empMap.set(String(e.id), e);
+  }
+  for (const e of newerEmps) {
+    if (!e || !e.id) continue;
+    const id = String(e.id);
+    const prev = empMap.get(id);
+    if (!prev) {
+      empMap.set(id, e);
+    } else {
+      const histMap = new Map<string, Record<string, unknown>>();
+      const prevHist = Array.isArray(prev.history)
+        ? (prev.history as Array<Record<string, unknown>>)
+        : [];
+      const newHist = Array.isArray(e.history)
+        ? (e.history as Array<Record<string, unknown>>)
+        : [];
+      for (const h of prevHist) {
+        if (h && h.id) histMap.set(String(h.id), h);
+      }
+      for (const h of newHist) {
+        if (h && h.id) histMap.set(String(h.id), h);
+      }
+      empMap.set(id, {
+        ...prev,
+        ...e,
+        avatarBase64: e.avatarBase64 || prev.avatarBase64 || '',
+        history: Array.from(histMap.values()),
+      });
+    }
+  }
+
+  // Mescla células de escala mensal
+  const exSched = ex.schedules && typeof ex.schedules === 'object' ? ex.schedules : {};
+  const incSched = inc.schedules && typeof inc.schedules === 'object' ? inc.schedules : {};
+  const mergedSchedules: Record<string, Record<string, Record<string, Record<string, unknown>>>> = {};
+  const allYm = new Set([...Object.keys(exSched), ...Object.keys(incSched)]);
+
+  for (const ym of allYm) {
+    mergedSchedules[ym] = {};
+    const exYm = exSched[ym] || {};
+    const incYm = incSched[ym] || {};
+    const allEmpIds = new Set([...Object.keys(exYm), ...Object.keys(incYm)]);
+    for (const empId of allEmpIds) {
+      const exDays = exYm[empId] || {};
+      const incDays = incYm[empId] || {};
+      mergedSchedules[ym][empId] = preferIncoming
+        ? { ...exDays, ...incDays }
+        : { ...incDays, ...exDays };
+    }
+  }
+
+  const customRolesSet = new Set<string>([
+    ...(Array.isArray(ex.customRoles) ? ex.customRoles : []),
+    ...(Array.isArray(inc.customRoles) ? inc.customRoles : []),
+  ]);
+
+  return {
+    ...(preferIncoming ? inc : ex),
+    manager: mergedManager,
+    units: mergedUnits,
+    customRoles: Array.from(customRolesSet),
+    employees: Array.from(empMap.values()),
+    schedules: mergedSchedules,
+    lastUpdated: new Date().toISOString(),
+  };
+}
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json({ limit: '30mb' }));
+
+  // Endpoints de Sincronização em Nuvem por E-mail (unifica Celular, PC 1, PC 2 e qualquer navegador)
+  app.post('/api/cloud-sync/push', (req, res) => {
+    try {
+      const { email, uid, passwordHash, account, state } = req.body as {
+        email?: string;
+        uid?: string;
+        passwordHash?: string;
+        account?: Record<string, unknown>;
+        state?: Record<string, unknown>;
+      };
+      const cleanEmail = String(email || account?.email || '')
+        .trim()
+        .toLowerCase();
+      if (!cleanEmail) {
+        res.status(400).json({ ok: false, error: 'E-mail obrigatório para sincronização.' });
+        return;
+      }
+
+      const store = readCloudStore();
+      const existing = store[cleanEmail];
+      const mergedState = mergeWorkspacesOnServer(existing?.state, state);
+      const mgr = (mergedState.manager as Record<string, unknown>) || {};
+      const units = Array.isArray(mergedState.units) ? mergedState.units : [];
+
+      const mergedAccount: Record<string, unknown> = {
+        ...(existing?.account || {}),
+        ...(account || {}),
+        uid: String(uid || account?.uid || existing?.uid || `cloud_${Date.now()}`),
+        email: cleanEmail,
+        emailVerified: true,
+        name: String(mgr.name || account?.name || existing?.account?.name || ''),
+        hospitalName: String(
+          mgr.hospitalName || account?.hospitalName || existing?.account?.hospitalName || ''
+        ),
+        sectorName: String(
+          mgr.sectorName || account?.sectorName || existing?.account?.sectorName || ''
+        ),
+        role: String(mgr.role || account?.role || existing?.account?.role || ''),
+        units: units.length > 0 ? units : account?.units || existing?.account?.units || [],
+      };
+
+      store[cleanEmail] = {
+        email: cleanEmail,
+        uid: String(mergedAccount.uid),
+        passwordHash: passwordHash || existing?.passwordHash || '',
+        account: mergedAccount,
+        state: mergedState,
+        updatedAt: new Date().toISOString(),
+      };
+
+      writeCloudStore(store);
+      res.json({
+        ok: true,
+        account: mergedAccount,
+        state: mergedState,
+      });
+    } catch (err) {
+      console.error('Erro em /api/cloud-sync/push:', err);
+      res.status(500).json({ ok: false, error: 'Falha ao sincronizar dados.' });
+    }
+  });
+
+  app.post('/api/cloud-sync/pull', (req, res) => {
+    try {
+      const { email, uid } = req.body as { email?: string; uid?: string };
+      const cleanEmail = String(email || '')
+        .trim()
+        .toLowerCase();
+      const store = readCloudStore();
+
+      let entry: CloudWorkspaceEntry | undefined = cleanEmail ? store[cleanEmail] : undefined;
+      if (!entry && uid) {
+        entry = Object.values(store).find((item) => item.uid === uid);
+      }
+
+      if (!entry) {
+        res.json({ ok: true, found: false });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        found: true,
+        account: entry.account,
+        state: entry.state,
+        updatedAt: entry.updatedAt,
+      });
+    } catch (err) {
+      console.error('Erro em /api/cloud-sync/pull:', err);
+      res.status(500).json({ ok: false, found: false });
+    }
+  });
+
+  app.post('/api/cloud-sync/login', (req, res) => {
+    try {
+      const { email, passwordHash, name } = req.body as {
+        email?: string;
+        passwordHash?: string;
+        name?: string;
+      };
+      const cleanEmail = String(email || '')
+        .trim()
+        .toLowerCase();
+      if (!cleanEmail) {
+        res.status(400).json({ ok: false, error: 'Informe um e-mail válido.' });
+        return;
+      }
+
+      const store = readCloudStore();
+      const existing = store[cleanEmail];
+
+      if (existing) {
+        if (passwordHash && !existing.passwordHash) {
+          existing.passwordHash = passwordHash;
+          writeCloudStore(store);
+        }
+        res.json({
+          ok: true,
+          found: true,
+          account: {
+            ...existing.account,
+            emailVerified: true,
+          },
+          state: existing.state,
+        });
+        return;
+      }
+
+      // Se a conta ainda não sincronizou a partir do outro aparelho, inicializa sessão pronta na nuvem (sem exigir novo cadastro!)
+      const defaultUnit = {
+        id: 'unit-default-1',
+        name: 'Unidade Principal',
+        shiftMode: '24H',
+        minStaffDay: 2,
+        minStaffNight: 1,
+      };
+      const fallbackName = String(name || cleanEmail.split('@')[0] || 'Gestor(a)');
+      const newAccount: Record<string, unknown> = {
+        uid: `cloud_${Buffer.from(cleanEmail).toString('hex').slice(0, 20)}`,
+        name: fallbackName,
+        email: cleanEmail,
+        authMode: 'firebase-email',
+        emailVerified: true,
+        hospitalName: '',
+        sectorName: 'Farmácia',
+        role: 'Supervisor(a)',
+        units: [defaultUnit],
+        createdAt: new Date().toISOString(),
+      };
+      const newState: Record<string, unknown> = {
+        manager: {
+          name: fallbackName,
+          hospitalName: '',
+          role: 'Supervisor(a)',
+          sectorName: 'Farmácia',
+          avatarBase64: '',
+          onboardingCompleted: true,
+        },
+        units: [defaultUnit],
+        customRoles: [],
+        employees: [],
+        schedules: {},
+        pushConfig: {
+          enabled: false,
+          alertUncoveredShift1hBefore: true,
+          dailySummaryAt0630: true,
+          instantCertificateAlert: true,
+          webhookOrVapidKey: '',
+        },
+        lastUpdated: new Date(0).toISOString(),
+      };
+
+      res.json({
+        ok: true,
+        found: false,
+        account: newAccount,
+        state: newState,
+      });
+    } catch (err) {
+      console.error('Erro em /api/cloud-sync/login:', err);
+      res.status(500).json({ ok: false, error: 'Erro ao autenticar conta na nuvem.' });
+    }
+  });
 
   app.get('/apple-touch-icon.png', (_req, res) => {
     res.setHeader('Content-Type', 'image/png');

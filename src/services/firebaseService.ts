@@ -35,6 +35,7 @@ import {
   MonthlyScheduleMap,
   ScheduleCellData,
   ShiftStatus,
+  UserAccount,
 } from '../types';
 import {
   computeRegimeShiftForDay,
@@ -152,11 +153,6 @@ export async function registerWithFirebaseEmail(params: {
       displayName: params.name.trim(),
     }).catch((err) => console.warn('Aviso ao definir displayName:', err));
   }
-  try {
-    await sendEmailVerification(credential.user);
-  } catch (err) {
-    console.warn('Aviso ao enviar e-mail de verificação inicial:', err);
-  }
   return credential.user;
 }
 
@@ -217,13 +213,249 @@ export function subscribeToFirebaseAuth(callback: (user: User | null) => void): 
   return onAuthStateChanged(auth, callback);
 }
 
-/**
- * Carrega o espaço de trabalho completo do usuário autenticado no Firestore.
- * Retorna null caso o usuário ainda não possua um documento em `/workspaces/{userId}` ou ainda não tenha confirmado o e-mail.
- */
-export async function loadWorkspaceFromFirestore(userId: string): Promise<EscalaProState | null> {
-  if (!auth.currentUser || auth.currentUser.uid !== userId || !auth.currentUser.emailVerified) {
+export async function pushWorkspaceToCloudMirror(params: {
+  email: string;
+  uid: string;
+  state: EscalaProState;
+  account?: Partial<UserAccount>;
+  passwordHash?: string;
+}): Promise<EscalaProState | null> {
+  const cleanEmail = (params.email || '').trim().toLowerCase();
+  if (!cleanEmail) return null;
+  try {
+    const res = await fetch('/api/cloud-sync/push', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: cleanEmail,
+        uid: params.uid,
+        passwordHash: params.passwordHash,
+        account: params.account,
+        state: params.state,
+      }),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      ok?: boolean;
+      state?: EscalaProState;
+    };
+    return data.ok && data.state ? data.state : null;
+  } catch {
     return null;
+  }
+}
+
+export async function pullWorkspaceFromCloudMirror(
+  email?: string,
+  uid?: string
+): Promise<{ account?: UserAccount; state?: EscalaProState } | null> {
+  const cleanEmail = (email || auth.currentUser?.email || '').trim().toLowerCase();
+  if (!cleanEmail && !uid) return null;
+  try {
+    const res = await fetch('/api/cloud-sync/pull', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: cleanEmail,
+        uid: uid || auth.currentUser?.uid,
+      }),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      ok?: boolean;
+      found?: boolean;
+      account?: UserAccount;
+      state?: EscalaProState;
+    };
+    if (data.ok && data.found && data.state) {
+      return {
+        account: data.account,
+        state: data.state,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function loginViaCloudMirror(params: {
+  email: string;
+  passwordHash?: string;
+  name?: string;
+}): Promise<{ found: boolean; account: UserAccount; state: EscalaProState } | null> {
+  const cleanEmail = (params.email || '').trim().toLowerCase();
+  if (!cleanEmail) return null;
+  try {
+    const res = await fetch('/api/cloud-sync/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: cleanEmail,
+        passwordHash: params.passwordHash || '',
+        name: params.name || '',
+      }),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      ok?: boolean;
+      found?: boolean;
+      account?: UserAccount;
+      state?: EscalaProState;
+    };
+    if (data.ok && data.account && data.state) {
+      return {
+        found: Boolean(data.found),
+        account: data.account,
+        state: data.state,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function mergeTwoEscalaProStates(
+  baseState: EscalaProState,
+  otherState: EscalaProState
+): EscalaProState {
+  const baseEmpCount = Array.isArray(baseState.employees) ? baseState.employees.length : 0;
+  const otherEmpCount = Array.isArray(otherState.employees) ? otherState.employees.length : 0;
+  const baseTime = new Date(baseState.lastUpdated || 0).getTime();
+  const otherTime = new Date(otherState.lastUpdated || 0).getTime();
+
+  const preferOther =
+    otherEmpCount > 0 && baseEmpCount === 0
+      ? true
+      : baseEmpCount > 0 && otherEmpCount === 0
+      ? false
+      : otherTime >= baseTime;
+
+  const primary = preferOther ? otherState : baseState;
+  const secondary = preferOther ? baseState : otherState;
+
+  const isGenericHospital = (h?: string) =>
+    !h || !h.trim() || h.trim() === 'Instituição' || h.trim() === 'Hospital / Instituição';
+
+  const mergedUnitsMap = new Map<string, HospitalUnit>();
+  for (const u of secondary.units || []) {
+    if (u && u.id) mergedUnitsMap.set(u.id, u);
+  }
+  for (const u of primary.units || []) {
+    if (u && u.id) mergedUnitsMap.set(u.id, u);
+  }
+  let mergedUnits = Array.from(mergedUnitsMap.values());
+  if (mergedUnits.length > 1) {
+    const hasCustomUnits = mergedUnits.some(
+      (u) => u.id !== 'unit-default-1' && u.name !== 'Unidade Principal'
+    );
+    if (hasCustomUnits) {
+      mergedUnits = mergedUnits.filter(
+        (u) => !(u.id === 'unit-default-1' && u.name === 'Unidade Principal')
+      );
+    }
+  }
+
+  const empMap = new Map<string, Employee>();
+  for (const e of secondary.employees || []) {
+    if (e && e.id) empMap.set(e.id, e);
+  }
+  for (const e of primary.employees || []) {
+    if (!e || !e.id) continue;
+    const prev = empMap.get(e.id);
+    if (!prev) {
+      empMap.set(e.id, e);
+    } else {
+      const histMap = new Map<string, AbsenceRecord>();
+      for (const h of prev.history || []) histMap.set(h.id, h);
+      for (const h of e.history || []) histMap.set(h.id, h);
+      empMap.set(e.id, {
+        ...prev,
+        ...e,
+        avatarBase64: e.avatarBase64 || prev.avatarBase64,
+        history: Array.from(histMap.values()),
+      });
+    }
+  }
+  const mergedEmployees = Array.from(empMap.values());
+
+  const mergedSchedules: MonthlyScheduleMap = {};
+  const allYmKeys = new Set([
+    ...Object.keys(secondary.schedules || {}),
+    ...Object.keys(primary.schedules || {}),
+  ]);
+  for (const ym of allYmKeys) {
+    mergedSchedules[ym] = {};
+    const secYm = secondary.schedules?.[ym] || {};
+    const priYm = primary.schedules?.[ym] || {};
+    const allEmpIds = new Set([...Object.keys(secYm), ...Object.keys(priYm)]);
+    for (const empId of allEmpIds) {
+      const secDays = secYm[empId] || {};
+      const priDays = priYm[empId] || {};
+      const mergedDays: Record<number, ScheduleCellData> = {
+        ...secDays,
+        ...priDays,
+      };
+      for (const [dKey, secCell] of Object.entries(secDays)) {
+        const dNum = Number(dKey);
+        const priCell = priDays[dNum];
+        if (
+          !priCell &&
+          (secCell.note || secCell.unitOverrideId !== undefined || secCell.extraHours)
+        ) {
+          mergedDays[dNum] = secCell;
+        }
+      }
+      mergedSchedules[ym][empId] = mergedDays;
+    }
+  }
+
+  const finalSchedules = reapplyEmployeeHistoryToSchedules(mergedEmployees, mergedSchedules);
+  const customRolesSet = new Set<string>([
+    ...(secondary.customRoles || []),
+    ...(primary.customRoles || []),
+  ]);
+
+  return {
+    ...primary,
+    manager: {
+      ...secondary.manager,
+      ...primary.manager,
+      name: primary.manager.name || secondary.manager.name || '',
+      hospitalName: !isGenericHospital(primary.manager.hospitalName)
+        ? primary.manager.hospitalName
+        : secondary.manager.hospitalName || primary.manager.hospitalName || '',
+      role: primary.manager.role || secondary.manager.role || '',
+      sectorName:
+        primary.manager.sectorName && primary.manager.sectorName !== 'Geral'
+          ? primary.manager.sectorName
+          : secondary.manager.sectorName || primary.manager.sectorName || '',
+      avatarBase64: primary.manager.avatarBase64 || secondary.manager.avatarBase64 || '',
+      onboardingCompleted: Boolean(
+        primary.manager.onboardingCompleted || secondary.manager.onboardingCompleted
+      ),
+    },
+    units: mergedUnits,
+    customRoles: Array.from(customRolesSet),
+    employees: mergedEmployees,
+    schedules: finalSchedules,
+    lastUpdated: new Date(Math.max(baseTime, otherTime, Date.now())).toISOString(),
+  };
+}
+
+/**
+ * Carrega o espaço de trabalho completo do usuário autenticado no Firestore e no espelho de nuvem por e-mail.
+ */
+export async function loadWorkspaceFromFirestore(
+  userId: string,
+  email?: string
+): Promise<EscalaProState | null> {
+  const mirrorResult = await pullWorkspaceFromCloudMirror(email, userId);
+  const mirrorState = mirrorResult?.state || null;
+
+  if (!auth.currentUser || auth.currentUser.uid !== userId) {
+    return mirrorState;
   }
 
   const safeUid = sanitizeId(userId);
@@ -232,11 +464,12 @@ export async function loadWorkspaceFromFirestore(userId: string): Promise<Escala
   try {
     workspaceSnap = await getDoc(doc(db, 'workspaces', safeUid));
   } catch (error) {
-    handleFirestoreError(error, OperationType.GET, workspacePath);
+    console.warn('Aviso ao consultar Firestore, usando espelho em nuvem:', error);
+    return mirrorState;
   }
 
   if (!workspaceSnap || !workspaceSnap.exists()) {
-    return null;
+    return mirrorState;
   }
 
   const wsData = workspaceSnap.data();
@@ -360,7 +593,7 @@ export async function loadWorkspaceFromFirestore(userId: string): Promise<Escala
       ? wsData.updatedAt.toDate().toISOString()
       : new Date(0).toISOString();
 
-  return {
+  const firestoreState: EscalaProState = {
     manager: {
       name: String(wsData.managerName || ''),
       hospitalName: String(wsData.hospitalName || ''),
@@ -382,20 +615,50 @@ export async function loadWorkspaceFromFirestore(userId: string): Promise<Escala
     },
     lastUpdated: remoteUpdatedIso,
   };
+
+  if (mirrorState) {
+    return mergeTwoEscalaProStates(firestoreState, mirrorState);
+  }
+  return firestoreState;
 }
 
 /**
- * Sincroniza o estado completo do usuário para o Firestore respeitando rigorosamente o schema e regras.
- * Retorna true se a gravação na nuvem foi realizada, ou false se foi ignorada (ex: e-mail não verificado ou onboarding pendente).
+ * Sincroniza o estado completo do usuário para o Firestore e para o espelho em nuvem por e-mail.
  */
-export async function syncWorkspaceToFirestore(userId: string, state: EscalaProState): Promise<boolean> {
+export async function syncWorkspaceToFirestore(
+  userId: string,
+  state: EscalaProState,
+  accountEmail?: string,
+  accountObj?: Partial<UserAccount>
+): Promise<boolean> {
+  const emailToSync = (accountEmail || accountObj?.email || auth.currentUser?.email || '')
+    .trim()
+    .toLowerCase();
+
+  let syncedMirror = false;
+  if (
+    emailToSync &&
+    (state.manager.onboardingCompleted ||
+      state.employees.length > 0 ||
+      state.units.length > 0)
+  ) {
+    const mirrorRes = await pushWorkspaceToCloudMirror({
+      email: emailToSync,
+      uid: userId,
+      state,
+      account: accountObj,
+    });
+    if (mirrorRes) {
+      syncedMirror = true;
+    }
+  }
+
   if (
     !auth.currentUser ||
     auth.currentUser.uid !== userId ||
-    !auth.currentUser.emailVerified ||
     !state.manager.onboardingCompleted
   ) {
-    return false;
+    return syncedMirror;
   }
 
   const safeUid = sanitizeId(userId);
