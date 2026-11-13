@@ -25,7 +25,11 @@ import {
   storageService,
 } from './services/storageService';
 import {
+  auth,
+  linkGoogleToCurrentAccount,
   loadWorkspaceFromFirestore,
+  refreshCurrentFirebaseUser,
+  resendVerificationEmail,
   signOutFirebase,
   subscribeToFirebaseAuth,
   syncWorkspaceToFirestore,
@@ -44,12 +48,15 @@ import { QuickLeaveWizardModal } from './components/QuickLeaveWizardModal';
 import { usePWAInstall } from './hooks/usePWAInstall';
 import {
   CalendarDays,
+  CheckCircle2,
   Cloud,
   Download,
   FileUp,
   FileWarning,
   LayoutDashboard,
   LogOut,
+  MailCheck,
+  RefreshCw,
   Settings,
   UserPlus,
   Users,
@@ -79,7 +86,12 @@ export default function App() {
     typeof navigator !== 'undefined' ? navigator.onLine : true
   );
   const [cloudSyncStatus, setCloudSyncStatus] = useState<'idle' | 'syncing' | 'synced'>('idle');
+  const [isCloudHydrating, setIsCloudHydrating] = useState<boolean>(false);
+  const [syncNoticeMsg, setSyncNoticeMsg] = useState<string | null>(null);
+  const [isCheckingVerification, setIsCheckingVerification] = useState<boolean>(false);
   const syncTimeoutRef = useRef<number | null>(null);
+  const isHydratingRef = useRef<boolean>(false);
+  const hydratedUidRef = useRef<string | null>(null);
 
   const [navContext, setNavContext] = useState<NavigationContext>({
     activePage: 'inicio',
@@ -110,49 +122,168 @@ export default function App() {
 
   const { isInstallable, isInstalled, installApp } = usePWAInstall();
 
-  // Escuta autenticação Firebase (caso o usuário tenha logado com Google)
+  const hydrateCloudAccount = async (account: UserAccount) => {
+    if (isHydratingRef.current && hydratedUidRef.current === account.uid) return;
+    isHydratingRef.current = true;
+    hydratedUidRef.current = account.uid;
+
+    try {
+      let localUserState = storageService.loadStateForUser(account);
+      const orphaned = storageService.findOrphanedLocalWorkspace(account.uid);
+
+      if (
+        !localUserState.manager.onboardingCompleted &&
+        localUserState.employees.length === 0 &&
+        orphaned
+      ) {
+        localUserState = orphaned.state;
+        storageService.saveStateForUser(account.uid, localUserState);
+        try {
+          localStorage.removeItem(orphaned.storageKey);
+        } catch {
+          // ignora erro ao limpar chave legada
+        }
+      }
+
+      setState(localUserState);
+
+      if (account.emailVerified && auth.currentUser?.uid === account.uid) {
+        if (!localUserState.manager.onboardingCompleted) {
+          setIsCloudHydrating(true);
+        }
+        setCloudSyncStatus('syncing');
+        const remoteState = await loadWorkspaceFromFirestore(account.uid);
+
+        if (remoteState) {
+          let finalState = remoteState;
+          let shouldPushMerged = false;
+
+          // Se a nuvem ainda não tem colaboradores, mas o aparelho local (ou workspace órfão) já possui, preserva e sobe para a nuvem
+          const richerLocal =
+            localUserState.employees.length > 0
+              ? localUserState
+              : orphaned && orphaned.state.employees.length > 0
+              ? orphaned.state
+              : null;
+
+          if (remoteState.employees.length === 0 && richerLocal) {
+            finalState = {
+              ...remoteState,
+              manager: {
+                ...remoteState.manager,
+                name: remoteState.manager.name || richerLocal.manager.name,
+                hospitalName:
+                  remoteState.manager.hospitalName || richerLocal.manager.hospitalName,
+                sectorName: remoteState.manager.sectorName || richerLocal.manager.sectorName,
+                role: remoteState.manager.role || richerLocal.manager.role,
+                onboardingCompleted:
+                  remoteState.manager.onboardingCompleted ||
+                  richerLocal.manager.onboardingCompleted,
+              },
+              units:
+                remoteState.units.length > 0 ? remoteState.units : richerLocal.units,
+              employees: richerLocal.employees,
+              schedules:
+                Object.keys(richerLocal.schedules || {}).length > 0
+                  ? richerLocal.schedules
+                  : remoteState.schedules,
+            };
+            shouldPushMerged = true;
+          }
+
+          storageService.saveStateForUser(account.uid, finalState);
+          setState(finalState);
+          if (orphaned) {
+            try {
+              localStorage.removeItem(orphaned.storageKey);
+            } catch {
+              // ignora
+            }
+          }
+
+          if (shouldPushMerged) {
+            await syncWorkspaceToFirestore(account.uid, finalState);
+          }
+
+          const mergedAccount: UserAccount = {
+            ...account,
+            name: finalState.manager.name || account.name,
+            hospitalName: finalState.manager.hospitalName || account.hospitalName,
+            sectorName: finalState.manager.sectorName || account.sectorName,
+            role: finalState.manager.role || account.role,
+            units: finalState.units.length > 0 ? finalState.units : account.units,
+          };
+          storageService.saveRegisteredAccountMetadata(mergedAccount);
+          storageService.setActiveSessionAccount(mergedAccount);
+          setCurrentUser(mergedAccount);
+          setCloudSyncStatus('synced');
+        } else if (localUserState.manager.onboardingCompleted) {
+          const pushed = await syncWorkspaceToFirestore(account.uid, localUserState);
+          setCloudSyncStatus(pushed ? 'synced' : 'idle');
+        } else {
+          setCloudSyncStatus('idle');
+        }
+      } else {
+        setCloudSyncStatus('idle');
+      }
+    } catch (err) {
+      console.error('Aviso na sincronização com Firestore:', err);
+      setCloudSyncStatus('idle');
+    } finally {
+      isHydratingRef.current = false;
+      setIsCloudHydrating(false);
+    }
+  };
+
+  // Escuta autenticação Firebase (Google ou E-mail/Senha) em qualquer dispositivo
   useEffect(() => {
     const unsubscribe = subscribeToFirebaseAuth(async (fbUser) => {
       if (!fbUser) return;
       const activeAcc = storageService.getActiveSessionAccount();
-      if (!activeAcc || activeAcc.uid === fbUser.uid) {
-        const googleAcc: UserAccount = {
+      const fbEmailClean = (fbUser.email || '').trim().toLowerCase();
+      const activeEmailClean = (activeAcc?.email || '').trim().toLowerCase();
+
+      // Só mantém sessão local legada se for de OUTRO e-mail; se for o mesmo e-mail, unifica na conta Firebase
+      if (
+        activeAcc &&
+        activeAcc.authMode === 'account-credentials' &&
+        activeAcc.uid.startsWith('usr_') &&
+        activeEmailClean !== fbEmailClean
+      ) {
+        return;
+      }
+
+      if (!activeAcc || activeAcc.uid === fbUser.uid || activeEmailClean === fbEmailClean) {
+        const isGoogle = fbUser.providerData.some((p) => p.providerId === 'google.com');
+        const fbAcc: UserAccount = {
           uid: fbUser.uid,
-          name: fbUser.displayName || activeAcc?.name || fbUser.email?.split('@')[0] || 'Gestor(a)',
+          name: fbUser.displayName || activeAcc?.name || '',
           email: fbUser.email || activeAcc?.email || '',
           photoURL: fbUser.photoURL || undefined,
-          authMode: 'firebase-google',
-          hospitalName: activeAcc?.hospitalName || 'Hospital Central',
-          sectorName: activeAcc?.sectorName || 'Farmácia',
-          role: activeAcc?.role || 'Supervisor de Farmácia',
+          authMode: isGoogle ? 'firebase-google' : 'firebase-email',
+          emailVerified: fbUser.emailVerified,
+          hospitalName: activeAcc?.hospitalName || '',
+          sectorName: activeAcc?.sectorName || '',
+          role: activeAcc?.role || '',
+          units: activeAcc?.units || [],
           createdAt: activeAcc?.createdAt || new Date().toISOString(),
         };
-        storageService.saveRegisteredAccountMetadata(googleAcc);
-        storageService.setActiveSessionAccount(googleAcc);
-        setCurrentUser(googleAcc);
+        if (activeAcc && activeAcc.uid !== fbUser.uid && activeAcc.uid.startsWith('usr_')) {
+          storageService.removeLocalAccountRecord(activeAcc.uid);
+        }
+        storageService.saveRegisteredAccountMetadata(fbAcc);
+        storageService.setActiveSessionAccount(fbAcc);
+        setCurrentUser(fbAcc);
 
-        try {
-          setCloudSyncStatus('syncing');
-          const remoteState = await loadWorkspaceFromFirestore(fbUser.uid);
-          if (remoteState) {
-            storageService.saveStateForUser(fbUser.uid, remoteState);
-            setState(remoteState);
-          } else {
-            const localUserState = storageService.loadStateForUser(googleAcc);
-            setState(localUserState);
-            await syncWorkspaceToFirestore(fbUser.uid, localUserState);
-          }
-          setCloudSyncStatus('synced');
-        } catch (err) {
-          console.error('Aviso na sincronização inicial com Firestore:', err);
-          setCloudSyncStatus('idle');
+        if (hydratedUidRef.current !== fbUser.uid) {
+          await hydrateCloudAccount(fbAcc);
         }
       }
     });
     return () => unsubscribe();
   }, []);
 
-  // Salva automaticamente no espaço isolado do usuário logado (e sincroniza com o Firestore se Google Auth)
+  // Salva automaticamente no cache offline do usuário e sincroniza na nuvem (Firestore)
   useEffect(() => {
     if (!currentUser) return;
     storageService.saveStateForUser(currentUser.uid, state);
@@ -162,16 +293,21 @@ export default function App() {
       hospitalName: state.manager.hospitalName || currentUser.hospitalName,
       sectorName: state.manager.sectorName || currentUser.sectorName,
       role: state.manager.role || currentUser.role,
+      units: state.units.length > 0 ? state.units : currentUser.units,
     });
 
-    if (currentUser.authMode === 'firebase-google') {
+    if (
+      (currentUser.authMode === 'firebase-google' || currentUser.authMode === 'firebase-email') &&
+      currentUser.emailVerified &&
+      !isHydratingRef.current
+    ) {
       if (syncTimeoutRef.current) {
         window.clearTimeout(syncTimeoutRef.current);
       }
       setCloudSyncStatus('syncing');
       syncTimeoutRef.current = window.setTimeout(() => {
         syncWorkspaceToFirestore(currentUser.uid, state)
-          .then(() => setCloudSyncStatus('synced'))
+          .then((ok) => setCloudSyncStatus(ok ? 'synced' : 'idle'))
           .catch((err) => {
             console.error('Erro ao sincronizar estado com Firestore:', err);
             setCloudSyncStatus('idle');
@@ -221,6 +357,7 @@ export default function App() {
 
   // Quando o usuário entra ou se cadastra na tela de acesso
   const handleUserAuthenticated = async (account: UserAccount, startWithDemo = false) => {
+    hydratedUidRef.current = null;
     setCurrentUser(account);
     if (startWithDemo) {
       const demo = createDemoEscalaProState();
@@ -240,31 +377,103 @@ export default function App() {
       return;
     }
 
-    const userState = storageService.loadStateForUser(account);
-    setState(userState);
+    await hydrateCloudAccount(account);
+  };
 
-    if (account.authMode === 'firebase-google') {
-      try {
+  // Verifica confirmação de e-mail ou vincula Google para sincronização imediata entre App e Site
+  const handleConfirmEmailAndSync = async () => {
+    if (!currentUser) return;
+    setIsCheckingVerification(true);
+    setSyncNoticeMsg(null);
+    try {
+      const refreshed = await refreshCurrentFirebaseUser();
+      if (refreshed && refreshed.emailVerified) {
+        const updatedAcc: UserAccount = {
+          ...currentUser,
+          emailVerified: true,
+        };
+        storageService.saveRegisteredAccountMetadata(updatedAcc);
+        storageService.setActiveSessionAccount(updatedAcc);
+        setCurrentUser(updatedAcc);
+
         setCloudSyncStatus('syncing');
-        const remote = await loadWorkspaceFromFirestore(account.uid);
-        if (remote) {
-          storageService.saveStateForUser(account.uid, remote);
+        const remote = await loadWorkspaceFromFirestore(refreshed.uid);
+        if (
+          remote &&
+          (!state.manager.onboardingCompleted ||
+            (remote.employees.length > 0 && state.employees.length === 0))
+        ) {
+          storageService.saveStateForUser(refreshed.uid, remote);
           setState(remote);
         } else {
-          await syncWorkspaceToFirestore(account.uid, userState);
+          await syncWorkspaceToFirestore(refreshed.uid, state);
         }
         setCloudSyncStatus('synced');
-      } catch (e) {
-        console.error('Erro ao buscar dados da nuvem no login:', e);
-        setCloudSyncStatus('idle');
+        setSyncNoticeMsg('E-mail confirmado! Sua conta está 100% sincronizada entre App e Site.');
+        setTimeout(() => setSyncNoticeMsg(null), 5000);
+      } else {
+        setSyncNoticeMsg(
+          `Ainda aguardando a confirmação do link enviado para ${currentUser.email}. Verifique sua caixa de entrada ou Spam.`
+        );
       }
+    } catch (err) {
+      setSyncNoticeMsg(err instanceof Error ? err.message : 'Erro ao verificar confirmação.');
+    } finally {
+      setIsCheckingVerification(false);
+    }
+  };
+
+  const handleResendVerification = async () => {
+    setSyncNoticeMsg(null);
+    try {
+      await resendVerificationEmail();
+      setSyncNoticeMsg(
+        `Novo link de confirmação enviado para ${currentUser?.email}. Abra o link e toque em "Já confirmei".`
+      );
+    } catch (err) {
+      setSyncNoticeMsg(
+        err instanceof Error ? err.message : 'Aguarde alguns segundos antes de reenviar o e-mail.'
+      );
+    }
+  };
+
+  const handleLinkGoogleForInstantSync = async () => {
+    if (!currentUser) return;
+    setIsCheckingVerification(true);
+    setSyncNoticeMsg(null);
+    try {
+      const linkedUser = await linkGoogleToCurrentAccount();
+      const updatedAcc: UserAccount = {
+        ...currentUser,
+        authMode: 'firebase-google',
+        emailVerified: true,
+        photoURL: linkedUser.photoURL || currentUser.photoURL,
+      };
+      storageService.saveRegisteredAccountMetadata(updatedAcc);
+      storageService.setActiveSessionAccount(updatedAcc);
+      setCurrentUser(updatedAcc);
+      setCloudSyncStatus('syncing');
+      await syncWorkspaceToFirestore(linkedUser.uid, state);
+      setCloudSyncStatus('synced');
+      setSyncNoticeMsg('Conta Google vinculada! Sincronização imediata ativada.');
+      setTimeout(() => setSyncNoticeMsg(null), 5000);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes('popup-closed-by-user')) {
+        setSyncNoticeMsg('Não foi possível vincular com o Google agora. Use a confirmação por e-mail.');
+      }
+    } finally {
+      setIsCheckingVerification(false);
     }
   };
 
   // Encerra a sessão atual para permitir entrada ou cadastro de outro usuário
   const handleLogout = async () => {
+    hydratedUidRef.current = null;
+    isHydratingRef.current = false;
     storageService.setActiveSessionAccount(null);
     setCurrentUser(null);
+    setCloudSyncStatus('idle');
     await signOutFirebase();
   };
 
@@ -558,6 +767,20 @@ export default function App() {
     return <AuthScreen onAuthenticated={handleUserAuthenticated} />;
   }
 
+  if (isCloudHydrating) {
+    return (
+      <div className="min-h-screen bg-[#0f172a] text-white flex flex-col items-center justify-center p-6 text-center">
+        <Logo size={54} />
+        <p className="mt-4 text-sm font-bold tracking-tight">
+          Sincronizando sua conta na nuvem...
+        </p>
+        <p className="mt-1 text-xs text-slate-400">
+          Carregando suas unidades, colaboradores e escalas
+        </p>
+      </div>
+    );
+  }
+
   if (!state.manager.onboardingCompleted) {
     return (
       <OnboardingModal
@@ -565,11 +788,12 @@ export default function App() {
           ...state.manager,
           name: state.manager.name || currentUser.name,
           hospitalName: state.manager.hospitalName || currentUser.hospitalName || '',
-          sectorName: state.manager.sectorName || currentUser.sectorName || 'Farmácia',
-          role: state.manager.role || currentUser.role || 'Supervisor de Farmácia',
+          sectorName: state.manager.sectorName || currentUser.sectorName || '',
+          role: state.manager.role || currentUser.role || '',
         }}
         initialUnits={state.units}
         onCompleteOnboarding={handleCompleteOnboarding}
+        onBackToAuth={handleLogout}
         onLoadDemoData={handleLoadDemoData}
       />
     );
@@ -655,8 +879,13 @@ export default function App() {
                 {state.manager.name || currentUser.name}
               </p>
               <p className="text-[10px] text-slate-400 truncate flex items-center gap-1">
-                {currentUser.authMode === 'firebase-google' && (
-                  <Cloud className="w-3 h-3 text-teal-400 shrink-0" />
+                {(currentUser.authMode === 'firebase-google' ||
+                  currentUser.authMode === 'firebase-email') && (
+                  <Cloud
+                    className={`w-3 h-3 shrink-0 ${
+                      currentUser.emailVerified ? 'text-teal-400' : 'text-amber-400'
+                    }`}
+                  />
                 )}
                 <span>{currentUser.email}</span>
               </p>
@@ -688,7 +917,13 @@ export default function App() {
               </span>
               <span className="text-[11px] text-slate-500 hidden sm:block truncate">
                 Conta: {state.manager.name || currentUser.name} ({currentUser.email})
-                {cloudSyncStatus === 'synced' ? ' · Salvo na nuvem' : ' · Salvo na conta'}
+                {cloudSyncStatus === 'synced'
+                  ? ' · Sincronizado na nuvem'
+                  : cloudSyncStatus === 'syncing'
+                  ? ' · Sincronizando...'
+                  : currentUser.authMode === 'firebase-email' && !currentUser.emailVerified
+                  ? ' · Confirme seu e-mail para sincronizar'
+                  : ' · Salvo localmente'}
               </span>
             </div>
           </div>
@@ -739,7 +974,77 @@ export default function App() {
         </header>
 
         {/* CONTEÚDO DA TELA ATIVA */}
-        <main className="flex-1 p-4 md:p-8 pb-24 md:pb-10 max-w-7xl w-full mx-auto">
+        <main className="flex-1 p-4 md:p-8 pb-24 md:pb-10 max-w-7xl w-full mx-auto space-y-5">
+          {syncNoticeMsg && (
+            <div className="no-print p-3.5 rounded-2xl bg-teal-50 border border-teal-200 text-teal-900 text-xs font-semibold flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 text-teal-600 shrink-0" />
+              <span>{syncNoticeMsg}</span>
+            </div>
+          )}
+
+          {currentUser.authMode === 'firebase-email' && !currentUser.emailVerified && (
+            <div className="no-print p-4 rounded-2xl bg-amber-50 border border-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5">
+                <MailCheck className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+                <div className="text-xs text-amber-950">
+                  <p className="font-bold">
+                    Confirme seu e-mail para sincronizar entre o App e o Site
+                  </p>
+                  <p className="text-amber-800 mt-0.5">
+                    Enviamos um link para <strong>{currentUser.email}</strong>. Após clicar no link (ou vincular com Google), suas unidades e escalas ficarão acessíveis de qualquer celular ou computador.
+                  </p>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  disabled={isCheckingVerification}
+                  onClick={handleConfirmEmailAndSync}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold cursor-pointer disabled:opacity-60"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isCheckingVerification ? 'animate-spin' : ''}`} />
+                  <span>Já confirmei · Sincronizar</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleResendVerification}
+                  className="px-3 py-2 rounded-xl bg-white hover:bg-amber-100 text-amber-900 border border-amber-300 text-xs font-semibold cursor-pointer"
+                >
+                  Reenviar e-mail
+                </button>
+                <button
+                  type="button"
+                  disabled={isCheckingVerification}
+                  onClick={handleLinkGoogleForInstantSync}
+                  className="px-3 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold cursor-pointer"
+                >
+                  Vincular Google
+                </button>
+              </div>
+            </div>
+          )}
+
+          {currentUser.authMode === 'account-credentials' && currentUser.uid.startsWith('usr_') && (
+            <div className="no-print p-4 rounded-2xl bg-slate-900 text-white flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5">
+                <Cloud className="w-5 h-5 text-teal-400 shrink-0 mt-0.5" />
+                <div className="text-xs">
+                  <p className="font-bold">Conta salva apenas neste dispositivo</p>
+                  <p className="text-slate-300 mt-0.5">
+                    Saia e entre novamente com seu e-mail e senha (ou Google) para enviar seus dados atuais para a nuvem e acessar de qualquer site ou celular.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="px-3.5 py-2 rounded-xl bg-[#0d9488] hover:bg-teal-700 text-white text-xs font-bold cursor-pointer shrink-0"
+              >
+                Conectar à Nuvem
+              </button>
+            </div>
+          )}
+
           {navContext.activePage === 'inicio' && (
             <DashboardPage
               state={state}

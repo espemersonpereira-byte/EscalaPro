@@ -1,10 +1,18 @@
 import { initializeApp } from 'firebase/app';
 import {
+  browserLocalPersistence,
+  createUserWithEmailAndPassword,
   getAuth,
   GoogleAuthProvider,
+  linkWithPopup,
   onAuthStateChanged,
+  sendEmailVerification,
+  sendPasswordResetEmail,
+  setPersistence,
+  signInWithEmailAndPassword,
   signInWithPopup,
   signOut,
+  updateProfile,
   User,
 } from 'firebase/auth';
 import {
@@ -33,6 +41,10 @@ const app = initializeApp(firebaseConfig);
 export const db = getFirestoreInstance();
 export const auth = getAuth(app);
 const googleProvider = new GoogleAuthProvider();
+
+setPersistence(auth, browserLocalPersistence).catch((err) => {
+  console.warn('Aviso ao configurar persistência local do Firebase Auth:', err);
+});
 
 import { getFirestore } from 'firebase/firestore';
 function getFirestoreInstance() {
@@ -121,6 +133,74 @@ export async function signInWithGooglePopup(): Promise<User> {
   return result.user;
 }
 
+export async function registerWithFirebaseEmail(params: {
+  name: string;
+  email: string;
+  password: string;
+}): Promise<User> {
+  const credential = await createUserWithEmailAndPassword(
+    auth,
+    params.email.trim().toLowerCase(),
+    params.password
+  );
+  if (params.name.trim()) {
+    await updateProfile(credential.user, {
+      displayName: params.name.trim(),
+    }).catch((err) => console.warn('Aviso ao definir displayName:', err));
+  }
+  try {
+    await sendEmailVerification(credential.user);
+  } catch (err) {
+    console.warn('Aviso ao enviar e-mail de verificação inicial:', err);
+  }
+  return credential.user;
+}
+
+export async function loginWithFirebaseEmail(email: string, password: string): Promise<User> {
+  const credential = await signInWithEmailAndPassword(
+    auth,
+    email.trim().toLowerCase(),
+    password
+  );
+  try {
+    await credential.user.reload();
+  } catch (err) {
+    console.warn('Aviso ao atualizar status do usuário:', err);
+  }
+  return auth.currentUser || credential.user;
+}
+
+export async function resendVerificationEmail(): Promise<void> {
+  if (!auth.currentUser) {
+    throw new Error('Nenhuma conta autenticada no momento.');
+  }
+  await sendEmailVerification(auth.currentUser);
+}
+
+export async function refreshCurrentFirebaseUser(): Promise<User | null> {
+  if (!auth.currentUser) return null;
+  await auth.currentUser.reload();
+  await auth.currentUser.getIdToken(true);
+  return auth.currentUser;
+}
+
+export async function sendFirebasePasswordReset(email: string): Promise<void> {
+  const cleanEmail = email.trim().toLowerCase();
+  if (!cleanEmail) {
+    throw new Error('Digite seu e-mail para receber o link de redefinição de senha.');
+  }
+  await sendPasswordResetEmail(auth, cleanEmail);
+}
+
+export async function linkGoogleToCurrentAccount(): Promise<User> {
+  if (!auth.currentUser) {
+    throw new Error('Faça login primeiro para vincular sua conta Google.');
+  }
+  const result = await linkWithPopup(auth.currentUser, googleProvider);
+  await result.user.reload();
+  return auth.currentUser || result.user;
+}
+
 export async function signOutFirebase(): Promise<void> {
   try {
     await signOut(auth);
@@ -135,10 +215,12 @@ export function subscribeToFirebaseAuth(callback: (user: User | null) => void): 
 
 /**
  * Carrega o espaço de trabalho completo do usuário autenticado no Firestore.
- * Retorna null caso o usuário ainda não possua um documento em `/workspaces/{userId}`.
+ * Retorna null caso o usuário ainda não possua um documento em `/workspaces/{userId}` ou ainda não tenha confirmado o e-mail.
  */
 export async function loadWorkspaceFromFirestore(userId: string): Promise<EscalaProState | null> {
-  if (!auth.currentUser || auth.currentUser.uid !== userId) return null;
+  if (!auth.currentUser || auth.currentUser.uid !== userId || !auth.currentUser.emailVerified) {
+    return null;
+  }
 
   const safeUid = sanitizeId(userId);
   const workspacePath = `workspaces/${safeUid}`;
@@ -270,23 +352,12 @@ export async function loadWorkspaceFromFirestore(userId: string): Promise<Escala
     manager: {
       name: String(wsData.managerName || ''),
       hospitalName: String(wsData.hospitalName || ''),
-      role: String(wsData.managerRole || 'Supervisor de Farmácia'),
-      sectorName: String(wsData.sectorName || 'Farmácia'),
+      role: String(wsData.managerRole || ''),
+      sectorName: String(wsData.sectorName || ''),
       avatarBase64: '',
       onboardingCompleted: Boolean(wsData.onboardingCompleted),
     },
-    units:
-      units.length > 0
-        ? units
-        : [
-            {
-              id: 'unit-1',
-              name: 'Farmácia Central',
-              shiftMode: '24H',
-              minStaffDay: 3,
-              minStaffNight: 2,
-            },
-          ],
+    units,
     customRoles: [],
     employees,
     schedules,
@@ -303,10 +374,16 @@ export async function loadWorkspaceFromFirestore(userId: string): Promise<Escala
 
 /**
  * Sincroniza o estado completo do usuário para o Firestore respeitando rigorosamente o schema e regras.
+ * Retorna true se a gravação na nuvem foi realizada, ou false se foi ignorada (ex: e-mail não verificado ou onboarding pendente).
  */
-export async function syncWorkspaceToFirestore(userId: string, state: EscalaProState): Promise<void> {
-  if (!auth.currentUser || auth.currentUser.uid !== userId || !auth.currentUser.emailVerified) {
-    return;
+export async function syncWorkspaceToFirestore(userId: string, state: EscalaProState): Promise<boolean> {
+  if (
+    !auth.currentUser ||
+    auth.currentUser.uid !== userId ||
+    !auth.currentUser.emailVerified ||
+    !state.manager.onboardingCompleted
+  ) {
+    return false;
   }
 
   const safeUid = sanitizeId(userId);
@@ -322,10 +399,10 @@ export async function syncWorkspaceToFirestore(userId: string, state: EscalaProS
 
   const wsPayload = {
     ownerId: safeUid,
-    managerName: clampString(state.manager.name, 1, 120, 'Gestor Hospitalar'),
-    managerRole: clampString(state.manager.role, 1, 100, 'Supervisor de Farmácia'),
-    sectorName: clampString(state.manager.sectorName, 1, 100, 'Farmácia'),
-    hospitalName: clampString(state.manager.hospitalName, 1, 150, 'Hospital Central'),
+    managerName: clampString(state.manager.name, 1, 120, 'Gestor(a)'),
+    managerRole: clampString(state.manager.role, 1, 100, 'Gestor(a)'),
+    sectorName: clampString(state.manager.sectorName, 1, 100, 'Geral'),
+    hospitalName: clampString(state.manager.hospitalName, 1, 150, 'Instituição'),
     onboardingCompleted: Boolean(state.manager.onboardingCompleted),
     pushEnabled: Boolean(state.pushConfig.enabled),
     pushTime: '06:30',
@@ -497,4 +574,5 @@ export async function syncWorkspaceToFirestore(userId: string, state: EscalaProS
       }
     }
   }
+  return true;
 }

@@ -28,7 +28,8 @@ export interface UserAccount {
   name: string;
   email: string;
   photoURL?: string;
-  authMode: 'firebase-google' | 'account-credentials';
+  authMode: 'firebase-google' | 'firebase-email' | 'account-credentials';
+  emailVerified?: boolean;
   hospitalName?: string;
   sectorName?: string;
   role?: string;

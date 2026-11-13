@@ -8,6 +8,7 @@ import {
 } from '../types';
 import { Logo } from './Logo';
 import {
+  ArrowLeft,
   Camera,
   CheckCircle2,
   ChevronRight,
@@ -21,6 +22,7 @@ interface OnboardingModalProps {
   initialManager: ManagerProfile;
   initialUnits: HospitalUnit[];
   onCompleteOnboarding: (manager: ManagerProfile, units: HospitalUnit[]) => void;
+  onBackToAuth?: () => void;
   onLoadDemoData?: () => void;
 }
 
@@ -28,6 +30,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
   initialManager,
   initialUnits,
   onCompleteOnboarding,
+  onBackToAuth,
 }) => {
   const [step, setStep] = useState<1 | 2>(1);
   const [name, setName] = useState(initialManager.name || '');
@@ -192,11 +195,11 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     <div className="min-h-screen bg-[#0f172a] text-slate-900 flex flex-col justify-center items-center p-4 md:p-8">
       <div className="w-full max-w-3xl bg-white rounded-3xl shadow-2xl border border-slate-200 overflow-hidden">
         {/* Cabeçalho Institucional */}
-        <div className="bg-slate-900 text-white px-6 py-6 md:px-8 border-b border-slate-800 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3.5">
-            <Logo size={48} />
-            <div>
-              <h1 className="text-xl font-bold tracking-tight text-white">
+        <div className="bg-slate-900 text-white px-5 py-5 md:px-8 md:py-6 border-b border-slate-800 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3.5 min-w-0">
+            <Logo size={46} />
+            <div className="min-w-0">
+              <h1 className="text-lg md:text-xl font-bold tracking-tight text-white truncate">
                 Configuração da Sua Conta · Escala<span className="text-[#0d9488]">Pro</span>
               </h1>
               <p className="text-xs text-slate-300">
@@ -204,6 +207,17 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
               </p>
             </div>
           </div>
+
+          {onBackToAuth && (
+            <button
+              type="button"
+              onClick={onBackToAuth}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 text-xs font-bold transition-colors cursor-pointer shrink-0"
+            >
+              <ArrowLeft className="w-4 h-4" />
+              <span>Voltar</span>
+            </button>
+          )}
         </div>
 
         <form onSubmit={handleFinish} className="p-6 md:p-8 space-y-6">
@@ -318,11 +332,24 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                 )}
               </div>
 
-              <div className="flex items-center justify-end pt-4 border-t border-slate-200">
+              <div className="flex flex-col-reverse sm:flex-row items-center justify-between gap-3 pt-4 border-t border-slate-200">
+                {onBackToAuth ? (
+                  <button
+                    type="button"
+                    onClick={onBackToAuth}
+                    className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl border border-slate-300 text-slate-700 hover:bg-slate-100 text-sm font-semibold transition-colors cursor-pointer"
+                  >
+                    <ArrowLeft className="w-4 h-4" />
+                    <span>Voltar para Entrar / Criar Conta</span>
+                  </button>
+                ) : (
+                  <div />
+                )}
+
                 <button
                   type="button"
                   onClick={handleNextStep}
-                  className="inline-flex items-center gap-2 px-6 py-3 rounded-xl bg-[#0d9488] hover:bg-teal-700 text-white font-semibold text-sm transition-colors cursor-pointer"
+                  className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-6 py-3 rounded-xl bg-[#0d9488] hover:bg-teal-700 text-white font-semibold text-sm transition-colors cursor-pointer"
                 >
                   <span>Avançar para Setor e Unidades</span>
                   <ChevronRight className="w-4 h-4" />

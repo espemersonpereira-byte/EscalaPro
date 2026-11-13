@@ -702,7 +702,18 @@ export const storageService = {
       const raw = localStorage.getItem(ACCOUNTS_LIST_KEY);
       if (!raw) return [];
       const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : [];
+      if (!Array.isArray(parsed)) return [];
+      // Garante zero contas duplicadas com o mesmo e-mail (prioriza contas Firebase)
+      const byEmail = new Map<string, LocalRegisteredAccount>();
+      for (const acc of parsed as LocalRegisteredAccount[]) {
+        if (!acc || !acc.email) continue;
+        const emailKey = acc.email.trim().toLowerCase();
+        const prev = byEmail.get(emailKey);
+        if (!prev || (!prev.authMode?.startsWith('firebase') && acc.authMode?.startsWith('firebase'))) {
+          byEmail.set(emailKey, acc);
+        }
+      }
+      return Array.from(byEmail.values());
     } catch {
       return [];
     }
@@ -710,24 +721,73 @@ export const storageService = {
 
   saveRegisteredAccountMetadata(account: UserAccount): void {
     try {
-      const accounts = this.listRegisteredAccounts();
-      const idx = accounts.findIndex(
-        (a) => a.uid === account.uid || a.email.toLowerCase() === account.email.toLowerCase()
+      const cleanEmail = (account.email || '').trim().toLowerCase();
+      const accounts = this.listRegisteredAccounts().filter(
+        (a) => a.uid !== account.uid && a.email.trim().toLowerCase() !== cleanEmail
       );
-      if (idx >= 0) {
-        accounts[idx] = {
-          ...accounts[idx],
-          ...account,
-        };
-      } else {
-        accounts.push({
-          ...account,
-          passwordHash: '',
-        });
-      }
+      accounts.unshift({
+        ...account,
+        email: cleanEmail || account.email,
+        passwordHash: '',
+      });
       localStorage.setItem(ACCOUNTS_LIST_KEY, JSON.stringify(accounts));
     } catch (e) {
       console.error('Erro ao atualizar metadados da conta:', e);
+    }
+  },
+
+  findLegacyLocalAccountByEmail(email: string, password: string): LocalRegisteredAccount | null {
+    const cleanEmail = email.trim().toLowerCase();
+    const accounts = this.listRegisteredAccounts();
+    const found = accounts.find(
+      (a) =>
+        a.email.toLowerCase() === cleanEmail &&
+        a.authMode === 'account-credentials' &&
+        a.uid.startsWith('usr_')
+    );
+    if (!found) return null;
+    if (found.passwordHash && found.passwordHash !== simpleHashPassword(password)) {
+      return null;
+    }
+    return found;
+  },
+
+  /**
+   * Procura dados salvos localmente em outra chave de conta no mesmo aparelho (ex: conta local usr_... anterior)
+   * para evitar que o usuário precise configurar tudo de novo ou perca colaboradores ao unificar na nuvem.
+   */
+  findOrphanedLocalWorkspace(targetUid: string): { storageKey: string; state: EscalaProState } | null {
+    try {
+      let best: { storageKey: string; state: EscalaProState; score: number } | null = null;
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (!key || !key.startsWith(USER_STATE_PREFIX)) continue;
+        const uidFromKey = key.slice(USER_STATE_PREFIX.length);
+        if (uidFromKey === targetUid) continue;
+        const raw = localStorage.getItem(key);
+        if (!raw) continue;
+        const parsed = JSON.parse(raw) as EscalaProState;
+        if (!parsed || !parsed.manager) continue;
+        const empCount = Array.isArray(parsed.employees) ? parsed.employees.length : 0;
+        const unitCount = Array.isArray(parsed.units) ? parsed.units.length : 0;
+        if (!parsed.manager.onboardingCompleted && empCount === 0) continue;
+        const score = empCount * 100 + unitCount * 10 + (parsed.manager.onboardingCompleted ? 5 : 0);
+        if (!best || score > best.score) {
+          best = { storageKey: key, state: parsed, score };
+        }
+      }
+      return best ? { storageKey: best.storageKey, state: best.state } : null;
+    } catch {
+      return null;
+    }
+  },
+
+  removeLocalAccountRecord(uid: string): void {
+    try {
+      const filtered = this.listRegisteredAccounts().filter((a) => a.uid !== uid);
+      localStorage.setItem(ACCOUNTS_LIST_KEY, JSON.stringify(filtered));
+    } catch (e) {
+      console.error('Erro ao remover registro local migrado:', e);
     }
   },
 
