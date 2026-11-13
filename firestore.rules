@@ -185,7 +185,7 @@ service cloud.firestore {
         data.ownerId == request.auth.uid &&
         isValidId(data.employeeId) &&
         data.type is string && data.type.size() >= 4 && data.type.size() <= 30 &&
-        (data.type == 'FALTA' || data.type == 'ATESTADO' || data.type == 'DECLARACAO_HORAS' || data.type == 'FERIAS' || data.type == 'PERMUTA' || data.type == 'BANCO_HORAS') &&
+        (data.type == 'FOLGA' || data.type == 'FALTA' || data.type == 'ATESTADO' || data.type == 'DECLARACAO_HORAS' || data.type == 'FERIAS' || data.type == 'PERMUTA' || data.type == 'BANCO_HORAS') &&
         data.startDate is string && data.startDate.size() >= 8 && data.startDate.size() <= 20 &&
         data.endDate is string && data.endDate.size() >= 8 && data.endDate.size() <= 20 &&
         data.daysCount is int && data.daysCount >= 1 && data.daysCount <= 365 &&

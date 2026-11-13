@@ -30,6 +30,7 @@ import {
   RotateCcw,
   Sun,
   UserCheck,
+  UserPlus,
   Users,
   UserX,
   X,
@@ -39,9 +40,10 @@ interface DashboardPageProps {
   state: EscalaProState;
   onNavigate: (updates: Partial<NavigationContext>) => void;
   onOpenEmployeeModal: (employeeId: string) => void;
+  onOpenNewEmployeeForUnit?: (unitId: string) => void;
   onOpenQuickLeaveWizard?: (
     employeeId?: string | null,
-    initialType?: 'ATESTADO' | 'DECLARACAO_HORAS' | 'FALTA' | 'FERIAS'
+    initialType?: 'FOLGA' | 'ATESTADO' | 'DECLARACAO_HORAS' | 'FALTA' | 'FERIAS'
   ) => void;
   onUpdateScheduleCell?: (
     year: number,
@@ -62,6 +64,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   state,
   onNavigate,
   onOpenEmployeeModal,
+  onOpenNewEmployeeForUnit,
   onOpenQuickLeaveWizard,
   onUpdateScheduleCell,
 }) => {
@@ -577,7 +580,12 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
             const dayDeficit = Math.max(0, dayNeeded - dayShiftTeam.length);
             const nightDeficit = Math.max(0, nightNeeded - nightShiftTeam.length);
             const isUnitComplete = dayDeficit === 0 && nightDeficit === 0;
-            const isOffExpanded = !!expandedOffUnits[unit.id];
+            const isOffExpanded =
+              expandedOffUnits[unit.id] !== undefined
+                ? expandedOffUnits[unit.id]
+                : dayShiftTeam.length === 0 &&
+                  nightShiftTeam.length === 0 &&
+                  offOrAwayTeam.length > 0;
 
             return (
               <div
@@ -606,46 +614,62 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                           {unit.name}
                         </h3>
                         <p className="text-xs text-slate-500">
-                          Funcionamento {unit.shiftMode} · Lotação mín.: {dayNeeded}D / {nightNeeded}N
+                          Funcionamento {unit.shiftMode} · {unitEmployees.length}{' '}
+                          {unitEmployees.length === 1 ? 'funcionário' : 'funcionários'} · Mín.:{' '}
+                          {dayNeeded}D / {nightNeeded}N
                         </p>
                       </div>
                     </button>
 
-                    {/* Indicador Visual de Cobertura */}
-                    <button
-                      type="button"
-                      onClick={() =>
-                        onNavigate({
-                          activePage: 'escala',
-                          selectedUnitFilter: unit.id,
-                          onlyUncoveredDaysInSchedule: !isUnitComplete,
-                        })
-                      }
-                      className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-colors cursor-pointer tabular-nums ${
-                        isUnitComplete
-                          ? 'bg-emerald-50 text-emerald-800 border border-emerald-200 hover:bg-emerald-100'
-                          : 'bg-red-50 text-red-700 border border-red-200 hover:bg-red-100'
-                      }`}
-                    >
-                      {isUnitComplete ? (
-                        <>
-                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                          <span>
-                            {dayShiftTeam.length + nightShiftTeam.length}/
-                            {dayNeeded + nightNeeded} escalados · Completo
-                          </span>
-                        </>
-                      ) : (
-                        <>
-                          <AlertTriangle className="w-3.5 h-3.5 text-red-600" />
-                          <span>
-                            {dayShiftTeam.length + nightShiftTeam.length}/
-                            {dayNeeded + nightNeeded} escalados · Falta{' '}
-                            {dayDeficit + nightDeficit} profissional
-                          </span>
-                        </>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {onOpenNewEmployeeForUnit && (
+                        <button
+                          type="button"
+                          onClick={() => onOpenNewEmployeeForUnit(unit.id)}
+                          title={`Cadastrar funcionário no setor ${unit.name}`}
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-white hover:bg-teal-50 text-teal-700 border border-slate-200 hover:border-teal-300 text-xs font-bold transition-colors cursor-pointer"
+                        >
+                          <UserPlus className="w-3.5 h-3.5" />
+                          <span>+ Funcionário</span>
+                        </button>
                       )}
-                    </button>
+
+                      {/* Indicador Visual de Cobertura */}
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onNavigate({
+                            activePage: 'escala',
+                            selectedUnitFilter: unit.id,
+                            onlyUncoveredDaysInSchedule: !isUnitComplete,
+                          })
+                        }
+                        className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-colors cursor-pointer tabular-nums ${
+                          isUnitComplete
+                            ? 'bg-emerald-50 text-emerald-800 border border-emerald-200 hover:bg-emerald-100'
+                            : 'bg-red-50 text-red-700 border border-red-200 hover:bg-red-100'
+                        }`}
+                      >
+                        {isUnitComplete ? (
+                          <>
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                            <span>
+                              {dayShiftTeam.length + nightShiftTeam.length}/
+                              {dayNeeded + nightNeeded} escalados · Completo
+                            </span>
+                          </>
+                        ) : (
+                          <>
+                            <AlertTriangle className="w-3.5 h-3.5 text-red-600" />
+                            <span>
+                              {dayShiftTeam.length + nightShiftTeam.length}/
+                              {dayNeeded + nightNeeded} escalados · Falta{' '}
+                              {dayDeficit + nightDeficit} profissional
+                            </span>
+                          </>
+                        )}
+                      </button>
+                    </div>
                   </div>
 
                   {/* Corpo com Turno Diurno e Turno Noturno */}

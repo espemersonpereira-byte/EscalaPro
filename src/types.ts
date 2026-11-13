@@ -44,7 +44,7 @@ export interface LocalRegisteredAccount extends UserAccount {
 export interface AbsenceRecord {
   id: string;
   employeeId: string;
-  type: 'FALTA' | 'ATESTADO' | 'FERIAS' | 'TROCA' | 'HORA_EXTRA' | 'DECLARACAO_HORAS';
+  type: 'FOLGA' | 'FALTA' | 'ATESTADO' | 'FERIAS' | 'TROCA' | 'HORA_EXTRA' | 'DECLARACAO_HORAS';
   startDate: string; // YYYY-MM-DD
   endDate?: string; // YYYY-MM-DD
   nextShiftDate?: string; // YYYY-MM-DD (próximo plantão calculado mediante a escala)
@@ -153,6 +153,7 @@ export interface ExtractedPdfEmployee {
 
 export const PRE_REGISTERED_MANAGER_ROLES: string[] = [
   'Supervisor de Farmácia',
+  'Supervisor de Almoxarifado e Recebimento',
   'Supervisor de Enfermagem',
   'Coordenador Médico',
   'Líder de Recepção',
@@ -163,6 +164,8 @@ export const PRE_REGISTERED_MANAGER_ROLES: string[] = [
 
 export const PRE_REGISTERED_SECTORS: string[] = [
   'Farmácia',
+  'Almoxarifado',
+  'Recebimento',
   'Enfermagem',
   'Medicina',
   'Radiologia',
@@ -176,6 +179,9 @@ export const PRE_REGISTERED_SECTORS: string[] = [
 export const NATIVE_HOSPITAL_ROLES: string[] = [
   'Farmacêutico',
   'Auxiliar de Farmácia',
+  'Auxiliar de Almoxarifado',
+  'Auxiliar de Recebimento',
+  'Jovem Aprendiz',
   'Enfermeiro',
   'Técnico de Enfermagem',
   'Auxiliar de Enfermagem',
@@ -193,8 +199,12 @@ export const WORK_HOURS_PRESETS: string[] = [
   '07:00 às 19:00',
   '19:00 às 07:00',
   '08:00 às 17:00',
+  '08:00 às 18:00',
   '07:00 às 13:00',
   '13:00 às 19:00',
+  '08:00 às 12:00',
+  '13:00 às 17:00',
+  '08:00 às 14:00',
   '06:00 às 14:20',
   '14:00 às 22:20',
 ];

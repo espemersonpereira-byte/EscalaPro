@@ -177,7 +177,65 @@ export function calculateLeaveAndNextShift(
   };
 }
 
-// Gera ou atualiza a escala automática de um mês preservando Férias (FE), Atestados (AT), Faltas (FA) e Trocas (TR)
+// Reaplica os registros do histórico (Folga, Falta, Atestado, Férias) nas células da escala caso necessário
+export function reapplyEmployeeHistoryToSchedules(
+  employees: Employee[],
+  schedules: MonthlyScheduleMap
+): MonthlyScheduleMap {
+  let updated: MonthlyScheduleMap = { ...schedules };
+  for (const emp of employees) {
+    if (!emp.active || !Array.isArray(emp.history) || emp.history.length === 0) continue;
+    // Percorre do mais antigo para o mais recente para que lançamentos recentes prevaleçam
+    const chronological = [...emp.history].reverse();
+    for (const rec of chronological) {
+      const statusToApply: ShiftStatus | null =
+        rec.type === 'FOLGA'
+          ? 'F'
+          : rec.type === 'FALTA'
+          ? 'FA'
+          : rec.type === 'ATESTADO'
+          ? 'AT'
+          : rec.type === 'FERIAS'
+          ? 'FE'
+          : null;
+      if (!statusToApply || !rec.startDate) continue;
+
+      const { year, monthIndex0, day } = parseIsoDateParts(rec.startDate);
+      const startObj = new Date(year, monthIndex0, day);
+      const safeDays = Math.max(1, Math.min(365, Number(rec.daysCount) || 1));
+
+      for (let i = 0; i < safeDays; i++) {
+        const dObj = new Date(startObj);
+        dObj.setDate(startObj.getDate() + i);
+        const y = dObj.getFullYear();
+        const m0 = dObj.getMonth();
+        const dNum = dObj.getDate();
+        const ymKey = getYearMonthKey(y, m0);
+
+        const existingCell = updated[ymKey]?.[emp.id]?.[dNum];
+        const defaultRegime = computeRegimeShiftForDay(emp, y, m0, dNum);
+        // Se a célula não existir ou ainda estiver no valor padrão de regime sem edição manual, aplica o histórico
+        if (!existingCell || (existingCell.status === defaultRegime && !existingCell.note)) {
+          const monthMap = { ...(updated[ymKey] || {}) };
+          const empMap: Record<number, ScheduleCellData> = { ...(monthMap[emp.id] || {}) };
+          empMap[dNum] = {
+            ...(existingCell || {}),
+            status: statusToApply,
+            note: existingCell?.note || rec.reason,
+          };
+          monthMap[emp.id] = empMap;
+          updated = {
+            ...updated,
+            [ymKey]: monthMap,
+          };
+        }
+      }
+    }
+  }
+  return updated;
+}
+
+// Gera ou atualiza a escala automática de um mês preservando Férias (FE), Atestados (AT), Faltas (FA), Trocas (TR) e Folgas/ajustes manuais
 export function generateAutomaticScheduleForMonth(
   employees: Employee[],
   existingSchedules: MonthlyScheduleMap,
@@ -195,35 +253,44 @@ export function generateAutomaticScheduleForMonth(
 
     for (let day = 1; day <= daysCount; day++) {
       const currentCell = empExistingDays[day];
+      const calculatedStatus = computeRegimeShiftForDay(emp, year, monthIndex0, day);
+
       if (
         preserveAbsences &&
         currentCell &&
         (currentCell.status === 'AT' ||
           currentCell.status === 'FE' ||
           currentCell.status === 'FA' ||
-          currentCell.status === 'TR')
+          currentCell.status === 'TR' ||
+          currentCell.status !== calculatedStatus ||
+          Boolean(currentCell.note) ||
+          Boolean(currentCell.extraHours) ||
+          Boolean(currentCell.unitOverrideId))
       ) {
         continue;
       }
 
-      const calculatedStatus = computeRegimeShiftForDay(emp, year, monthIndex0, day);
       empExistingDays[day] = {
+        ...(currentCell || {}),
         status: calculatedStatus,
         note: currentCell?.note,
         extraHours: currentCell?.extraHours,
+        unitOverrideId: currentCell?.unitOverrideId,
       };
     }
 
     currentMonthMap[emp.id] = empExistingDays;
   }
 
-  return {
+  const nextMap: MonthlyScheduleMap = {
     ...existingSchedules,
     [ymKey]: currentMonthMap,
   };
+
+  return preserveAbsences ? reapplyEmployeeHistoryToSchedules(employees, nextMap) : nextMap;
 }
 
-// Aplica um registro de ausência (Falta, Atestado, Férias) diretamente nas células da escala
+// Aplica um registro de ausência ou folga (Folga, Falta, Atestado, Férias) diretamente nas células da escala
 export function applyAbsenceToSchedules(
   schedules: MonthlyScheduleMap,
   employeeId: string,
@@ -250,7 +317,7 @@ export function applyAbsenceToSchedules(
     empMap[dNum] = {
       ...(empMap[dNum] || {}),
       status,
-      note,
+      note: note || empMap[dNum]?.note || 'Marcado na escala',
     };
 
     monthMap[employeeId] = empMap;

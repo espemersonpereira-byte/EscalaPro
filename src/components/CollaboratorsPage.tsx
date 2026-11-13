@@ -34,7 +34,7 @@ interface CollaboratorsPageProps {
   onOpenEmployeeModal: (employeeId: string | null) => void;
   onOpenQuickLeaveWizard: (
     employeeId?: string | null,
-    initialType?: 'ATESTADO' | 'DECLARACAO_HORAS' | 'FALTA' | 'FERIAS'
+    initialType?: 'FOLGA' | 'ATESTADO' | 'DECLARACAO_HORAS' | 'FALTA' | 'FERIAS'
   ) => void;
 }
 

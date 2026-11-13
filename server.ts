@@ -299,6 +299,9 @@ function inferAttributesFromRowCells(
       'Farmacêutico',
       'Auxiliar de Farmácia',
       'Técnico de Farmácia',
+      'Auxiliar de Almoxarifado',
+      'Auxiliar de Recebimento',
+      'Jovem Aprendiz',
       'Enfermeiro',
       'Técnico de Enfermagem',
       'Auxiliar de Enfermagem',
@@ -323,7 +326,10 @@ function inferAttributesFromRowCells(
     }
   }
   if (!roleHint) {
-    if (/\bfarm/i.test(joined) && /\baux/i.test(joined)) roleHint = 'Auxiliar de Farmácia';
+    if (/\balmox/i.test(joined)) roleHint = 'Auxiliar de Almoxarifado';
+    else if (/\brecebim/i.test(joined)) roleHint = 'Auxiliar de Recebimento';
+    else if (/\baprendiz\b/i.test(joined)) roleHint = 'Jovem Aprendiz';
+    else if (/\bfarm/i.test(joined) && /\baux/i.test(joined)) roleHint = 'Auxiliar de Farmácia';
     else if (/\bfarm/i.test(joined)) roleHint = 'Farmacêutico';
     else if (/\bt[eé]c.*enf/i.test(joined) || /\bte\b/i.test(joined))
       roleHint = 'Técnico de Enfermagem';

@@ -3,9 +3,11 @@ import {
   AbsenceRecord,
   Employee,
   EscalaProState,
+  HospitalUnit,
   NATIVE_HOSPITAL_ROLES,
   REGIME_LABELS,
   ScheduleRegime,
+  UnitShiftMode,
   WORK_HOURS_PRESETS,
 } from '../types';
 import {
@@ -35,19 +37,25 @@ import {
 interface EmployeeModalProps {
   state: EscalaProState;
   employee: Employee | null; // null = Novo Colaborador
+  initialUnitId?: string | null;
   onClose: () => void;
-  onSaveEmployee: (emp: Employee, newCustomRole?: string) => void;
+  onSaveEmployee: (
+    emp: Employee,
+    newCustomRole?: string,
+    newUnitToCreate?: HospitalUnit
+  ) => void;
   onDeleteEmployee?: (employeeId: string) => void;
   onRegisterAbsenceOrLeave: (
     employeeId: string,
     record: AbsenceRecord,
-    statusToApply: 'FA' | 'AT' | 'FE'
+    statusToApply: 'F' | 'FA' | 'AT' | 'FE'
   ) => void;
 }
 
 export const EmployeeModal: React.FC<EmployeeModalProps> = ({
   state,
   employee,
+  initialUnitId,
   onClose,
   onSaveEmployee,
   onDeleteEmployee,
@@ -58,9 +66,15 @@ export const EmployeeModal: React.FC<EmployeeModalProps> = ({
   const todayIso = formatIsoDate(now.getFullYear(), now.getMonth(), now.getDate());
 
   const allRoles = Array.from(new Set([...NATIVE_HOSPITAL_ROLES, ...state.customRoles]));
+  const hasAlmoxarifadoUnit = state.units.some(
+    (u) => u.name.trim().toLowerCase() === 'almoxarifado'
+  );
+  const hasRecebimentoUnit = state.units.some(
+    (u) => u.name.trim().toLowerCase() === 'recebimento'
+  );
 
   const [activeSubModal, setActiveSubModal] = useState<
-    'NONE' | 'FALTA' | 'ATESTADO' | 'FERIAS' | 'PREVIEW_ANEXO'
+    'NONE' | 'FOLGA' | 'FALTA' | 'ATESTADO' | 'FERIAS' | 'PREVIEW_ANEXO'
   >('NONE');
 
   // Dados cadastrais editáveis (sem valores de exemplo pré-preenchidos para novos cadastros)
@@ -71,8 +85,10 @@ export const EmployeeModal: React.FC<EmployeeModalProps> = ({
   const [role, setRole] = useState(employee?.role || '');
   const [customRoleInput, setCustomRoleInput] = useState('');
   const [unitId, setUnitId] = useState(
-    employee?.unitId || state.units[0]?.id || ''
+    employee?.unitId || initialUnitId || state.units[0]?.id || ''
   );
+  const [newUnitNameInput, setNewUnitNameInput] = useState('');
+  const [newUnitShiftMode, setNewUnitShiftMode] = useState<UnitShiftMode>('24H');
   const [defaultShift, setDefaultShift] = useState<'Diurno' | 'Noturno'>(
     employee?.defaultShift || 'Diurno'
   );
@@ -88,6 +104,11 @@ export const EmployeeModal: React.FC<EmployeeModalProps> = ({
   const [avatarBase64, setAvatarBase64] = useState<string>(
     employee?.avatarBase64 || ''
   );
+
+  // Estado para Marcar Folga
+  const [folgaDate, setFolgaDate] = useState(todayIso);
+  const [folgaDays, setFolgaDays] = useState<number>(1);
+  const [folgaReason, setFolgaReason] = useState('');
 
   // Estado para Registrar Falta
   const [faltaDate, setFaltaDate] = useState(todayIso);
@@ -143,6 +164,30 @@ export const EmployeeModal: React.FC<EmployeeModalProps> = ({
     reader.readAsDataURL(file);
   };
 
+  const handleRoleChange = (selectedRole: string) => {
+    setRole(selectedRole);
+    if (!isNew) return;
+    if (selectedRole === 'Auxiliar de Almoxarifado') {
+      const existingAlmox = state.units.find(
+        (u) => u.name.trim().toLowerCase() === 'almoxarifado'
+      );
+      if (existingAlmox) {
+        setUnitId(existingAlmox.id);
+      } else if (!initialUnitId) {
+        setUnitId('__CREATE_ALMOXARIFADO__');
+      }
+    } else if (selectedRole === 'Auxiliar de Recebimento') {
+      const existingRec = state.units.find(
+        (u) => u.name.trim().toLowerCase() === 'recebimento'
+      );
+      if (existingRec) {
+        setUnitId(existingRec.id);
+      } else if (!initialUnitId) {
+        setUnitId('__CREATE_RECEBIMENTO__');
+      }
+    }
+  };
+
   const handleSaveProfile = (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) return;
@@ -152,12 +197,47 @@ export const EmployeeModal: React.FC<EmployeeModalProps> = ({
         ? customRoleInput.trim() || 'Profissional de Saúde'
         : role;
 
+    let finalUnitId = unitId;
+    let newUnitToCreate: HospitalUnit | undefined;
+
+    if (
+      unitId === '__CREATE_ALMOXARIFADO__' ||
+      unitId === '__CREATE_RECEBIMENTO__' ||
+      unitId === '__CREATE_CUSTOM_UNIT__'
+    ) {
+      const desiredUnitName =
+        unitId === '__CREATE_ALMOXARIFADO__'
+          ? 'Almoxarifado'
+          : unitId === '__CREATE_RECEBIMENTO__'
+          ? 'Recebimento'
+          : newUnitNameInput.trim();
+
+      if (!desiredUnitName) return;
+
+      const alreadyExisting = state.units.find(
+        (u) => u.name.trim().toLowerCase() === desiredUnitName.toLowerCase()
+      );
+      if (alreadyExisting) {
+        finalUnitId = alreadyExisting.id;
+      } else {
+        const createdId = `unit-${Date.now()}`;
+        finalUnitId = createdId;
+        newUnitToCreate = {
+          id: createdId,
+          name: desiredUnitName,
+          shiftMode: newUnitShiftMode,
+          minStaffDay: newUnitShiftMode === 'NOTURNO' ? 0 : 1,
+          minStaffNight: newUnitShiftMode === 'DIURNO' ? 0 : 1,
+        };
+      }
+    }
+
     const updatedEmp: Employee = {
       id: employee?.id || `emp-${Date.now()}`,
       name: name.trim(),
       registrationNumber: registrationNumber.trim(),
       role: finalRole,
-      unitId,
+      unitId: finalUnitId || state.units[0]?.id || 'unit-1',
       defaultShift,
       workHours: workHours.trim() || '07:00 às 19:00',
       regime,
@@ -171,13 +251,53 @@ export const EmployeeModal: React.FC<EmployeeModalProps> = ({
       updatedEmp,
       role === 'NOVA_FUNCAO' && customRoleInput.trim()
         ? customRoleInput.trim()
-        : undefined
+        : undefined,
+      newUnitToCreate
     );
     setFeedbackMsg('Dados cadastrais salvos e sincronizados com a escala!');
     setTimeout(() => {
       setFeedbackMsg(null);
       if (isNew) onClose();
     }, 1200);
+  };
+
+  const handleConfirmFolga = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!employee) return;
+
+    const days = Math.max(1, Math.min(30, Number(folgaDays) || 1));
+    const calc = calculateLeaveAndNextShift(
+      employee,
+      state.schedules,
+      folgaDate,
+      days
+    );
+
+    const newRec: AbsenceRecord = {
+      id: `folga-${Date.now()}`,
+      employeeId: employee.id,
+      type: 'FOLGA',
+      startDate: calc.startDateIso,
+      endDate: calc.endDateIso,
+      nextShiftDate: calc.nextShiftDateIso,
+      daysCount: days,
+      shift: employee.defaultShift,
+      reason:
+        folgaReason.trim() ||
+        `Folga marcada na escala (${days} ${days === 1 ? 'dia' : 'dias'} · Próximo plantão: ${
+          calc.nextShiftDateFormatted
+        }).`,
+      createdAt: new Date().toISOString(),
+    };
+
+    onRegisterAbsenceOrLeave(employee.id, newRec, 'F');
+    setActiveSubModal('NONE');
+    setFolgaReason('');
+    setFolgaDays(1);
+    setFeedbackMsg(
+      `Folga (F) salva na escala! Próximo plantão será em ${calc.nextShiftDateFormatted}.`
+    );
+    setTimeout(() => setFeedbackMsg(null), 4000);
   };
 
   const handleConfirmFalta = (e: React.FormEvent) => {
@@ -329,7 +449,16 @@ export const EmployeeModal: React.FC<EmployeeModalProps> = ({
                   Lançamento Rápido na Escala (Reflete Imediatamente)
                 </h3>
               </div>
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => setActiveSubModal('FOLGA')}
+                  className="flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold transition-colors cursor-pointer"
+                >
+                  <Calendar className="w-4 h-4" />
+                  <span>Marcar Folga</span>
+                </button>
+
                 <button
                   type="button"
                   onClick={() => setActiveSubModal('FALTA')}
@@ -357,6 +486,126 @@ export const EmployeeModal: React.FC<EmployeeModalProps> = ({
                   <span>Programar Férias</span>
                 </button>
               </div>
+
+              {/* Sub-formulário de Marcar Folga */}
+              {activeSubModal === 'FOLGA' && (
+                <form
+                  onSubmit={handleConfirmFolga}
+                  className="mt-3 p-4 rounded-xl bg-white border border-emerald-200 space-y-3"
+                >
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-xs font-bold text-emerald-900">
+                      Marcar Folga na Escala (Marca F e grava no histórico)
+                    </h4>
+                    <button
+                      type="button"
+                      onClick={() => setActiveSubModal('NONE')}
+                      className="text-xs text-slate-500 hover:text-slate-800 cursor-pointer"
+                    >
+                      Fechar
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">
+                        Data da Folga
+                      </label>
+                      <input
+                        type="date"
+                        required
+                        value={folgaDate}
+                        onChange={(e) => setFolgaDate(e.target.value)}
+                        className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white text-base text-slate-900"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">
+                        Quantidade de Dias de Folga
+                      </label>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="number"
+                          min={1}
+                          max={30}
+                          required
+                          value={folgaDays}
+                          onChange={(e) =>
+                            setFolgaDays(Math.max(1, Number(e.target.value) || 1))
+                          }
+                          className="w-24 px-3 py-2 rounded-xl border border-slate-300 bg-white text-base text-slate-900 tabular-nums"
+                        />
+                        <div className="flex items-center gap-1">
+                          {[1, 2, 3].map((dNum) => (
+                            <button
+                              key={dNum}
+                              type="button"
+                              onClick={() => setFolgaDays(dNum)}
+                              className={`px-2.5 py-1.5 rounded-lg text-xs font-bold border cursor-pointer ${
+                                folgaDays === dNum
+                                  ? 'bg-emerald-600 text-white border-emerald-700'
+                                  : 'bg-slate-50 text-slate-700 border-slate-300 hover:bg-slate-100'
+                              }`}
+                            >
+                              {dNum}d
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {employee && (() => {
+                    const liveCalc = calculateLeaveAndNextShift(
+                      employee,
+                      state.schedules,
+                      folgaDate,
+                      folgaDays
+                    );
+                    return (
+                      <div className="p-3 rounded-xl bg-emerald-50/80 border border-emerald-200 grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                        <div>
+                          <span className="text-[11px] font-bold text-emerald-800 block">
+                            Dia(s) de Folga:
+                          </span>
+                          <span className="font-bold text-slate-900">
+                            {liveCalc.startDateFormatted}
+                            {liveCalc.daysCount > 1 ? ` até ${liveCalc.endDateFormatted}` : ''}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="text-[11px] font-bold text-teal-800 block">
+                            Próximo Plantão de Retorno:
+                          </span>
+                          <span className="font-bold text-teal-950">
+                            {liveCalc.nextShiftDateFormatted} · {liveCalc.nextShiftLabel}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      Observação / Motivo da Folga (opcional)
+                    </label>
+                    <input
+                      type="text"
+                      value={folgaReason}
+                      onChange={(e) => setFolgaReason(e.target.value)}
+                      placeholder="Ex: Folga concedida pela supervisão, compensação de plantão..."
+                      className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white text-base text-slate-900"
+                    />
+                  </div>
+                  <div className="flex justify-end">
+                    <button
+                      type="submit"
+                      className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold cursor-pointer"
+                    >
+                      Confirmar Folga na Escala
+                    </button>
+                  </div>
+                </form>
+              )}
 
               {/* Sub-formulário de Registrar Falta */}
               {activeSubModal === 'FALTA' && (
@@ -734,46 +983,50 @@ export const EmployeeModal: React.FC<EmployeeModalProps> = ({
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div>
-                <label className="block text-xs font-bold text-slate-700 mb-1">
-                  Função / Cargo *
-                </label>
-                <select
-                  required
-                  value={role}
-                  onChange={(e) => setRole(e.target.value)}
-                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900"
-                >
-                  <option value="" disabled>
-                    Escolha a função...
-                  </option>
-                  {allRoles.map((r) => (
-                    <option key={r} value={r}>
-                      {r}
+              <div className="space-y-2">
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1">
+                    Função / Cargo *
+                  </label>
+                  <select
+                    required
+                    value={role}
+                    onChange={(e) => handleRoleChange(e.target.value)}
+                    className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900"
+                  >
+                    <option value="" disabled>
+                      Escolha a função...
                     </option>
-                  ))}
-                  <option value="NOVA_FUNCAO">+ Digitar outra função...</option>
-                </select>
+                    {allRoles.map((r) => (
+                      <option key={r} value={r}>
+                        {r}
+                      </option>
+                    ))}
+                    <option value="NOVA_FUNCAO">+ Digitar outra função...</option>
+                  </select>
+                </div>
+
+                {role === 'NOVA_FUNCAO' && (
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-1">
+                      Nome da Nova Função *
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={customRoleInput}
+                      onChange={(e) => setCustomRoleInput(e.target.value)}
+                      placeholder="Digite o nome da função"
+                      className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900"
+                    />
+                  </div>
+                )}
               </div>
 
-              {role === 'NOVA_FUNCAO' ? (
+              <div className="space-y-2">
                 <div>
                   <label className="block text-xs font-bold text-slate-700 mb-1">
-                    Nome da Função *
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={customRoleInput}
-                    onChange={(e) => setCustomRoleInput(e.target.value)}
-                    placeholder="Digite o nome da função"
-                    className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900"
-                  />
-                </div>
-              ) : (
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1">
-                    Unidade de Lotação *
+                    Setor / Unidade de Lotação *
                   </label>
                   <select
                     required
@@ -786,9 +1039,71 @@ export const EmployeeModal: React.FC<EmployeeModalProps> = ({
                         {u.name}
                       </option>
                     ))}
+                    {!hasAlmoxarifadoUnit && (
+                      <option value="__CREATE_ALMOXARIFADO__">
+                        + Adicionar setor: Almoxarifado
+                      </option>
+                    )}
+                    {!hasRecebimentoUnit && (
+                      <option value="__CREATE_RECEBIMENTO__">
+                        + Adicionar setor: Recebimento
+                      </option>
+                    )}
+                    <option value="__CREATE_CUSTOM_UNIT__">
+                      + Cadastrar novo setor / unidade...
+                    </option>
                   </select>
                 </div>
-              )}
+
+                {(unitId === '__CREATE_ALMOXARIFADO__' ||
+                  unitId === '__CREATE_RECEBIMENTO__' ||
+                  unitId === '__CREATE_CUSTOM_UNIT__') && (
+                  <div className="p-3 rounded-xl bg-teal-50/70 border border-teal-200 space-y-2.5">
+                    {unitId === '__CREATE_CUSTOM_UNIT__' ? (
+                      <div>
+                        <label className="block text-xs font-bold text-teal-900 mb-1">
+                          Nome do Novo Setor / Unidade *
+                        </label>
+                        <input
+                          type="text"
+                          required
+                          value={newUnitNameInput}
+                          onChange={(e) => setNewUnitNameInput(e.target.value)}
+                          placeholder="Ex: Recebimento, Almoxarifado..."
+                          className="w-full px-3 py-2 rounded-xl border border-teal-300 bg-white text-base text-slate-900"
+                        />
+                      </div>
+                    ) : (
+                      <p className="text-xs font-bold text-teal-900">
+                        O setor{' '}
+                        <span className="underline">
+                          {unitId === '__CREATE_ALMOXARIFADO__'
+                            ? 'Almoxarifado'
+                            : 'Recebimento'}
+                        </span>{' '}
+                        será criado automaticamente e exibido na tela de Início!
+                      </p>
+                    )}
+
+                    <div>
+                      <label className="block text-[11px] font-bold text-teal-800 mb-1">
+                        Funcionamento do Setor
+                      </label>
+                      <select
+                        value={newUnitShiftMode}
+                        onChange={(e) =>
+                          setNewUnitShiftMode(e.target.value as UnitShiftMode)
+                        }
+                        className="w-full px-3 py-2 rounded-xl border border-teal-300 bg-white text-base text-slate-900"
+                      >
+                        <option value="24H">24h (Diurno + Noturno)</option>
+                        <option value="DIURNO">Apenas Diurno</option>
+                        <option value="NOTURNO">Apenas Noturno</option>
+                      </select>
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -893,21 +1208,23 @@ export const EmployeeModal: React.FC<EmployeeModalProps> = ({
               <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
                 <Clock className="w-4 h-4 text-teal-600" />
                 <span>
-                  Histórico de Faltas, Atestados, Férias, Trocas e Horas Extras (
+                  Histórico de Folgas, Faltas, Atestados, Férias, Trocas e Horas Extras (
                   {employee.history.length})
                 </span>
               </h3>
 
               {employee.history.length === 0 ? (
                 <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 text-xs text-slate-500 text-center">
-                  Nenhuma ocorrência de falta, atestado ou permuta registrada para este
+                  Nenhuma ocorrência de folga, falta, atestado ou permuta registrada para este
                   profissional.
                 </div>
               ) : (
                 <div className="space-y-2.5">
                   {employee.history.map((rec) => {
                     const badgeStyle =
-                      rec.type === 'FALTA'
+                      rec.type === 'FOLGA'
+                        ? 'bg-emerald-600 text-white'
+                        : rec.type === 'FALTA'
                         ? 'bg-red-600 text-white'
                         : rec.type === 'ATESTADO'
                         ? 'bg-amber-500 text-white'

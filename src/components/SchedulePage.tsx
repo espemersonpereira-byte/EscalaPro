@@ -285,18 +285,31 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
     const dateIso = formatIsoDate(selectedYear, selectedMonth0, day);
 
     if (modalTab === 'STATUS') {
+      const defaultRegimeStatus = computeRegimeShiftForDay(
+        employee,
+        selectedYear,
+        selectedMonth0,
+        day
+      );
+      const isManualFolga = cellStatus === 'F' && defaultRegimeStatus !== 'F';
+      const effectiveNote =
+        cellNote.trim() ||
+        `${SHIFT_STATUS_META[cellStatus].label} marcado manualmente na escala`;
+
       const historyRecord: AbsenceRecord | undefined =
-        cellStatus === 'FA' || cellStatus === 'AT' || cellStatus === 'FE'
+        isManualFolga || cellStatus === 'FA' || cellStatus === 'AT' || cellStatus === 'FE'
           ? {
               id: `abs-${Date.now()}`,
               employeeId: employee.id,
-              type:
-                cellStatus === 'FA'
-                  ? 'FALTA'
-                  : cellStatus === 'AT'
-                  ? 'ATESTADO'
-                  : 'FERIAS',
+              type: isManualFolga
+                ? 'FOLGA'
+                : cellStatus === 'FA'
+                ? 'FALTA'
+                : cellStatus === 'AT'
+                ? 'ATESTADO'
+                : 'FERIAS',
               startDate: dateIso,
+              endDate: dateIso,
               daysCount: 1,
               shift: employee.defaultShift,
               reason:
@@ -314,7 +327,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
         {
           status: cellStatus,
           unitOverrideId: cellUnitId && cellUnitId !== employee.unitId ? cellUnitId : '',
-          note: cellNote.trim() || undefined,
+          note: effectiveNote,
         },
         { historyRecord }
       );

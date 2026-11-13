@@ -29,12 +29,12 @@ import {
 interface QuickLeaveWizardModalProps {
   state: EscalaProState;
   initialEmployeeId?: string | null;
-  initialType?: 'ATESTADO' | 'DECLARACAO_HORAS' | 'FALTA' | 'FERIAS';
+  initialType?: 'FOLGA' | 'ATESTADO' | 'DECLARACAO_HORAS' | 'FALTA' | 'FERIAS';
   onClose: () => void;
   onApplyLeaveOrOccurrence: (payload: {
     employeeId: string;
     record: AbsenceRecord;
-    scheduleStatusToApply?: 'AT' | 'FA' | 'FE';
+    scheduleStatusToApply?: 'F' | 'AT' | 'FA' | 'FE';
     hourBankDelta?: number;
   }) => void;
 }
@@ -67,15 +67,19 @@ export const QuickLeaveWizardModal: React.FC<QuickLeaveWizardModalProps> = ({
       : activeEmployees[0]?.id || ''
   );
 
-  // 2. Escolha do Tipo de Lançamento (Atestado, Horas, Falta, Férias)
+  // 2. Escolha do Tipo de Lançamento (Folga, Atestado, Horas, Falta, Férias)
   const [occurrenceType, setOccurrenceType] = useState<
-    'ATESTADO' | 'DECLARACAO_HORAS' | 'FALTA' | 'FERIAS'
+    'FOLGA' | 'ATESTADO' | 'DECLARACAO_HORAS' | 'FALTA' | 'FERIAS'
   >(initialType);
 
   // 3. Campos de Data de Início e Quantidade de Dias
   const [startDateIso, setStartDateIso] = useState<string>(todayIso);
   const [daysCount, setDaysCount] = useState<number>(
-    initialType === 'FERIAS' ? 15 : initialType === 'FALTA' ? 1 : 3
+    initialType === 'FERIAS'
+      ? 15
+      : initialType === 'FALTA' || initialType === 'FOLGA'
+      ? 1
+      : 3
   );
 
   // Campos para Declaração de Horas / Banco de Horas
@@ -224,6 +228,39 @@ export const QuickLeaveWizardModal: React.FC<QuickLeaveWizardModalProps> = ({
         employeeName: selectedEmployee.name,
         title: modeDesc,
         endDateFormatted: formatDateWithWeekdayPtBr(startDateIso),
+        nextShiftFormatted: calculation.nextShiftDateFormatted,
+        nextShiftLabel: calculation.nextShiftLabel,
+      });
+    } else if (occurrenceType === 'FOLGA') {
+      const record: AbsenceRecord = {
+        id: `folga-${Date.now()}`,
+        employeeId: selectedEmployee.id,
+        type: 'FOLGA',
+        startDate: calculation.startDateIso,
+        endDate: calculation.endDateIso,
+        nextShiftDate: calculation.nextShiftDateIso,
+        daysCount: calculation.daysCount,
+        shift: selectedEmployee.defaultShift,
+        reason:
+          reasonText.trim() ||
+          `Folga marcada na escala (${calculation.daysCount} ${
+            calculation.daysCount === 1 ? 'dia' : 'dias'
+          } · Próximo plantão: ${calculation.nextShiftDateFormatted}).`,
+        createdAt: new Date().toISOString(),
+      };
+
+      onApplyLeaveOrOccurrence({
+        employeeId: selectedEmployee.id,
+        record,
+        scheduleStatusToApply: 'F',
+      });
+
+      setSavedSummary({
+        employeeName: selectedEmployee.name,
+        title: `Folga (F) de ${calculation.daysCount} ${
+          calculation.daysCount === 1 ? 'dia' : 'dias'
+        } marcada na escala`,
+        endDateFormatted: calculation.endDateFormatted,
         nextShiftFormatted: calculation.nextShiftDateFormatted,
         nextShiftLabel: calculation.nextShiftLabel,
       });
@@ -427,7 +464,24 @@ export const QuickLeaveWizardModal: React.FC<QuickLeaveWizardModalProps> = ({
               <label className="block text-xs font-bold text-slate-800">
                 2. O que você deseja lançar para {selectedEmployee?.name.split(' ')[0]}?
               </label>
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOccurrenceType('FOLGA');
+                    setDaysCount(1);
+                  }}
+                  className={`p-3 rounded-2xl border text-left transition-all cursor-pointer ${
+                    occurrenceType === 'FOLGA'
+                      ? 'border-emerald-600 bg-emerald-50/80 ring-2 ring-emerald-600/20'
+                      : 'border-slate-200 hover:bg-slate-50'
+                  }`}
+                >
+                  <Calendar className="w-5 h-5 text-emerald-600 mb-1" />
+                  <div className="text-xs font-bold text-slate-900">Marcar Folga</div>
+                  <div className="text-[10px] text-slate-500">Marca F na escala</div>
+                </button>
+
                 <button
                   type="button"
                   onClick={() => {
@@ -741,6 +795,8 @@ export const QuickLeaveWizardModal: React.FC<QuickLeaveWizardModalProps> = ({
                                   ? 'FE'
                                   : occurrenceType === 'FALTA'
                                   ? 'FA'
+                                  : occurrenceType === 'FOLGA'
+                                  ? 'F'
                                   : 'AT'}
                               </span>
                             </span>

@@ -15,6 +15,7 @@ import {
   PushNotificationConfig,
   ScheduleCellData,
   UserAccount,
+  MonthlyScheduleMap,
 } from './types';
 import {
   applyAbsenceToSchedules,
@@ -22,6 +23,7 @@ import {
   generateAutomaticScheduleForMonth,
   getYearMonthKey,
   parseIsoDateParts,
+  reapplyEmployeeHistoryToSchedules,
   storageService,
 } from './services/storageService';
 import {
@@ -108,12 +110,13 @@ export default function App() {
   const [modalEmployeeTarget, setModalEmployeeTarget] = useState<string | 'NEW' | null>(
     null
   );
+  const [newEmployeeUnitId, setNewEmployeeUnitId] = useState<string | null>(null);
 
-  // Controle do Assistente Guiado de Atestado / Horas / Falta / Férias
+  // Controle do Assistente Guiado de Folga / Atestado / Horas / Falta / Férias
   const [quickWizardConfig, setQuickWizardConfig] = useState<{
     open: boolean;
     employeeId: string | null;
-    initialType: 'ATESTADO' | 'DECLARACAO_HORAS' | 'FALTA' | 'FERIAS';
+    initialType: 'FOLGA' | 'ATESTADO' | 'DECLARACAO_HORAS' | 'FALTA' | 'FERIAS';
   }>({
     open: false,
     employeeId: null,
@@ -158,7 +161,6 @@ export default function App() {
           let finalState = remoteState;
           let shouldPushMerged = false;
 
-          // Se a nuvem ainda não tem colaboradores, mas o aparelho local (ou workspace órfão) já possui, preserva e sobe para a nuvem
           const richerLocal =
             localUserState.employees.length > 0
               ? localUserState
@@ -189,6 +191,98 @@ export default function App() {
                   : remoteState.schedules,
             };
             shouldPushMerged = true;
+          } else if (richerLocal) {
+            const localTime = new Date(richerLocal.lastUpdated || 0).getTime();
+            const remoteTime = new Date(remoteState.lastUpdated || 0).getTime();
+            const isLocalNewer = localTime > remoteTime;
+
+            // Mescla unidades preservando todas
+            const mergedUnitsMap = new Map<string, HospitalUnit>();
+            for (const u of isLocalNewer ? remoteState.units : richerLocal.units) {
+              mergedUnitsMap.set(u.id, u);
+            }
+            for (const u of isLocalNewer ? richerLocal.units : remoteState.units) {
+              mergedUnitsMap.set(u.id, u);
+            }
+
+            // Mescla colaboradores e seus históricos (Folga, Falta, Atestado, Férias) sem perder nenhum registro
+            const empMap = new Map<string, Employee>();
+            const baseEmps = isLocalNewer ? remoteState.employees : richerLocal.employees;
+            const newerEmps = isLocalNewer ? richerLocal.employees : remoteState.employees;
+            for (const e of baseEmps) {
+              empMap.set(e.id, e);
+            }
+            for (const e of newerEmps) {
+              const prevEmp = empMap.get(e.id);
+              if (!prevEmp) {
+                empMap.set(e.id, e);
+              } else {
+                const histMap = new Map<string, AbsenceRecord>();
+                for (const h of prevEmp.history || []) histMap.set(h.id, h);
+                for (const h of e.history || []) histMap.set(h.id, h);
+                empMap.set(e.id, {
+                  ...prevEmp,
+                  ...e,
+                  avatarBase64: e.avatarBase64 || prevEmp.avatarBase64,
+                  history: Array.from(histMap.values()),
+                });
+              }
+            }
+            const mergedEmployees = Array.from(empMap.values());
+
+            // Mescla as células de escala preservando marcações manuais (como Folga F, D, N, AT, FA, FE, TR e direcionamento de setor)
+            const mergedSchedules: MonthlyScheduleMap = {};
+            const allYmKeys = new Set([
+              ...Object.keys(remoteState.schedules || {}),
+              ...Object.keys(richerLocal.schedules || {}),
+            ]);
+            for (const ym of allYmKeys) {
+              mergedSchedules[ym] = {};
+              const remYm = remoteState.schedules?.[ym] || {};
+              const locYm = richerLocal.schedules?.[ym] || {};
+              const allEmpIds = new Set([...Object.keys(remYm), ...Object.keys(locYm)]);
+              for (const empId of allEmpIds) {
+                const remDays = remYm[empId] || {};
+                const locDays = locYm[empId] || {};
+                const mergedDays: Record<number, ScheduleCellData> = isLocalNewer
+                  ? { ...remDays, ...locDays }
+                  : { ...locDays, ...remDays };
+
+                // Mesmo se o servidor for mais recente, preserva células locais que possuam nota/ajuste manual e que ainda não estavam salvas na nuvem
+                if (!isLocalNewer) {
+                  for (const [dKey, locCell] of Object.entries(locDays)) {
+                    const dNum = Number(dKey);
+                    const remCell = remDays[dNum];
+                    if (
+                      !remCell &&
+                      (locCell.note ||
+                        locCell.unitOverrideId !== undefined ||
+                        locCell.extraHours)
+                    ) {
+                      mergedDays[dNum] = locCell;
+                      shouldPushMerged = true;
+                    }
+                  }
+                }
+                mergedSchedules[ym][empId] = mergedDays;
+              }
+            }
+
+            const finalSchedules = reapplyEmployeeHistoryToSchedules(
+              mergedEmployees,
+              mergedSchedules
+            );
+
+            if (isLocalNewer) {
+              shouldPushMerged = true;
+            }
+
+            finalState = {
+              ...(isLocalNewer ? richerLocal : remoteState),
+              units: Array.from(mergedUnitsMap.values()),
+              employees: mergedEmployees,
+              schedules: finalSchedules,
+            };
           }
 
           storageService.saveStateForUser(account.uid, finalState);
@@ -312,7 +406,7 @@ export default function App() {
             console.error('Erro ao sincronizar estado com Firestore:', err);
             setCloudSyncStatus('idle');
           });
-      }, 900);
+      }, 250);
     }
   }, [state, currentUser]);
 
@@ -603,9 +697,14 @@ export default function App() {
   };
 
   // Salva novo colaborador ou atualiza colaborador existente
-  const handleSaveEmployee = (emp: Employee, newCustomRole?: string) => {
+  const handleSaveEmployee = (
+    emp: Employee,
+    newCustomRole?: string,
+    newUnitToCreate?: HospitalUnit
+  ) => {
     setState((prev) => {
-      const exists = prev.employees.some((e) => e.id === emp.id);
+      const existingEmp = prev.employees.find((e) => e.id === emp.id);
+      const exists = Boolean(existingEmp);
       const nextEmployees = exists
         ? prev.employees.map((e) => (e.id === emp.id ? emp : e))
         : [...prev.employees, emp];
@@ -615,17 +714,31 @@ export default function App() {
           ? [...prev.customRoles, newCustomRole]
           : prev.customRoles;
 
+      const nextUnits =
+        newUnitToCreate && !prev.units.some((u) => u.id === newUnitToCreate.id)
+          ? [...prev.units, newUnitToCreate]
+          : prev.units;
+
       const now = new Date();
-      const nextSchedules = generateAutomaticScheduleForMonth(
-        nextEmployees,
-        prev.schedules,
-        now.getFullYear(),
-        now.getMonth(),
-        true
-      );
+      // Só gera escala automática para o colaborador salvo se ele for novo ou se mudou de regime/turno, preservando todas as folgas e marcações dos demais colaboradores
+      const shouldGenerateForTarget =
+        !existingEmp ||
+        existingEmp.regime !== emp.regime ||
+        existingEmp.defaultShift !== emp.defaultShift;
+
+      const nextSchedules = shouldGenerateForTarget
+        ? generateAutomaticScheduleForMonth(
+            [emp],
+            prev.schedules,
+            now.getFullYear(),
+            now.getMonth(),
+            true
+          )
+        : reapplyEmployeeHistoryToSchedules(nextEmployees, prev.schedules);
 
       return {
         ...prev,
+        units: nextUnits,
         customRoles: nextCustomRoles,
         employees: nextEmployees,
         schedules: nextSchedules,
@@ -642,11 +755,11 @@ export default function App() {
     }));
   };
 
-  // Registra Falta (FA), Atestado Médico (AT) ou Férias (FE) a partir do Prontuário
+  // Registra Folga (F), Falta (FA), Atestado Médico (AT) ou Férias (FE) a partir do Prontuário
   const handleRegisterAbsenceOrLeave = (
     employeeId: string,
     record: AbsenceRecord,
-    statusToApply: 'FA' | 'AT' | 'FE'
+    statusToApply: 'F' | 'FA' | 'AT' | 'FE'
   ) => {
     setState((prev) => {
       const nextEmployees = prev.employees.map((emp) => {
@@ -676,7 +789,7 @@ export default function App() {
 
   const handleOpenQuickLeaveWizard = (
     employeeId: string | null = null,
-    initialType: 'ATESTADO' | 'DECLARACAO_HORAS' | 'FALTA' | 'FERIAS' = 'ATESTADO'
+    initialType: 'FOLGA' | 'ATESTADO' | 'DECLARACAO_HORAS' | 'FALTA' | 'FERIAS' = 'ATESTADO'
   ) => {
     setQuickWizardConfig({
       open: true,
@@ -685,11 +798,11 @@ export default function App() {
     });
   };
 
-  // Aplica Atestado Médico, Declaração de Horas, Falta ou Férias via Assistente Manual
+  // Aplica Folga, Atestado Médico, Declaração de Horas, Falta ou Férias via Assistente Manual
   const handleApplyLeaveOrOccurrence = (params: {
     employeeId: string;
     record: AbsenceRecord;
-    scheduleStatusToApply?: 'AT' | 'FA' | 'FE';
+    scheduleStatusToApply?: 'F' | 'AT' | 'FA' | 'FE';
     hourBankDelta?: number;
   }) => {
     setState((prev) => {
@@ -957,7 +1070,10 @@ export default function App() {
             )}
             <button
               type="button"
-              onClick={() => setModalEmployeeTarget('NEW')}
+              onClick={() => {
+                setNewEmployeeUnitId(null);
+                setModalEmployeeTarget('NEW');
+              }}
               className="px-3.5 py-2 rounded-xl bg-[#0d9488] hover:bg-teal-700 text-white text-xs font-bold transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               + Colaborador
@@ -1049,7 +1165,14 @@ export default function App() {
             <DashboardPage
               state={state}
               onNavigate={updateNav}
-              onOpenEmployeeModal={(empId) => setModalEmployeeTarget(empId)}
+              onOpenEmployeeModal={(empId) => {
+                setNewEmployeeUnitId(null);
+                setModalEmployeeTarget(empId);
+              }}
+              onOpenNewEmployeeForUnit={(unitId) => {
+                setNewEmployeeUnitId(unitId);
+                setModalEmployeeTarget('NEW');
+              }}
               onOpenQuickLeaveWizard={handleOpenQuickLeaveWizard}
               onUpdateScheduleCell={handleUpdateScheduleCell}
             />
@@ -1062,7 +1185,10 @@ export default function App() {
               onUpdateNav={updateNav}
               onGenerateAutoSchedule={handleGenerateAutoSchedule}
               onUpdateScheduleCell={handleUpdateScheduleCell}
-              onOpenEmployeeModal={(empId) => setModalEmployeeTarget(empId)}
+              onOpenEmployeeModal={(empId) => {
+                setNewEmployeeUnitId(null);
+                setModalEmployeeTarget(empId);
+              }}
             />
           )}
 
@@ -1071,7 +1197,12 @@ export default function App() {
               state={state}
               navContext={navContext}
               onUpdateNav={updateNav}
-              onOpenEmployeeModal={(empId) => setModalEmployeeTarget(empId || 'NEW')}
+              onOpenEmployeeModal={(empId) => {
+                setNewEmployeeUnitId(
+                  navContext.selectedUnitFilter !== 'TODAS' ? navContext.selectedUnitFilter : null
+                );
+                setModalEmployeeTarget(empId || 'NEW');
+              }}
               onOpenQuickLeaveWizard={handleOpenQuickLeaveWizard}
             />
           )}
@@ -1093,6 +1224,10 @@ export default function App() {
               onUpdateManagerAndUnits={handleUpdateManagerAndUnits}
               onUpdatePushConfig={handleUpdatePushConfig}
               onLoadDemoData={handleLoadDemoData}
+              onOpenNewEmployeeForUnit={(unitId) => {
+                setNewEmployeeUnitId(unitId);
+                setModalEmployeeTarget('NEW');
+              }}
             />
           )}
         </main>
@@ -1128,7 +1263,11 @@ export default function App() {
         <EmployeeModal
           state={state}
           employee={selectedModalEmployee}
-          onClose={() => setModalEmployeeTarget(null)}
+          initialUnitId={newEmployeeUnitId}
+          onClose={() => {
+            setNewEmployeeUnitId(null);
+            setModalEmployeeTarget(null);
+          }}
           onSaveEmployee={handleSaveEmployee}
           onDeleteEmployee={handleDeleteEmployee}
           onRegisterAbsenceOrLeave={handleRegisterAbsenceOrLeave}

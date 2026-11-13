@@ -36,6 +36,10 @@ import {
   ScheduleCellData,
   ShiftStatus,
 } from '../types';
+import {
+  computeRegimeShiftForDay,
+  reapplyEmployeeHistoryToSchedules,
+} from './storageService';
 
 const app = initializeApp(firebaseConfig);
 export const db = getFirestoreInstance();
@@ -350,6 +354,12 @@ export async function loadWorkspaceFromFirestore(userId: string): Promise<Escala
     handleFirestoreError(error, OperationType.LIST, cellsPath);
   }
 
+  const finalSchedules = reapplyEmployeeHistoryToSchedules(employees, schedules);
+  const remoteUpdatedIso =
+    wsData.updatedAt && typeof wsData.updatedAt.toDate === 'function'
+      ? wsData.updatedAt.toDate().toISOString()
+      : new Date(0).toISOString();
+
   return {
     manager: {
       name: String(wsData.managerName || ''),
@@ -362,7 +372,7 @@ export async function loadWorkspaceFromFirestore(userId: string): Promise<Escala
     units,
     customRoles: [],
     employees,
-    schedules,
+    schedules: finalSchedules,
     pushConfig: {
       enabled: Boolean(wsData.pushEnabled),
       alertUncoveredShift1hBefore: true,
@@ -370,7 +380,7 @@ export async function loadWorkspaceFromFirestore(userId: string): Promise<Escala
       instantCertificateAlert: true,
       webhookOrVapidKey: '',
     },
-    lastUpdated: new Date().toISOString(),
+    lastUpdated: remoteUpdatedIso,
   };
 }
 
@@ -528,16 +538,22 @@ export async function syncWorkspaceToFirestore(userId: string, state: EscalaProS
     }
   }
 
-  // Sincroniza células customizadas (AT, FA, FE, TR ou com nota/hora extra) para manter performance
+  // Sincroniza células customizadas (qualquer alteração manual de Folga F, D, N, AT, FA, FE, TR, setor pontual, nota ou hora extra)
   for (const [ymKey, empScheduleMap] of Object.entries(state.schedules)) {
+    const [yStr, mStr] = ymKey.split('-');
+    const yNum = Number(yStr) || new Date().getFullYear();
+    const m0 = (Number(mStr) || 1) - 1;
+
     for (const [rawEmpId, daysMap] of Object.entries(empScheduleMap)) {
       const empId = sanitizeId(rawEmpId);
-      const empExists = state.employees.some((e) => sanitizeId(e.id) === empId);
-      if (!empExists) continue;
+      const empObj = state.employees.find((e) => sanitizeId(e.id) === empId);
+      if (!empObj) continue;
 
       for (const [dayStr, cell] of Object.entries(daysMap)) {
         const dayNum = Number(dayStr);
+        const defaultRegimeStatus = computeRegimeShiftForDay(empObj, yNum, m0, dayNum);
         if (
+          cell.status !== defaultRegimeStatus ||
           cell.status === 'AT' ||
           cell.status === 'FA' ||
           cell.status === 'FE' ||

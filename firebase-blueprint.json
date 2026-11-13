@@ -252,7 +252,7 @@
         "type": {
           "type": "string",
           "description": "Tipo da ocorrência.",
-          "enum": ["FALTA", "ATESTADO", "DECLARACAO_HORAS", "FERIAS", "PERMUTA", "BANCO_HORAS"],
+          "enum": ["FOLGA", "FALTA", "ATESTADO", "DECLARACAO_HORAS", "FERIAS", "PERMUTA", "BANCO_HORAS"],
           "minLength": 4,
           "maxLength": 30
         },
