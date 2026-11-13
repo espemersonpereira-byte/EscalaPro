@@ -7,6 +7,8 @@ import {
   LocalRegisteredAccount,
   MonthlyScheduleMap,
   ScheduleCellData,
+  ScheduleCycleSlot,
+  SchedulePeriodViewMode,
   ShiftStatus,
   UserAccount,
 } from '../types';
@@ -25,6 +27,96 @@ export function getDaysInMonth(year: number, monthIndex0: number): number {
   return new Date(year, monthIndex0 + 1, 0).getDate();
 }
 
+export function getNextYearMonth(
+  year: number,
+  monthIndex0: number
+): { year: number; monthIndex0: number } {
+  if (monthIndex0 >= 11) {
+    return { year: year + 1, monthIndex0: 0 };
+  }
+  return { year, monthIndex0: monthIndex0 + 1 };
+}
+
+export function getPrevYearMonth(
+  year: number,
+  monthIndex0: number
+): { year: number; monthIndex0: number } {
+  if (monthIndex0 <= 0) {
+    return { year: year - 1, monthIndex0: 11 };
+  }
+  return { year, monthIndex0: monthIndex0 - 1 };
+}
+
+/**
+ * Monta os dias do Ciclo Quinzenal Hospitalar:
+ * - Parte 1 (2ª quinzena do mês inicial): dia 16 até o último dia do mês inicial (ex: 16/11 a 30/11)
+ * - Parte 2 (1ª quinzena do mês seguinte): dia 01 até o dia 15 do mês seguinte (ex: 01/12 a 15/12)
+ */
+export function buildFortnightCycleSlots(
+  startYear: number,
+  startMonthIndex0: number,
+  viewMode: SchedulePeriodViewMode = 'CYCLE_16_15_FULL'
+): ScheduleCycleSlot[] {
+  const slots: ScheduleCycleSlot[] = [];
+  const startDaysInMonth = getDaysInMonth(startYear, startMonthIndex0);
+  const startYmKey = getYearMonthKey(startYear, startMonthIndex0);
+  const startMonth2Digits = String(startMonthIndex0 + 1).padStart(2, '0');
+
+  if (viewMode === 'CALENDAR_MONTH') {
+    for (let d = 1; d <= startDaysInMonth; d++) {
+      const dStr = String(d).padStart(2, '0');
+      slots.push({
+        year: startYear,
+        monthIndex0: startMonthIndex0,
+        day: d,
+        ymKey: startYmKey,
+        isoDate: formatIsoDate(startYear, startMonthIndex0, d),
+        shortDateLabel: `${dStr}/${startMonth2Digits}`,
+        fortnightPart: d <= 15 ? 1 : 2,
+      });
+    }
+    return slots;
+  }
+
+  // Parte 1: 2ª quinzena do mês inicial (16 até 30/31)
+  if (viewMode === 'CYCLE_16_15_FULL' || viewMode === 'FORTNIGHT_16_END') {
+    for (let d = 16; d <= startDaysInMonth; d++) {
+      const dStr = String(d).padStart(2, '0');
+      slots.push({
+        year: startYear,
+        monthIndex0: startMonthIndex0,
+        day: d,
+        ymKey: startYmKey,
+        isoDate: formatIsoDate(startYear, startMonthIndex0, d),
+        shortDateLabel: `${dStr}/${startMonth2Digits}`,
+        fortnightPart: 1,
+      });
+    }
+  }
+
+  // Parte 2: 1ª quinzena do mês seguinte (01 até 15)
+  if (viewMode === 'CYCLE_16_15_FULL' || viewMode === 'FORTNIGHT_01_15') {
+    const nextYm = getNextYearMonth(startYear, startMonthIndex0);
+    const nextYmKey = getYearMonthKey(nextYm.year, nextYm.monthIndex0);
+    const nextMonth2Digits = String(nextYm.monthIndex0 + 1).padStart(2, '0');
+
+    for (let d = 1; d <= 15; d++) {
+      const dStr = String(d).padStart(2, '0');
+      slots.push({
+        year: nextYm.year,
+        monthIndex0: nextYm.monthIndex0,
+        day: d,
+        ymKey: nextYmKey,
+        isoDate: formatIsoDate(nextYm.year, nextYm.monthIndex0, d),
+        shortDateLabel: `${dStr}/${nextMonth2Digits}`,
+        fortnightPart: 2,
+      });
+    }
+  }
+
+  return slots;
+}
+
 export function formatIsoDate(year: number, monthIndex0: number, day: number): string {
   const m = String(monthIndex0 + 1).padStart(2, '0');
   const d = String(day).padStart(2, '0');
@@ -32,12 +124,16 @@ export function formatIsoDate(year: number, monthIndex0: number, day: number): s
 }
 
 export function parseIsoDateParts(isoDate: string): { year: number; monthIndex0: number; day: number } {
-  const [y, m, d] = isoDate.split('-').map(Number);
+  const [y, m, d] = parseIsoDatePartsRaw(isoDate);
   return {
     year: y || new Date().getFullYear(),
     monthIndex0: (m || 1) - 1,
     day: d || 1,
   };
+}
+
+function parseIsoDatePartsRaw(isoDate: string): number[] {
+  return String(isoDate || '').split('-').map(Number);
 }
 
 export function formatDateWithWeekdayPtBr(isoDate: string): string {
@@ -513,8 +609,7 @@ export function deduplicateEscalaProState(state: EscalaProState): EscalaProState
   };
 }
 
-// Gera ou atualiza a escala automática de um mês preservando Férias (FE), Atestados (AT), Faltas (FA), Trocas (TR) e Folgas/ajustes manuais
-export function generateAutomaticScheduleForMonth(
+function generateSingleMonthScheduleInternal(
   employees: Employee[],
   existingSchedules: MonthlyScheduleMap,
   year: number,
@@ -560,12 +655,39 @@ export function generateAutomaticScheduleForMonth(
     currentMonthMap[emp.id] = empExistingDays;
   }
 
-  const nextMap: MonthlyScheduleMap = {
+  return {
     ...existingSchedules,
     [ymKey]: currentMonthMap,
   };
+}
 
-  return preserveAbsences ? reapplyEmployeeHistoryToSchedules(employees, nextMap) : nextMap;
+// Gera ou atualiza a escala automática tanto do mês selecionado quanto do mês seguinte (cobrindo o ciclo quinzenal 16 a 15 completo, ex: 16/11 a 30/11 e 01/12 a 15/12)
+export function generateAutomaticScheduleForMonth(
+  employees: Employee[],
+  existingSchedules: MonthlyScheduleMap,
+  year: number,
+  monthIndex0: number,
+  preserveAbsences = true
+): MonthlyScheduleMap {
+  const afterFirstMonth = generateSingleMonthScheduleInternal(
+    employees,
+    existingSchedules,
+    year,
+    monthIndex0,
+    preserveAbsences
+  );
+  const nextYm = getNextYearMonth(year, monthIndex0);
+  const afterSecondMonth = generateSingleMonthScheduleInternal(
+    employees,
+    afterFirstMonth,
+    nextYm.year,
+    nextYm.monthIndex0,
+    preserveAbsences
+  );
+
+  return preserveAbsences
+    ? reapplyEmployeeHistoryToSchedules(employees, afterSecondMonth)
+    : afterSecondMonth;
 }
 
 // Aplica um registro de ausência ou folga (Folga, Falta, Atestado, Férias) diretamente nas células da escala

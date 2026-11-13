@@ -288,7 +288,8 @@ function inferAttributesFromRowCells(
   availableUnits: string[],
   availableRoles: string[],
   currentSectionUnit: string,
-  currentSectionRole: string
+  currentSectionRole: string,
+  firstScheduleDayNumber = 16
 ): Omit<ExtractedEmployeeItem, 'name'> {
   const joined = cells.join(' | ');
   const lowerJoined = joined.toLowerCase();
@@ -341,7 +342,7 @@ function inferAttributesFromRowCells(
     else if (/\brecep/i.test(joined)) roleHint = 'Recepcionista';
     else if (/\badm/i.test(joined)) roleHint = 'Auxiliar Administrativo';
     else if (/\bhigien/i.test(joined)) roleHint = 'Auxiliar de Higienização';
-    else roleHint = availableRoles[0] || 'Enfermeiro';
+    else roleHint = availableRoles[0] || 'Auxiliar de Farmácia';
   }
 
   // 2. Detecta Unidade / Setor
@@ -376,7 +377,11 @@ function inferAttributesFromRowCells(
   }
 
   // 4. Analisa células de dias (D, N, F, SD, SN, M, T) na linha para inferir regime 12x36 ímpar/par, 5x2 ou 6x1
-  let scheduleRegimeHint: '12x36_ODD' | '12x36_EVEN' | '5x2' | '6x1' = '12x36_ODD';
+  const firstDayIsEven = firstScheduleDayNumber % 2 === 0;
+  let scheduleRegimeHint: '12x36_ODD' | '12x36_EVEN' | '5x2' | '6x1' = firstDayIsEven
+    ? '12x36_EVEN'
+    : '12x36_ODD';
+
   if (/12\s*x\s*36.*par|\bpares\b|\bdia\s+par/i.test(joined)) {
     scheduleRegimeHint = '12x36_EVEN';
   } else if (/12\s*x\s*36.*[ií]mpar|\b[ií]mpares\b|\bdia\s+[ií]mpar/i.test(joined)) {
@@ -402,9 +407,11 @@ function inferAttributesFromRowCells(
         shiftHint = 'Noturno';
         if (!hoursMatch) workHoursHint = '19:00 às 07:00';
       }
-      // Se primeiro dia de código for F (folga no dia 1) e segundo for D/N (trabalha no dia 2), é 12x36 Par!
+      // Considera se a escala começa no dia 16 (par, padrão quinzenal 16 a 15) ou no dia 1 (ímpar)
       if (shiftCodes[0].code === 'F' && shiftCodes[1] && shiftCodes[1].code !== 'F') {
-        scheduleRegimeHint = '12x36_EVEN';
+        scheduleRegimeHint = firstDayIsEven ? '12x36_ODD' : '12x36_EVEN';
+      } else if (shiftCodes[0].code !== 'F' && shiftCodes[1]?.code === 'F') {
+        scheduleRegimeHint = firstDayIsEven ? '12x36_EVEN' : '12x36_ODD';
       }
     }
   }
@@ -472,6 +479,7 @@ function extractEmployeesDeterministically(
       });
 
       let nameColIdx = -1;
+      let firstScheduleDayNumber = 16; // Padrão quinzenal: começa no dia 16 (2ª quinzena do mês inicial, ex: 16/11 a 30/11 e 01/12 a 15/12)
       let currentSectionUnit =
         availableUnits.find((u) => sheetName.toLowerCase().includes(u.toLowerCase())) || '';
       let currentSectionRole = '';
@@ -481,6 +489,19 @@ function extractEmployeesDeterministically(
         const cells = rawRow.map((c) => String(c ?? '').trim());
         const nonEmptyCells = cells.filter(Boolean);
         if (nonEmptyCells.length === 0) continue;
+
+        // Detecta se a linha contém a sequência de dias do cabeçalho da escala (ex: 16, 17, 18... ou 01, 02, 03...)
+        const dayHeaderNums: number[] = [];
+        for (const c of cells) {
+          const m = c.match(/^(?:dia\s*)?(\d{1,2})(?:\/\d{1,2})?$/i);
+          if (m) {
+            const n = Number(m[1]);
+            if (n >= 1 && n <= 31) dayHeaderNums.push(n);
+          }
+        }
+        if (dayHeaderNums.length >= 6 && (dayHeaderNums[0] === 16 || dayHeaderNums[0] === 1)) {
+          firstScheduleDayNumber = dayHeaderNums[0];
+        }
 
         // Verifica se é uma linha de cabeçalho que declara a coluna "Nome" / "Colaborador" / "Funcionário"
         const detectedHeaderIdx = cells.findIndex((c) =>
@@ -511,7 +532,8 @@ function extractEmployeesDeterministically(
                 availableUnits,
                 availableRoles,
                 currentSectionUnit,
-                currentSectionRole
+                currentSectionRole,
+                firstScheduleDayNumber
               )
             );
           }
@@ -529,7 +551,8 @@ function extractEmployeesDeterministically(
               availableUnits,
               availableRoles,
               currentSectionUnit,
-              currentSectionRole
+              currentSectionRole,
+              firstScheduleDayNumber
             )
           );
           continue;
@@ -547,7 +570,8 @@ function extractEmployeesDeterministically(
                 availableUnits,
                 availableRoles,
                 currentSectionUnit,
-                currentSectionRole
+                currentSectionRole,
+                firstScheduleDayNumber
               )
             );
             break;
@@ -1873,7 +1897,7 @@ Regras de conversão:
           ? safeUnits.join(', ')
           : 'Unidade Principal, Pronto-Socorro, Centro Cirúrgico, UTI';
 
-      const promptText = `Você é um especialista em leitura de escalas hospitalares, planilhas Excel, documentos Word, PDFs, folhas de ponto e quadros de funcionários.
+      const promptText = `Você é um especialista em leitura de escalas hospitalares quinzenais (16 a 15), planilhas Excel, documentos Word, PDFs, folhas de ponto e quadros de funcionários.
 Analise o arquivo enviado (${fileName || 'documento'}) e extraia TODOS os nomes de colaboradores/funcionários encontrados.
 Para cada colaborador encontrado, identifique pistas no documento sobre:
 - name: Nome completo do colaborador (em formato Title Case limpo). Não inclua cabeçalhos de tabela, nomes de meses ou palavras genéricas como "Total", "Assinatura" ou "Unidade".
@@ -1882,6 +1906,9 @@ Para cada colaborador encontrado, identifique pistas no documento sobre:
 - shiftHint: Turno provável ("Diurno" ou "Noturno").
 - workHoursHint: Horário provável (ex: "07:00 às 19:00", "19:00 às 07:00", "08:00 às 17:00", "07:00 às 13:00").
 - scheduleRegimeHint: Regime de escala provável ("12x36_ODD" para 12x36 dias ímpares, "12x36_EVEN" para 12x36 dias pares, "5x2" para segunda a sexta, "6x1" para 6x1).
+  ATENÇÃO À ESCALA QUINZENAL (16 a 15): As escalas hospitalares começam na 2ª quinzena de um mês (ex: 16/11 a 30/11) e terminam na 1ª quinzena do mês seguinte (ex: 01/12 a 15/12). O primeiro dia da tabela é o dia 16 (PAR)! Portanto:
+  * Quem trabalha nos dias 16, 18, 20, 22, 24, 26, 28, 30 e 02, 04, 06, 08, 10, 12, 14 é "12x36_EVEN" (12x36 Dias Pares).
+  * Quem trabalha nos dias 17, 19, 21, 23, 25, 27, 29 e 01, 03, 05, 7, 9, 11, 13, 15 é "12x36_ODD" (12x36 Dias Ímpares).
 - registrationNumber: Matrícula, COREN, CRF, CRM ou registro se constar no arquivo (ou string vazia).
 - notes: Breve observação encontrada no documento (ex: "Férias", "Plantonista noturno", etc.).
 

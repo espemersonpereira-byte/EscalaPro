@@ -146,6 +146,22 @@ export interface NavigationContext {
   highlightAbsencesReport: boolean;
 }
 
+export type SchedulePeriodViewMode =
+  | 'CYCLE_16_15_FULL'
+  | 'FORTNIGHT_16_END'
+  | 'FORTNIGHT_01_15'
+  | 'CALENDAR_MONTH';
+
+export interface ScheduleCycleSlot {
+  year: number;
+  monthIndex0: number;
+  day: number;
+  ymKey: string;
+  isoDate: string;
+  shortDateLabel: string; // ex: "16/11", "01/12"
+  fortnightPart: 1 | 2; // 1 = 2ª quinzena do mês inicial (16..fim), 2 = 1ª quinzena do mês seguinte (01..15)
+}
+
 export interface ExtractedPdfEmployee {
   name: string;
   roleHint: string;
@@ -155,6 +171,7 @@ export interface ExtractedPdfEmployee {
   scheduleRegimeHint: ScheduleRegime;
   registrationNumber?: string;
   notes?: string;
+  dayShiftsHint?: Record<string, ShiftStatus>;
 }
 
 export interface ExtractedHourBankEntry {

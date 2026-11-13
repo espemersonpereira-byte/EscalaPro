@@ -10,9 +10,8 @@ import {
   WORK_HOURS_PRESETS,
 } from '../types';
 import {
+  buildFortnightCycleSlots,
   computeRegimeShiftForDay,
-  getDaysInMonth,
-  getYearMonthKey,
   storageService,
 } from '../services/storageService';
 import {
@@ -263,18 +262,16 @@ startxref
     onImportEmployeesBatch(createdEmployees);
     setCandidates([]);
     setImportSuccessMsg(
-      `${createdEmployees.length} colaboradores importados do PDF com sucesso! A escala mensal deles já foi gerada automaticamente.`
+      `${createdEmployees.length} colaboradores importados do arquivo com sucesso! A escala quinzenal (16 a 15) já foi gerada automaticamente.`
     );
   };
 
-  // Exporta Planilha CSV compatível com Excel do mês atual
+  // Exporta Planilha CSV compatível com Excel do ciclo quinzenal atual (16 a 15)
   const handleExportFullExcelCsv = () => {
     const now = new Date();
     const year = now.getFullYear();
     const month0 = now.getMonth();
-    const ymKey = getYearMonthKey(year, month0);
-    const daysCount = getDaysInMonth(year, month0);
-    const daysArray = Array.from({ length: daysCount }, (_, i) => i + 1);
+    const cycleSlots = buildFortnightCycleSlots(year, month0, 'CYCLE_16_15_FULL');
 
     const headers = [
       'Nome_Colaborador',
@@ -285,17 +282,17 @@ startxref
       'Horario_Trabalho',
       'Regime_Escala',
       'Saldo_Banco_Horas',
-      ...daysArray.map((d) => `Dia_${String(d).padStart(2, '0')}`),
+      ...cycleSlots.map((s) => s.shortDateLabel),
     ];
 
     const rows = state.employees
       .filter((e) => e.active)
       .map((emp) => {
         const unitName = state.units.find((u) => u.id === emp.unitId)?.name || '';
-        const dayStatuses = daysArray.map(
-          (d) =>
-            state.schedules[ymKey]?.[emp.id]?.[d]?.status ||
-            computeRegimeShiftForDay(emp, year, month0, d)
+        const dayStatuses = cycleSlots.map(
+          (slot) =>
+            state.schedules[slot.ymKey]?.[emp.id]?.[slot.day]?.status ||
+            computeRegimeShiftForDay(emp, slot.year, slot.monthIndex0, slot.day)
         );
 
         return [
@@ -316,7 +313,11 @@ startxref
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `escalapro-planilha-${ymKey}.csv`;
+    const firstSlot = cycleSlots[0];
+    const lastSlot = cycleSlots[cycleSlots.length - 1];
+    link.download = `escalapro-quinzenal-${
+      firstSlot?.shortDateLabel.replace('/', '_') || '16'
+    }-a-${lastSlot?.shortDateLabel.replace('/', '_') || '15'}.csv`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -538,28 +539,32 @@ startxref
                     {(
                       [
                         {
-                          label: '07:00 às 19:00 | 12x36 Dias Ímpares (Diurno)',
-                          shift: 'Diurno' as const,
-                          hours: '07:00 às 19:00',
-                          regime: '12x36_ODD' as ScheduleRegime,
-                        },
-                        {
-                          label: '07:00 às 19:00 | 12x36 Dias Pares (Diurno)',
+                          label:
+                            '07:00 às 19:00 | 12x36 Dias Pares — Trabalha 16, 18, 20... e 02, 04, 06... (Diurno)',
                           shift: 'Diurno' as const,
                           hours: '07:00 às 19:00',
                           regime: '12x36_EVEN' as ScheduleRegime,
                         },
                         {
-                          label: '19:00 às 07:00 | 12x36 Dias Ímpares (Noturno)',
-                          shift: 'Noturno' as const,
-                          hours: '19:00 às 07:00',
+                          label:
+                            '07:00 às 19:00 | 12x36 Dias Ímpares — Trabalha 17, 19, 21... e 01, 03, 05... (Diurno)',
+                          shift: 'Diurno' as const,
+                          hours: '07:00 às 19:00',
                           regime: '12x36_ODD' as ScheduleRegime,
                         },
                         {
-                          label: '19:00 às 07:00 | 12x36 Dias Pares (Noturno)',
+                          label:
+                            '19:00 às 07:00 | 12x36 Dias Pares — Trabalha 16, 18, 20... e 02, 04, 06... (Noturno)',
                           shift: 'Noturno' as const,
                           hours: '19:00 às 07:00',
                           regime: '12x36_EVEN' as ScheduleRegime,
+                        },
+                        {
+                          label:
+                            '19:00 às 07:00 | 12x36 Dias Ímpares — Trabalha 17, 19, 21... e 01, 03, 05... (Noturno)',
+                          shift: 'Noturno' as const,
+                          hours: '19:00 às 07:00',
+                          regime: '12x36_ODD' as ScheduleRegime,
                         },
                         {
                           label: '08:00 às 17:00 | 5x2 Segunda a Sexta',

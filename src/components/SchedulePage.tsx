@@ -7,17 +7,20 @@ import {
   NavigationContext,
   REGIME_LABELS,
   ScheduleCellData,
+  ScheduleCycleSlot,
+  SchedulePeriodViewMode,
   SHIFT_STATUS_META,
   ShiftStatus,
 } from '../types';
 import {
+  buildFortnightCycleSlots,
   computeRegimeShiftForDay,
   formatIsoDate,
   getDaysInMonth,
+  getNextYearMonth,
   getYearMonthKey,
 } from '../services/storageService';
 import {
-  AlertTriangle,
   ArrowLeftRight,
   Calendar,
   Check,
@@ -69,6 +72,21 @@ const MONTH_NAMES = [
   'Dezembro',
 ];
 
+const MONTH_SHORT = [
+  'Jan',
+  'Fev',
+  'Mar',
+  'Abr',
+  'Mai',
+  'Jun',
+  'Jul',
+  'Ago',
+  'Set',
+  'Out',
+  'Nov',
+  'Dez',
+];
+
 const WEEKDAY_SHORT = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
 
 export const SchedulePage: React.FC<SchedulePageProps> = ({
@@ -82,11 +100,14 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
   const now = new Date();
   const [selectedYear, setSelectedYear] = useState<number>(now.getFullYear());
   const [selectedMonth0, setSelectedMonth0] = useState<number>(now.getMonth());
+  // Padrão: Escala Quinzenal Completa (16 do mês inicial até 15 do mês seguinte, ex: 16/11 a 30/11 e 01/12 a 15/12)
+  const [periodViewMode, setPeriodViewMode] =
+    useState<SchedulePeriodViewMode>('CYCLE_16_15_FULL');
 
-  // Modal de edição rápida da célula da escala
+  // Modal de edição rápida da célula da escala (agora ciente do ano, mês e dia exato do slot quinzenal)
   const [editingCell, setEditingCell] = useState<{
     employee: Employee;
-    day: number;
+    slot: ScheduleCycleSlot;
     currentCell: ScheduleCellData;
   } | null>(null);
 
@@ -99,29 +120,43 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
   const [extraHoursInput, setExtraHoursInput] = useState<number>(6);
 
   // Modal de Radar de Cobertura Mínima (sugere folguistas para cobrir um dia com déficit)
-  const [coverageDayModal, setCoverageDayModal] = useState<number | null>(null);
+  const [coverageSlotModal, setCoverageSlotModal] = useState<ScheduleCycleSlot | null>(null);
 
   // Feedback de cópia do resumo para WhatsApp
   const [whatsappFeedback, setWhatsappFeedback] = useState<string | null>(null);
   const [autoGenBanner, setAutoGenBanner] = useState<string | null>(null);
 
-  const ymKey = getYearMonthKey(selectedYear, selectedMonth0);
-  const daysInMonth = getDaysInMonth(selectedYear, selectedMonth0);
-  const allDaysArray = useMemo(
-    () => Array.from({ length: daysInMonth }, (_, i) => i + 1),
-    [daysInMonth]
+  const nextYm = useMemo(
+    () => getNextYearMonth(selectedYear, selectedMonth0),
+    [selectedYear, selectedMonth0]
+  );
+
+  const startDaysInMonth = getDaysInMonth(selectedYear, selectedMonth0);
+  const startMonthNumStr = String(selectedMonth0 + 1).padStart(2, '0');
+  const nextMonthNumStr = String(nextYm.monthIndex0 + 1).padStart(2, '0');
+
+  const fortnight1RangeLabel = `16/${startMonthNumStr} a ${startDaysInMonth}/${startMonthNumStr}`;
+  const fortnight2RangeLabel = `01/${nextMonthNumStr} a 15/${nextMonthNumStr}`;
+  const fullCycleRangeLabel = `${fortnight1RangeLabel} e ${fortnight2RangeLabel}`;
+
+  const allCycleSlots = useMemo(
+    () => buildFortnightCycleSlots(selectedYear, selectedMonth0, periodViewMode),
+    [selectedYear, selectedMonth0, periodViewMode]
   );
 
   const allRoles = useMemo(() => {
     return Array.from(new Set([...NATIVE_HOSPITAL_ROLES, ...state.customRoles]));
   }, [state.customRoles]);
 
-  // Obtém célula efetiva de um colaborador em um dia
-  const getCellForEmployeeDay = (emp: Employee, day: number): ScheduleCellData => {
-    const saved = state.schedules[ymKey]?.[emp.id]?.[day];
+  // Obtém célula efetiva de um colaborador em um slot (dia/mês/ano)
+  const getCellForEmployeeSlot = (
+    emp: Employee,
+    slot: ScheduleCycleSlot
+  ): ScheduleCellData => {
+    const saved = state.schedules[slot.ymKey]?.[emp.id]?.[slot.day];
     if (saved) return saved;
     return {
-      status: computeRegimeShiftForDay(emp, selectedYear, selectedMonth0, day),
+      status: computeRegimeShiftForDay(emp, slot.year, slot.monthIndex0, slot.day),
     };
   };
 
@@ -156,7 +191,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
     navContext.selectedRoleFilter,
   ]);
 
-  // Radar de Cobertura Mínima por dia (calcula escalados vs. mínimo exigido pelas unidades filtradas)
+  // Radar de Cobertura Mínima por data ISO do ciclo quinzenal
   const dailyCoverageMap = useMemo(() => {
     const relevantUnits =
       navContext.selectedUnitFilter === 'TODAS'
@@ -175,11 +210,11 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
     }, 0);
 
     const map: Record<
-      number,
+      string,
       { scheduledCount: number; minRequired: number; hasDeficit: boolean }
     > = {};
 
-    for (const day of allDaysArray) {
+    for (const slot of allCycleSlots) {
       let scheduledCount = 0;
       const poolForCoverage =
         navContext.selectedUnitFilter === 'TODAS'
@@ -198,7 +233,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
               ) {
                 return false;
               }
-              const cell = getCellForEmployeeDay(emp, day);
+              const cell = getCellForEmployeeSlot(emp, slot);
               const effUnit =
                 cell.unitOverrideId && state.units.some((u) => u.id === cell.unitOverrideId)
                   ? cell.unitOverrideId
@@ -207,12 +242,12 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
             });
 
       for (const emp of poolForCoverage) {
-        const cell = getCellForEmployeeDay(emp, day);
+        const cell = getCellForEmployeeSlot(emp, slot);
         if (cell.status === 'D' || cell.status === 'N' || cell.status === 'TR') {
           scheduledCount++;
         }
       }
-      map[day] = {
+      map[slot.isoDate] = {
         scheduledCount,
         minRequired: minRequiredTotal,
         hasDeficit: scheduledCount < minRequiredTotal,
@@ -221,7 +256,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
 
     return map;
   }, [
-    allDaysArray,
+    allCycleSlots,
     filteredEmployees,
     state.employees,
     navContext.selectedUnitFilter,
@@ -229,15 +264,23 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
     navContext.selectedRoleFilter,
     state.units,
     state.schedules,
-    ymKey,
   ]);
 
-  const visibleDays = useMemo(() => {
-    if (!navContext.onlyUncoveredDaysInSchedule) return allDaysArray;
-    return allDaysArray.filter((d) => dailyCoverageMap[d]?.hasDeficit);
-  }, [allDaysArray, navContext.onlyUncoveredDaysInSchedule, dailyCoverageMap]);
+  const visibleSlots = useMemo(() => {
+    if (!navContext.onlyUncoveredDaysInSchedule) return allCycleSlots;
+    return allCycleSlots.filter((slot) => dailyCoverageMap[slot.isoDate]?.hasDeficit);
+  }, [allCycleSlots, navContext.onlyUncoveredDaysInSchedule, dailyCoverageMap]);
 
-  const handlePrevMonth = () => {
+  const part1VisibleCount = useMemo(
+    () => visibleSlots.filter((s) => s.fortnightPart === 1).length,
+    [visibleSlots]
+  );
+  const part2VisibleCount = useMemo(
+    () => visibleSlots.filter((s) => s.fortnightPart === 2).length,
+    [visibleSlots]
+  );
+
+  const handlePrevCycle = () => {
     if (selectedMonth0 === 0) {
       setSelectedMonth0(11);
       setSelectedYear((y) => y - 1);
@@ -246,7 +289,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
     }
   };
 
-  const handleNextMonth = () => {
+  const handleNextCycle = () => {
     if (selectedMonth0 === 11) {
       setSelectedMonth0(0);
       setSelectedYear((y) => y + 1);
@@ -255,9 +298,9 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
     }
   };
 
-  const openCellEditor = (emp: Employee, day: number) => {
-    const cell = getCellForEmployeeDay(emp, day);
-    setEditingCell({ employee: emp, day, currentCell: cell });
+  const openCellEditor = (emp: Employee, slot: ScheduleCycleSlot) => {
+    const cell = getCellForEmployeeSlot(emp, slot);
+    setEditingCell({ employee: emp, slot, currentCell: cell });
     setModalTab('STATUS');
     setCellStatus(cell.status);
     setCellUnitId(
@@ -270,9 +313,15 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
       (e) => e.active && e.id !== emp.id
     );
     setSwapPartnerId(cell.swapWithEmployeeId || potentialPartners[0]?.id || '');
+
+    const nextDateObj = new Date(slot.year, slot.monthIndex0, slot.day + 1);
     setSwapReturnDate(
       cell.swapReturnDate ||
-        formatIsoDate(selectedYear, selectedMonth0, Math.min(daysInMonth, day + 1))
+        formatIsoDate(
+          nextDateObj.getFullYear(),
+          nextDateObj.getMonth(),
+          nextDateObj.getDate()
+        )
     );
     setExtraHoursInput(cell.extraHours || 6);
   };
@@ -281,20 +330,20 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
     e.preventDefault();
     if (!editingCell) return;
 
-    const { employee, day } = editingCell;
-    const dateIso = formatIsoDate(selectedYear, selectedMonth0, day);
+    const { employee, slot } = editingCell;
+    const dateIso = slot.isoDate;
 
     if (modalTab === 'STATUS') {
       const defaultRegimeStatus = computeRegimeShiftForDay(
         employee,
-        selectedYear,
-        selectedMonth0,
-        day
+        slot.year,
+        slot.monthIndex0,
+        slot.day
       );
       const isManualFolga = cellStatus === 'F' && defaultRegimeStatus !== 'F';
       const effectiveNote =
         cellNote.trim() ||
-        `${SHIFT_STATUS_META[cellStatus].label} marcado manualmente na escala`;
+        `${SHIFT_STATUS_META[cellStatus].label} marcado manualmente na escala (${slot.shortDateLabel})`;
 
       const historyRecord: AbsenceRecord | undefined =
         isManualFolga || cellStatus === 'FA' || cellStatus === 'AT' || cellStatus === 'FE'
@@ -314,16 +363,16 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
               shift: employee.defaultShift,
               reason:
                 cellNote.trim() ||
-                `${SHIFT_STATUS_META[cellStatus].label} lançado diretamente na grade da escala.`,
+                `${SHIFT_STATUS_META[cellStatus].label} lançado diretamente na grade da escala (${slot.shortDateLabel}).`,
               createdAt: new Date().toISOString(),
             }
           : undefined;
 
       onUpdateScheduleCell(
-        selectedYear,
-        selectedMonth0,
+        slot.year,
+        slot.monthIndex0,
         employee.id,
-        day,
+        slot.day,
         {
           status: cellStatus,
           unitOverrideId: cellUnitId && cellUnitId !== employee.unitId ? cellUnitId : '',
@@ -350,10 +399,10 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
       };
 
       onUpdateScheduleCell(
-        selectedYear,
-        selectedMonth0,
+        slot.year,
+        slot.monthIndex0,
         employee.id,
-        day,
+        slot.day,
         {
           status: 'TR',
           swapWithEmployeeId: partner.id,
@@ -383,10 +432,10 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
       };
 
       onUpdateScheduleCell(
-        selectedYear,
-        selectedMonth0,
+        slot.year,
+        slot.monthIndex0,
         employee.id,
-        day,
+        slot.day,
         {
           ...editingCell.currentCell,
           status: employee.defaultShift === 'Noturno' ? 'N' : 'D',
@@ -480,7 +529,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
     }
   };
 
-  // Exporta CSV compatível com Excel direto da tela de Escala também
+  // Exporta CSV compatível com Excel exatamente com as datas do ciclo quinzenal ativo (ex: 16/11 a 30/11 e 01/12 a 15/12)
   const handleExportCsv = () => {
     const headers = [
       'Colaborador',
@@ -488,12 +537,12 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
       'Unidade',
       'Turno_Padrao',
       'Regime',
-      ...allDaysArray.map((d) => `Dia_${String(d).padStart(2, '0')}`),
+      ...allCycleSlots.map((s) => s.shortDateLabel),
     ];
 
     const rows = filteredEmployees.map((emp) => {
       const unitName = state.units.find((u) => u.id === emp.unitId)?.name || '';
-      const dayCells = allDaysArray.map((d) => getCellForEmployeeDay(emp, d).status);
+      const dayCells = allCycleSlots.map((s) => getCellForEmployeeSlot(emp, s).status);
       return [
         `"${emp.name}"`,
         `"${emp.role}"`,
@@ -509,7 +558,11 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `escala-${ymKey}.csv`;
+    const fileTag =
+      periodViewMode === 'CALENDAR_MONTH'
+        ? `${selectedYear}-${startMonthNumStr}`
+        : `quinzenal-16_${startMonthNumStr}-a-15_${nextMonthNumStr}-${selectedYear}`;
+    link.download = `escala-${fileTag}.csv`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -518,6 +571,15 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
 
   const getUnitName = (unitId: string) =>
     state.units.find((u) => u.id === unitId)?.name || 'Unidade';
+
+  const activePeriodTitle =
+    periodViewMode === 'CALENDAR_MONTH'
+      ? `${MONTH_NAMES[selectedMonth0]} de ${selectedYear} (01/${startMonthNumStr} a ${startDaysInMonth}/${startMonthNumStr})`
+      : periodViewMode === 'FORTNIGHT_16_END'
+      ? `2ª Quinzena de ${MONTH_NAMES[selectedMonth0]} (${fortnight1RangeLabel})`
+      : periodViewMode === 'FORTNIGHT_01_15'
+      ? `1ª Quinzena de ${MONTH_NAMES[nextYm.monthIndex0]} (${fortnight2RangeLabel})`
+      : `Escala Quinzenal: ${fortnight1RangeLabel} (${MONTH_SHORT[selectedMonth0]}) e ${fortnight2RangeLabel} (${MONTH_SHORT[nextYm.monthIndex0]})`;
 
   return (
     <div className="space-y-5 print-container">
@@ -529,8 +591,8 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
               {state.manager.hospitalName || 'Instituição Hospitalar'} — Escala Oficial de Plantões
             </h1>
             <p className="text-sm text-slate-700">
-              Setor: {state.manager.sectorName} · Referência: {MONTH_NAMES[selectedMonth0]} de{' '}
-              {selectedYear} · Responsável: {state.manager.name} ({state.manager.role})
+              Setor: {state.manager.sectorName} · {activePeriodTitle} · Responsável:{' '}
+              {state.manager.name} ({state.manager.role})
             </p>
           </div>
           <div className="text-right text-xs text-slate-600">
@@ -540,53 +602,67 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
         </div>
       </div>
 
-      {/* Barra Superior de Ações e Geração Automática */}
+      {/* Barra Superior de Ações e Período Quinzenal (16 a 15) */}
       <section className="no-print bg-white rounded-2xl border border-slate-200 p-4 md:p-5 space-y-4">
         <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
-          {/* Seletor de Mês/Ano */}
-          <div className="flex items-center gap-3">
+          {/* Seletor de Ciclo Quinzenal (ex: 16/Nov a 15/Dez) */}
+          <div className="flex flex-col sm:flex-row sm:items-center gap-3">
             <div className="flex items-center bg-slate-100 rounded-xl p-1 border border-slate-200">
               <button
                 type="button"
-                onClick={handlePrevMonth}
+                onClick={handlePrevCycle}
                 className="p-2 rounded-lg hover:bg-white text-slate-700 transition-colors cursor-pointer"
-                title="Mês anterior"
+                title="Ciclo anterior"
               >
                 <ChevronLeft className="w-4 h-4" />
               </button>
-              <div className="px-4 py-1 text-sm font-bold text-slate-900 min-w-[155px] text-center">
-                {MONTH_NAMES[selectedMonth0]} {selectedYear}
+              <div className="px-3.5 py-1 text-center min-w-[210px]">
+                {periodViewMode === 'CALENDAR_MONTH' ? (
+                  <div className="text-sm font-bold text-slate-900">
+                    {MONTH_NAMES[selectedMonth0]} {selectedYear}
+                  </div>
+                ) : (
+                  <>
+                    <div className="text-xs sm:text-sm font-bold text-slate-900 leading-tight">
+                      16/{MONTH_SHORT[selectedMonth0]} a 15/{MONTH_SHORT[nextYm.monthIndex0]}{' '}
+                      {nextYm.year}
+                    </div>
+                    <div className="text-[10px] font-semibold text-teal-700 leading-tight mt-0.5">
+                      {fortnight1RangeLabel} + {fortnight2RangeLabel}
+                    </div>
+                  </>
+                )}
               </div>
               <button
                 type="button"
-                onClick={handleNextMonth}
+                onClick={handleNextCycle}
                 className="p-2 rounded-lg hover:bg-white text-slate-700 transition-colors cursor-pointer"
-                title="Próximo mês"
+                title="Próximo ciclo"
               >
                 <ChevronRight className="w-4 h-4" />
               </button>
             </div>
 
-            <span className="hidden sm:inline-block text-xs text-slate-500">
-              Toque em qualquer célula para alterar plantão, permuta ou hora extra
+            <span className="hidden xl:inline-block text-xs text-slate-500">
+              Toque em qualquer dia ({fortnight1RangeLabel} ou {fortnight2RangeLabel}) para ajustar plantão ou folga
             </span>
           </div>
 
           {/* Botões de Ação Principal */}
-          <div className="flex flex-wrap items-center gap-2.5">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={() => {
                 onGenerateAutoSchedule(selectedYear, selectedMonth0);
                 setAutoGenBanner(
-                  `Escala de ${MONTH_NAMES[selectedMonth0]}/${selectedYear} gerada automaticamente respeitando regimes (12x36, 5x2, 6x1) e preservando férias e atestados!`
+                  `Escala Quinzenal (${fullCycleRangeLabel}) gerada automaticamente respeitando regimes (12x36, 5x2, 6x1) e preservando folgas, férias e atestados!`
                 );
                 setTimeout(() => setAutoGenBanner(null), 5000);
               }}
               className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[#0d9488] hover:bg-teal-700 text-white text-xs font-bold transition-colors cursor-pointer whitespace-nowrap shadow-xs"
             >
               <Sparkles className="w-4 h-4" />
-              <span>Gerar Escala Automática</span>
+              <span>Gerar Escala Quinzenal</span>
             </button>
 
             <button
@@ -614,6 +690,66 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
             >
               <Printer className="w-4 h-4 text-slate-600" />
               <span>Imprimir A4</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Seletor Rápido das Quinzenas do Ciclo (16/11 a 30/11 | 01/12 a 15/12) */}
+        <div className="pt-3 border-t border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+          <div className="flex items-center gap-2">
+            <Calendar className="w-4 h-4 text-teal-600 shrink-0" />
+            <span className="text-xs font-bold text-slate-700">
+              Visualização Quinzenal da Escala:
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:flex lg:flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setPeriodViewMode('CYCLE_16_15_FULL')}
+              className={`px-3 py-2 rounded-xl text-xs font-bold border transition-colors cursor-pointer ${
+                periodViewMode === 'CYCLE_16_15_FULL'
+                  ? 'bg-[#0f172a] text-white border-slate-900'
+                  : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+              }`}
+            >
+              Ciclo Completo ({fortnight1RangeLabel} + {fortnight2RangeLabel})
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setPeriodViewMode('FORTNIGHT_16_END')}
+              className={`px-3 py-2 rounded-xl text-xs font-bold border transition-colors cursor-pointer ${
+                periodViewMode === 'FORTNIGHT_16_END'
+                  ? 'bg-[#0d9488] text-white border-teal-700'
+                  : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+              }`}
+            >
+              2ª Quinzena {MONTH_SHORT[selectedMonth0]} ({fortnight1RangeLabel})
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setPeriodViewMode('FORTNIGHT_01_15')}
+              className={`px-3 py-2 rounded-xl text-xs font-bold border transition-colors cursor-pointer ${
+                periodViewMode === 'FORTNIGHT_01_15'
+                  ? 'bg-indigo-600 text-white border-indigo-700'
+                  : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+              }`}
+            >
+              1ª Quinzena {MONTH_SHORT[nextYm.monthIndex0]} ({fortnight2RangeLabel})
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setPeriodViewMode('CALENDAR_MONTH')}
+              className={`px-3 py-2 rounded-xl text-xs font-semibold border transition-colors cursor-pointer ${
+                periodViewMode === 'CALENDAR_MONTH'
+                  ? 'bg-slate-800 text-white border-slate-900'
+                  : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              Mês Civil (01/{startMonthNumStr} a {startDaysInMonth}/{startMonthNumStr})
             </button>
           </div>
         </div>
@@ -748,7 +884,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
         </div>
       </section>
 
-      {/* Grade da Escala Mensal */}
+      {/* Grade da Escala Quinzenal */}
       <section className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
         {filteredEmployees.length === 0 ? (
           <div className="p-10 text-center space-y-3">
@@ -779,52 +915,86 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
               </button>
             </div>
           </div>
-        ) : visibleDays.length === 0 ? (
+        ) : visibleSlots.length === 0 ? (
           <div className="p-10 text-center space-y-3">
             <p className="text-base font-bold text-emerald-800">
-              Excelente! Nenhum dia deste mês possui déficit de cobertura mínima.
+              Excelente! Nenhum dia deste período possui déficit de cobertura mínima.
             </p>
             <button
               type="button"
               onClick={() => onUpdateNav({ onlyUncoveredDaysInSchedule: false })}
               className="px-4 py-2 rounded-xl bg-[#0d9488] text-white text-xs font-semibold cursor-pointer"
             >
-              Ver Todos os Dias do Mês
+              Ver Todos os Dias da Quinzena
             </button>
           </div>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full border-collapse text-left print-table">
               <thead>
+                {/* Linha Superior Agrupada identificando claramente as 2 Quinzenas (16/11 a 30/11 e 01/12 a 15/12) */}
+                {periodViewMode !== 'CALENDAR_MONTH' && (
+                  <tr className="bg-slate-950 text-white border-b border-slate-800">
+                    <th className="sticky left-0 z-20 bg-slate-950 px-3.5 py-2 text-[11px] font-bold text-teal-400 border-r border-slate-800">
+                      Ciclo Quinzenal (16 a 15)
+                    </th>
+                    {part1VisibleCount > 0 && (
+                      <th
+                        colSpan={part1VisibleCount}
+                        className="px-2 py-1.5 text-center text-[11px] font-bold tracking-wide text-teal-300 bg-teal-950/60 border-r-2 border-teal-500/60"
+                      >
+                        2ª Quinzena de {MONTH_NAMES[selectedMonth0]} ({fortnight1RangeLabel})
+                      </th>
+                    )}
+                    {part2VisibleCount > 0 && (
+                      <th
+                        colSpan={part2VisibleCount}
+                        className="px-2 py-1.5 text-center text-[11px] font-bold tracking-wide text-indigo-300 bg-indigo-950/60 border-r border-slate-800"
+                      >
+                        1ª Quinzena de {MONTH_NAMES[nextYm.monthIndex0]} ({fortnight2RangeLabel})
+                      </th>
+                    )}
+                  </tr>
+                )}
+
                 <tr className="bg-slate-900 text-white border-b border-slate-800">
                   <th className="sticky left-0 z-20 bg-slate-900 px-3.5 py-3 min-w-[210px] max-w-[230px] text-xs font-bold tracking-tight border-r border-slate-800">
                     Colaborador / Função / Unidade
                   </th>
-                  {visibleDays.map((d) => {
-                    const dateObj = new Date(selectedYear, selectedMonth0, d);
+                  {visibleSlots.map((slot, idx) => {
+                    const dateObj = new Date(slot.year, slot.monthIndex0, slot.day);
                     const dow = dateObj.getDay();
                     const isWeekend = dow === 0 || dow === 6;
                     const isToday =
-                      selectedYear === now.getFullYear() &&
-                      selectedMonth0 === now.getMonth() &&
-                      d === now.getDate();
+                      slot.year === now.getFullYear() &&
+                      slot.monthIndex0 === now.getMonth() &&
+                      slot.day === now.getDate();
+                    const isFirstOfSecondFortnight =
+                      periodViewMode === 'CYCLE_16_15_FULL' &&
+                      slot.fortnightPart === 2 &&
+                      idx > 0 &&
+                      visibleSlots[idx - 1]?.fortnightPart === 1;
 
                     return (
                       <th
-                        key={d}
-                        className={`px-1 py-2 text-center min-w-[36px] border-r border-slate-800 select-none ${
+                        key={slot.isoDate}
+                        className={`px-1 py-2 text-center min-w-[40px] border-r border-slate-800 select-none ${
+                          isFirstOfSecondFortnight ? 'border-l-2 border-l-teal-400' : ''
+                        } ${
                           isToday
                             ? 'bg-teal-600 text-white'
                             : isWeekend
                             ? 'bg-slate-800 text-amber-300'
+                            : slot.fortnightPart === 2 && periodViewMode !== 'CALENDAR_MONTH'
+                            ? 'bg-slate-900/90 text-indigo-200'
                             : 'text-slate-200'
                         }`}
                       >
                         <div className="text-[10px] font-medium opacity-80">
                           {WEEKDAY_SHORT[dow]}
                         </div>
-                        <div className="text-xs font-bold tabular-nums">
-                          {String(d).padStart(2, '0')}
+                        <div className="text-[11px] font-bold tabular-nums leading-tight mt-0.5">
+                          {slot.shortDateLabel}
                         </div>
                       </th>
                     );
@@ -856,26 +1026,31 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                         </button>
                       </td>
 
-                      {/* Células dos dias do mês */}
-                      {visibleDays.map((d) => {
-                        const cell = getCellForEmployeeDay(emp, d);
+                      {/* Células dos dias do ciclo quinzenal */}
+                      {visibleSlots.map((slot, idx) => {
+                        const cell = getCellForEmployeeSlot(emp, slot);
                         const meta = SHIFT_STATUS_META[cell.status];
-                        const dateObj = new Date(selectedYear, selectedMonth0, d);
+                        const dateObj = new Date(slot.year, slot.monthIndex0, slot.day);
                         const isWeekend = dateObj.getDay() === 0 || dateObj.getDay() === 6;
                         const hasUnitOverride =
                           Boolean(cell.unitOverrideId) && cell.unitOverrideId !== emp.unitId;
+                        const isFirstOfSecondFortnight =
+                          periodViewMode === 'CYCLE_16_15_FULL' &&
+                          slot.fortnightPart === 2 &&
+                          idx > 0 &&
+                          visibleSlots[idx - 1]?.fortnightPart === 1;
 
                         return (
                           <td
-                            key={d}
+                            key={slot.isoDate}
                             className={`p-1 text-center border-r border-slate-100 ${
-                              isWeekend ? 'bg-slate-50/70' : ''
-                            }`}
+                              isFirstOfSecondFortnight ? 'border-l-2 border-l-teal-500/40' : ''
+                            } ${isWeekend ? 'bg-slate-50/70' : ''}`}
                           >
                             <button
                               type="button"
-                              onClick={() => openCellEditor(emp, d)}
-                              title={`${emp.name} — Dia ${d}: ${meta.label}${
+                              onClick={() => openCellEditor(emp, slot)}
+                              title={`${emp.name} — Dia ${slot.shortDateLabel}: ${meta.label}${
                                 hasUnitOverride && cell.unitOverrideId
                                   ? ` · Direcionado para ${getUnitName(cell.unitOverrideId)}`
                                   : ''
@@ -907,19 +1082,25 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                       Toque no dia em vermelho para convocar folguista
                     </div>
                   </td>
-                  {visibleDays.map((d) => {
-                    const cov = dailyCoverageMap[d];
+                  {visibleSlots.map((slot, idx) => {
+                    const cov = dailyCoverageMap[slot.isoDate];
                     const hasDeficit = cov?.hasDeficit;
+                    const isFirstOfSecondFortnight =
+                      periodViewMode === 'CYCLE_16_15_FULL' &&
+                      slot.fortnightPart === 2 &&
+                      idx > 0 &&
+                      visibleSlots[idx - 1]?.fortnightPart === 1;
+
                     return (
                       <td
-                        key={d}
+                        key={slot.isoDate}
                         className={`p-1 text-center border-r border-slate-200 ${
-                          hasDeficit ? 'bg-red-50' : 'bg-emerald-50/40'
-                        }`}
+                          isFirstOfSecondFortnight ? 'border-l-2 border-l-teal-500/40' : ''
+                        } ${hasDeficit ? 'bg-red-50' : 'bg-emerald-50/40'}`}
                       >
                         <button
                           type="button"
-                          onClick={() => setCoverageDayModal(d)}
+                          onClick={() => setCoverageSlotModal(slot)}
                           className={`w-full py-1 rounded text-[10px] font-bold tabular-nums cursor-pointer ${
                             hasDeficit
                               ? 'bg-red-600 text-white hover:bg-red-700'
@@ -927,8 +1108,8 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                           }`}
                           title={
                             hasDeficit
-                              ? `Déficit no dia ${d}: ${cov.scheduledCount}/${cov.minRequired} escalados. Toque para ver quem está de folga.`
-                              : `Cobertura atingida no dia ${d}: ${cov.scheduledCount}/${cov.minRequired}`
+                              ? `Déficit em ${slot.shortDateLabel}: ${cov.scheduledCount}/${cov.minRequired} escalados. Toque para ver quem está de folga.`
+                              : `Cobertura atingida em ${slot.shortDateLabel}: ${cov.scheduledCount}/${cov.minRequired}`
                           }
                         >
                           {cov.scheduledCount}/{cov.minRequired}
@@ -976,8 +1157,9 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
             <div className="bg-slate-900 text-white px-6 py-4 flex items-center justify-between">
               <div>
                 <p className="text-xs text-teal-400 font-semibold">
-                  Dia {String(editingCell.day).padStart(2, '0')} de{' '}
-                  {MONTH_NAMES[selectedMonth0]} de {selectedYear}
+                  Dia {String(editingCell.slot.day).padStart(2, '0')} de{' '}
+                  {MONTH_NAMES[editingCell.slot.monthIndex0]} de {editingCell.slot.year} (
+                  {editingCell.slot.shortDateLabel})
                 </p>
                 <h3 className="text-base font-bold text-white mt-0.5">
                   {editingCell.employee.name}
@@ -1037,7 +1219,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                 <>
                   <div>
                     <label className="block text-xs font-bold text-slate-700 mb-2">
-                      Selecione o Status na Escala
+                      Selecione o Status na Escala ({editingCell.slot.shortDateLabel})
                     </label>
                     <div className="grid grid-cols-2 gap-2.5">
                       {(['D', 'N', 'F', 'FA', 'AT', 'FE'] as ShiftStatus[]).map((st) => {
@@ -1071,7 +1253,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                   {state.units.length > 1 && (
                     <div>
                       <label className="block text-xs font-bold text-slate-700 mb-1">
-                        Setor apenas neste dia (não altera os outros dias)
+                        Setor apenas neste dia ({editingCell.slot.shortDateLabel} — não altera os outros dias)
                       </label>
                       <select
                         value={cellUnitId || editingCell.employee.unitId}
@@ -1222,7 +1404,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
       )}
 
       {/* MODAL DO RADAR DE COBERTURA (Sugere Folguistas do Dia para Cobrir Déficit) */}
-      {coverageDayModal !== null && (
+      {coverageSlotModal !== null && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 no-print">
           <div className="bg-white rounded-3xl max-w-lg w-full border border-slate-200 shadow-2xl overflow-hidden">
             <div className="bg-slate-900 text-white px-6 py-4 flex items-center justify-between">
@@ -1230,18 +1412,18 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                 <Calendar className="w-5 h-5 text-teal-400" />
                 <div>
                   <h3 className="text-base font-bold text-white">
-                    Radar de Cobertura — Dia {String(coverageDayModal).padStart(2, '0')}/
-                    {String(selectedMonth0 + 1).padStart(2, '0')}
+                    Radar de Cobertura — Dia {coverageSlotModal.shortDateLabel}/
+                    {coverageSlotModal.year}
                   </h3>
                   <p className="text-xs text-slate-300">
-                    Escalados: {dailyCoverageMap[coverageDayModal]?.scheduledCount} · Mínimo
-                    necessário: {dailyCoverageMap[coverageDayModal]?.minRequired}
+                    Escalados: {dailyCoverageMap[coverageSlotModal.isoDate]?.scheduledCount} ·
+                    Mínimo necessário: {dailyCoverageMap[coverageSlotModal.isoDate]?.minRequired}
                   </p>
                 </div>
               </div>
               <button
                 type="button"
-                onClick={() => setCoverageDayModal(null)}
+                onClick={() => setCoverageSlotModal(null)}
                 className="p-2 rounded-xl bg-slate-800 text-slate-300 hover:text-white cursor-pointer"
               >
                 <X className="w-5 h-5" />
@@ -1250,14 +1432,15 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
 
             <div className="p-6 space-y-4 max-h-[420px] overflow-y-auto">
               <p className="text-xs text-slate-600">
-                Profissionais que estão de <strong>Folga (F)</strong> neste dia e disponíveis
-                para convocação ou cobertura rápida:
+                Profissionais que estão de <strong>Folga (F)</strong> neste dia (
+                {coverageSlotModal.shortDateLabel}) e disponíveis para convocação ou cobertura
+                rápida:
               </p>
 
               {(() => {
                 const availableFolguistas = state.employees.filter((emp) => {
                   if (!emp.active) return false;
-                  const cell = getCellForEmployeeDay(emp, coverageDayModal);
+                  const cell = getCellForEmployeeSlot(emp, coverageSlotModal);
                   return cell.status === 'F';
                 });
 
@@ -1290,14 +1473,14 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                             const shiftCode: ShiftStatus =
                               emp.defaultShift === 'Noturno' ? 'N' : 'D';
                             onUpdateScheduleCell(
-                              selectedYear,
-                              selectedMonth0,
+                              coverageSlotModal.year,
+                              coverageSlotModal.monthIndex0,
                               emp.id,
-                              coverageDayModal,
+                              coverageSlotModal.day,
                               {
                                 status: shiftCode,
                                 extraHours: 12,
-                                note: 'Convocado pelo Radar de Cobertura Mínima (+12h)',
+                                note: `Convocado pelo Radar de Cobertura Mínima em ${coverageSlotModal.shortDateLabel} (+12h)`,
                               },
                               { extraHoursDelta: 12 }
                             );
