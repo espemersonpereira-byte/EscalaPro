@@ -740,13 +740,295 @@ async function extractTextOrInlinePart(
   };
 }
 
+interface ExtractedHourBankItem {
+  name: string;
+  hoursBalance: number;
+  formattedOriginal?: string;
+  unitHint?: string;
+  roleHint?: string;
+  registrationNumber?: string;
+  notes?: string;
+}
+
+function parseHourBalanceString(rawVal: string): { parsed: boolean; hours: number; original: string } {
+  const cleaned = String(rawVal || '').trim();
+  if (!cleaned) return { parsed: false, hours: 0, original: '' };
+
+  // Evita confundir horários de expediente (ex: "07:00 às 19:00") ou datas ("12/11/2026") ou regimes ("12x36", "5x2", "6x1") com saldo de banco de horas
+  if (
+    /\d{1,2}:\d{2}\s*(?:as|às|a|-)\s*\d{1,2}:\d{2}/i.test(cleaned) ||
+    /\b(?:12\s*x\s*36|5\s*x\s*2|6\s*x\s*1)\b/i.test(cleaned) ||
+    /^\d{1,2}\/\d{1,2}(?:\/\d{2,4})?$/.test(cleaned) ||
+    /^\d{4}-\d{2}-\d{2}$/.test(cleaned)
+  ) {
+    return { parsed: false, hours: 0, original: '' };
+  }
+
+  const lower = cleaned.toLowerCase();
+  const isNegativeContext =
+    lower.includes('debito') ||
+    lower.includes('débito') ||
+    lower.includes('negativ') ||
+    lower.includes('falta') ||
+    lower.includes('devendo') ||
+    cleaned.startsWith('-') ||
+    /^\(.*\)$/.test(cleaned);
+
+  // Formato HH:MM (ex: "+12:30", "-04:15", "08:30h", "14:00")
+  const hhmmMatch = cleaned.match(/([+-])?\s*(\d{1,3}):(\d{2})(?:\s*h(?:oras?)?)?\b/i);
+  if (hhmmMatch) {
+    const sign = hhmmMatch[1] === '-' || isNegativeContext ? -1 : 1;
+    const h = Number(hhmmMatch[2]) || 0;
+    const m = Number(hhmmMatch[3]) || 0;
+    if (h <= 400 && m < 60) {
+      const total = Math.round((h + m / 60) * 100) / 100;
+      return { parsed: true, hours: sign * total, original: cleaned };
+    }
+  }
+
+  // Formato explícito com "h" ou "horas" ou sinal +/- (ex: "+12h", "-6,5h", "+8 horas", "12.5h")
+  const explicitHoursMatch = cleaned.match(
+    /([+-])\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:h(?:oras?|rs?)?)?|\b(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:h(?:oras?|rs?)|bh|saldo)\b/i
+  );
+  if (explicitHoursMatch) {
+    const numStr = (explicitHoursMatch[2] || explicitHoursMatch[3] || '0').replace(',', '.');
+    const val = Number(numStr);
+    if (!Number.isNaN(val) && val <= 400) {
+      const sign = explicitHoursMatch[1] === '-' || isNegativeContext ? -1 : 1;
+      return { parsed: true, hours: sign * val, original: cleaned };
+    }
+  }
+
+  // Número puro em coluna de saldo (ex: "12", "-4,5", "8.5", "0")
+  const pureNumMatch = cleaned.match(/^([+-])?\s*(\d{1,3}(?:[.,]\d{1,2})?)$/);
+  if (pureNumMatch) {
+    const val = Number(pureNumMatch[2].replace(',', '.'));
+    if (!Number.isNaN(val) && val <= 300) {
+      const sign = pureNumMatch[1] === '-' || isNegativeContext ? -1 : 1;
+      return { parsed: true, hours: sign * val, original: cleaned };
+    }
+  }
+
+  return { parsed: false, hours: 0, original: '' };
+}
+
+function extractHourBankDeterministically(
+  fileBuffer: Buffer,
+  extractedText: string,
+  availableUnits: string[],
+  availableRoles: string[]
+): ExtractedHourBankItem[] {
+  const results: ExtractedHourBankItem[] = [];
+  const seenNames = new Set<string>();
+
+  const addEntry = (
+    rawName: string,
+    hoursBalance: number,
+    formattedOriginal: string,
+    otherCells: string[]
+  ) => {
+    const cleanName = toTitleCasePtBr(
+      rawName
+        .replace(/^\d+[\s.)-]+/, '')
+        .replace(/\([^)]*\)/g, '')
+        .trim()
+    );
+    const key = cleanName.toLowerCase();
+    if (!cleanName || seenNames.has(key)) return;
+    seenNames.add(key);
+
+    const attrs = inferAttributesFromRowCells(
+      otherCells,
+      availableUnits,
+      availableRoles,
+      '',
+      ''
+    );
+
+    results.push({
+      name: cleanName,
+      hoursBalance,
+      formattedOriginal:
+        formattedOriginal || `${hoursBalance >= 0 ? '+' : ''}${hoursBalance}h`,
+      unitHint: attrs.unitHint,
+      roleHint: attrs.roleHint,
+      registrationNumber: attrs.registrationNumber,
+      notes: attrs.notes || 'Importado via planilha/documento de Banco de Horas',
+    });
+  };
+
+  // 1. Tenta ler estruturadamente das abas do Excel/CSV via XLSX
+  try {
+    const workbook = XLSX.read(fileBuffer, { type: 'buffer' });
+    for (const sheetName of workbook.SheetNames) {
+      const sheet = workbook.Sheets[sheetName];
+      if (!sheet) continue;
+      const rows = XLSX.utils.sheet_to_json< unknown[] >(sheet, {
+        header: 1,
+        defval: '',
+        blankrows: false,
+      });
+
+      let nameColIdx = -1;
+      let balanceColIdx = -1;
+      let positiveColIdx = -1;
+      let negativeColIdx = -1;
+
+      for (const row of rows) {
+        if (!Array.isArray(row)) continue;
+        const cells = row.map((c) => String(c ?? '').trim());
+        const nonEmpty = cells.filter(Boolean);
+        if (nonEmpty.length === 0) continue;
+
+        // Detecta cabeçalhos de Nome e de Saldo / Banco de Horas / Extras / Débito
+        cells.forEach((cellVal, idx) => {
+          const norm = normalizeServerKey(cellVal);
+          if (
+            norm === 'nome' ||
+            norm === 'colaborador' ||
+            norm === 'funcionario' ||
+            norm === 'profissional' ||
+            norm.startsWith('nome do ') ||
+            norm.includes('nome completo')
+          ) {
+            nameColIdx = idx;
+          }
+          if (
+            norm.includes('saldo') ||
+            norm.includes('banco de horas') ||
+            norm === 'bh' ||
+            norm === 'horas' ||
+            norm.includes('total de horas') ||
+            norm.includes('hora extra') ||
+            norm.includes('horas extras')
+          ) {
+            balanceColIdx = idx;
+          }
+          if (norm.includes('credito') || norm.includes('positiv')) {
+            positiveColIdx = idx;
+          }
+          if (norm.includes('debito') || norm.includes('negativ')) {
+            negativeColIdx = idx;
+          }
+        });
+
+        let foundName = '';
+        let foundNameIdx = -1;
+
+        if (nameColIdx >= 0 && cells[nameColIdx] && isLikelyPersonName(cells[nameColIdx])) {
+          foundName = cells[nameColIdx];
+          foundNameIdx = nameColIdx;
+        } else {
+          for (let col = 0; col < Math.min(5, cells.length); col++) {
+            if (cells[col] && isLikelyPersonName(cells[col])) {
+              foundName = cells[col];
+              foundNameIdx = col;
+              break;
+            }
+          }
+        }
+
+        if (!foundName) continue;
+
+        let hoursVal = 0;
+        let origStr = '';
+        let foundBalance = false;
+
+        if (balanceColIdx >= 0 && balanceColIdx !== foundNameIdx && cells[balanceColIdx]) {
+          const p = parseHourBalanceString(cells[balanceColIdx]);
+          if (p.parsed) {
+            hoursVal = p.hours;
+            origStr = p.original;
+            foundBalance = true;
+          }
+        }
+
+        if (!foundBalance && (positiveColIdx >= 0 || negativeColIdx >= 0)) {
+          const posP =
+            positiveColIdx >= 0 ? parseHourBalanceString(cells[positiveColIdx] || '') : null;
+          const negP =
+            negativeColIdx >= 0 ? parseHourBalanceString(cells[negativeColIdx] || '') : null;
+          if (posP?.parsed || negP?.parsed) {
+            const posH = posP?.parsed ? Math.abs(posP.hours) : 0;
+            const negH = negP?.parsed ? Math.abs(negP.hours) : 0;
+            hoursVal = Math.round((posH - negH) * 100) / 100;
+            origStr = `${hoursVal >= 0 ? '+' : ''}${hoursVal}h`;
+            foundBalance = true;
+          }
+        }
+
+        if (!foundBalance) {
+          // Procura em qualquer outra célula da linha um valor de horas
+          for (let idx = 0; idx < cells.length; idx++) {
+            if (idx === foundNameIdx || !cells[idx]) continue;
+            // Ignora números pequenos isolados que sejam apenas número de ordem na coluna 0 (ex: 1, 2, 3...)
+            if (idx === 0 && foundNameIdx > 0 && /^\d{1,2}$/.test(cells[idx])) continue;
+            const p = parseHourBalanceString(cells[idx]);
+            if (p.parsed) {
+              hoursVal = p.hours;
+              origStr = p.original;
+              foundBalance = true;
+              break;
+            }
+          }
+        }
+
+        const otherCells = cells.filter((_, idx) => idx !== foundNameIdx);
+        addEntry(foundName, hoursVal, origStr, otherCells);
+      }
+    }
+  } catch {
+    // Segue para análise de texto
+  }
+
+  if (results.length > 0) {
+    return results;
+  }
+
+  // 2. Analisa texto linha por linha (Word, TXT, CSV ou PDF)
+  const lines = (extractedText || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+    if (line.startsWith('===')) continue;
+    const parts = line
+      .split(/[;\t|]+|\s+-\s+|,/)
+      .map((p) => p.trim())
+      .filter(Boolean);
+
+    if (parts.length === 0) continue;
+
+    for (let i = 0; i < Math.min(3, parts.length); i++) {
+      if (isLikelyPersonName(parts[i])) {
+        const otherParts = parts.filter((_, idx) => idx !== i);
+        let hoursVal = 0;
+        let origStr = '';
+        for (const part of otherParts) {
+          const p = parseHourBalanceString(part);
+          if (p.parsed) {
+            hoursVal = p.hours;
+            origStr = p.original;
+            break;
+          }
+        }
+        addEntry(parts[i], hoursVal, origStr, otherParts);
+        break;
+      }
+    }
+  }
+
+  return results;
+}
+
 // Chama o Gemini com retry e fallback automático de modelos para evitar falhas 503 UNAVAILABLE
-async function callGeminiWithFallback(
+async function callGeminiWithFallback<T = ExtractedEmployeeItem>(
   ai: GoogleGenAI,
   contentParts: unknown[],
   responseSchema: unknown
-): Promise<ExtractedEmployeeItem[]> {
-  const modelsToTry = ['gemini-4-hydrogen', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+): Promise<T[]> {
+  const modelsToTry = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
   let lastError: unknown = null;
 
   for (const modelName of modelsToTry) {
@@ -766,7 +1048,7 @@ async function callGeminiWithFallback(
         const rawText = (response.text ?? '[]').trim();
         const parsed = JSON.parse(rawText);
         if (Array.isArray(parsed)) {
-          return parsed as ExtractedEmployeeItem[];
+          return parsed as T[];
         }
       } catch (err) {
         lastError = err;
@@ -818,18 +1100,206 @@ function writeCloudStore(store: Record<string, CloudWorkspaceEntry>): void {
   }
 }
 
+function normalizeServerKey(value: unknown): string {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ');
+}
+
+function deduplicateWorkspaceOnServer(rawState: Record<string, unknown>): Record<string, unknown> {
+  const rawUnits = Array.isArray(rawState.units)
+    ? (rawState.units as Array<Record<string, unknown>>)
+    : [];
+  const rawEmployees = Array.isArray(rawState.employees)
+    ? (rawState.employees as Array<Record<string, unknown>>)
+    : [];
+  const rawSchedules =
+    rawState.schedules && typeof rawState.schedules === 'object'
+      ? (rawState.schedules as Record<string, Record<string, Record<string, Record<string, unknown>>>>)
+      : {};
+
+  // 1. Deduplica Unidades / Setores por nome normalizado
+  const unitIdRedirect = new Map<string, string>();
+  const canonicalUnitsByName = new Map<string, Record<string, unknown>>();
+  const dedupedUnits: Array<Record<string, unknown>> = [];
+
+  for (const unit of rawUnits) {
+    if (!unit || !unit.id) continue;
+    const uId = String(unit.id);
+    const trimmedName = String(unit.name || '').trim() || 'Unidade Principal';
+    const key = normalizeServerKey(trimmedName);
+
+    const existing = canonicalUnitsByName.get(key);
+    if (!existing) {
+      const cleanUnit = { ...unit, name: trimmedName };
+      canonicalUnitsByName.set(key, cleanUnit);
+      dedupedUnits.push(cleanUnit);
+      unitIdRedirect.set(uId, uId);
+    } else {
+      unitIdRedirect.set(uId, String(existing.id));
+    }
+  }
+
+  let finalUnits = dedupedUnits;
+  if (finalUnits.length > 1) {
+    const nonPlaceholder = finalUnits.filter(
+      (u) =>
+        !(
+          String(u.id) === 'unit-default-1' &&
+          normalizeServerKey(u.name) === 'unidade principal'
+        )
+    );
+    if (nonPlaceholder.length > 0) {
+      const fallbackId = String(nonPlaceholder[0].id);
+      for (const u of finalUnits) {
+        if (
+          String(u.id) === 'unit-default-1' &&
+          normalizeServerKey(u.name) === 'unidade principal'
+        ) {
+          unitIdRedirect.set(String(u.id), fallbackId);
+        }
+      }
+      finalUnits = nonPlaceholder;
+    }
+  }
+
+  const validUnitIds = new Set(finalUnits.map((u) => String(u.id)));
+  const defaultUnitId = String(finalUnits[0]?.id || 'unit-default-1');
+
+  const resolveUnitId = (uid: unknown): string => {
+    const s = String(uid || '');
+    const mapped = unitIdRedirect.get(s) || s;
+    return validUnitIds.has(mapped) ? mapped : defaultUnitId;
+  };
+
+  // 2. Deduplica Colaboradores por nome normalizado
+  const empIdRedirect = new Map<string, string>();
+  const canonicalEmpByName = new Map<string, Record<string, unknown>>();
+  const dedupedEmployees: Array<Record<string, unknown>> = [];
+
+  for (const emp of rawEmployees) {
+    if (!emp || !emp.id) continue;
+    const eId = String(emp.id);
+    const remappedEmp: Record<string, unknown> = {
+      ...emp,
+      name: String(emp.name || '').trim(),
+      unitId: resolveUnitId(emp.unitId),
+    };
+    const nameKey = normalizeServerKey(remappedEmp.name);
+    if (!nameKey) {
+      dedupedEmployees.push(remappedEmp);
+      empIdRedirect.set(eId, eId);
+      continue;
+    }
+
+    const existing = canonicalEmpByName.get(nameKey);
+    if (!existing) {
+      canonicalEmpByName.set(nameKey, remappedEmp);
+      dedupedEmployees.push(remappedEmp);
+      empIdRedirect.set(eId, eId);
+    } else {
+      // Se um está ativo e outro inativo, preserva o status mais recente ou mescla se ambos ativos
+      const existingId = String(existing.id);
+      empIdRedirect.set(eId, existingId);
+
+      const histMap = new Map<string, Record<string, unknown>>();
+      const h1 = Array.isArray(existing.history)
+        ? (existing.history as Array<Record<string, unknown>>)
+        : [];
+      const h2 = Array.isArray(remappedEmp.history)
+        ? (remappedEmp.history as Array<Record<string, unknown>>)
+        : [];
+      for (const h of [...h1, ...h2]) {
+        if (!h) continue;
+        const sig = `${String(h.type || '')}_${String(h.startDate || '')}_${String(h.daysCount || '')}`;
+        if (!histMap.has(sig)) histMap.set(sig, h);
+      }
+
+      const existingCustomUnit =
+        String(existing.unitId) !== 'unit-default-1' &&
+        normalizeServerKey(
+          finalUnits.find((u) => String(u.id) === String(existing.unitId))?.name
+        ) !== 'unidade principal';
+
+      const mergedEmp: Record<string, unknown> = {
+        ...existing,
+        ...remappedEmp,
+        id: existingId,
+        active: Boolean(existing.active && remappedEmp.active),
+        unitId: existingCustomUnit ? existing.unitId : remappedEmp.unitId,
+        registrationNumber: remappedEmp.registrationNumber || existing.registrationNumber || '',
+        avatarBase64: remappedEmp.avatarBase64 || existing.avatarBase64 || '',
+        history: Array.from(histMap.values()),
+      };
+      canonicalEmpByName.set(nameKey, mergedEmp);
+      const idx = dedupedEmployees.findIndex((item) => String(item.id) === existingId);
+      if (idx !== -1) dedupedEmployees[idx] = mergedEmp;
+    }
+  }
+
+  // 3. Remapeia Escalas
+  const cleanedSchedules: Record<string, Record<string, Record<string, Record<string, unknown>>>> = {};
+  for (const [ym, monthData] of Object.entries(rawSchedules)) {
+    if (!monthData || typeof monthData !== 'object') continue;
+    cleanedSchedules[ym] = {};
+    for (const [oldEmpId, daysMap] of Object.entries(monthData)) {
+      if (!daysMap || typeof daysMap !== 'object') continue;
+      const targetEmpId = empIdRedirect.get(oldEmpId) || oldEmpId;
+      if (!cleanedSchedules[ym][targetEmpId]) {
+        cleanedSchedules[ym][targetEmpId] = {};
+      }
+      for (const [dayKey, cell] of Object.entries(daysMap)) {
+        if (!cell || typeof cell !== 'object') continue;
+        const remappedCell: Record<string, unknown> = {
+          ...cell,
+          unitOverrideId: cell.unitOverrideId
+            ? resolveUnitId(cell.unitOverrideId)
+            : undefined,
+        };
+        const existingCell = cleanedSchedules[ym][targetEmpId][dayKey];
+        if (!existingCell) {
+          cleanedSchedules[ym][targetEmpId][dayKey] = remappedCell;
+        } else {
+          const isSpecial = (st: unknown) =>
+            st === 'F' || st === 'FA' || st === 'AT' || st === 'FE';
+          if (
+            (isSpecial(remappedCell.status) && !isSpecial(existingCell.status)) ||
+            remappedCell.unitOverrideId ||
+            remappedCell.note
+          ) {
+            cleanedSchedules[ym][targetEmpId][dayKey] = {
+              ...existingCell,
+              ...remappedCell,
+            };
+          }
+        }
+      }
+    }
+  }
+
+  return {
+    ...rawState,
+    units: finalUnits,
+    employees: dedupedEmployees,
+    schedules: cleanedSchedules,
+  };
+}
+
 function mergeWorkspacesOnServer(
   existingStateRaw: Record<string, unknown> | undefined,
   incomingStateRaw: Record<string, unknown> | undefined
 ): Record<string, unknown> {
   if (!existingStateRaw || typeof existingStateRaw !== 'object') {
-    return incomingStateRaw || {};
+    return deduplicateWorkspaceOnServer(incomingStateRaw || {});
   }
   if (!incomingStateRaw || typeof incomingStateRaw !== 'object') {
-    return existingStateRaw;
+    return deduplicateWorkspaceOnServer(existingStateRaw);
   }
 
-  const ex = existingStateRaw as {
+  const ex = deduplicateWorkspaceOnServer(existingStateRaw) as {
     manager?: Record<string, unknown>;
     units?: Array<Record<string, unknown>>;
     customRoles?: string[];
@@ -838,20 +1308,19 @@ function mergeWorkspacesOnServer(
     pushConfig?: Record<string, unknown>;
     lastUpdated?: string;
   };
-  const inc = incomingStateRaw as typeof ex;
+  const inc = deduplicateWorkspaceOnServer(incomingStateRaw) as typeof ex;
 
   const exTime = new Date(String(ex.lastUpdated || 0)).getTime();
   const incTime = new Date(String(inc.lastUpdated || 0)).getTime();
   const exEmpCount = Array.isArray(ex.employees) ? ex.employees.length : 0;
   const incEmpCount = Array.isArray(inc.employees) ? inc.employees.length : 0;
 
-  // Se o novo estado veio de um PC recém-logado sem funcionários e o estado salvo já possui funcionários, preserva os dados ricos do outro aparelho
+  // Quando o aparelho envia um push (/api/cloud-sync/push), ele é a ação ativa do usuário.
+  // Só preservamos o servidor se o cliente enviou um estado inicial vazio sem onboarding enquanto o servidor já possui funcionários.
   const preferIncoming =
-    incEmpCount > 0 && exEmpCount === 0
-      ? true
-      : exEmpCount > 0 && incEmpCount === 0
+    exEmpCount > 0 && incEmpCount === 0 && !inc.manager?.onboardingCompleted
       ? false
-      : incTime >= exTime;
+      : true;
 
   const primaryMgr = (preferIncoming ? inc.manager : ex.manager) || {};
   const secondaryMgr = (preferIncoming ? ex.manager : inc.manager) || {};
@@ -877,105 +1346,53 @@ function mergeWorkspacesOnServer(
     ),
   };
 
-  // Mescla unidades (evitando que "Unidade Principal" genérica substitua unidades reais criadas pelo usuário)
+  // Unidades: respeita integralmente a lista enviada pelo aparelho ativo
   const exUnits = Array.isArray(ex.units) ? ex.units : [];
   const incUnits = Array.isArray(inc.units) ? inc.units : [];
-  const unitMap = new Map<string, Record<string, unknown>>();
-  const firstList = preferIncoming ? exUnits : incUnits;
-  const secondList = preferIncoming ? incUnits : exUnits;
+  const primaryUnits = preferIncoming ? incUnits : exUnits;
+  const secondaryUnits = preferIncoming ? exUnits : incUnits;
 
-  for (const u of firstList) {
-    if (u && u.id) unitMap.set(String(u.id), u);
-  }
-  for (const u of secondList) {
-    if (u && u.id) unitMap.set(String(u.id), u);
-  }
+  const isOnlyDefaultPlaceholder = (list: Array<Record<string, unknown>>) =>
+    list.length === 0 ||
+    (list.length === 1 &&
+      String(list[0].id) === 'unit-default-1' &&
+      normalizeServerKey(list[0].name) === 'unidade principal');
 
-  let mergedUnits = Array.from(unitMap.values());
-  if (mergedUnits.length > 1) {
-    const hasCustomUnits = mergedUnits.some(
-      (u) => String(u.id) !== 'unit-default-1' && String(u.name) !== 'Unidade Principal'
-    );
-    if (hasCustomUnits) {
-      mergedUnits = mergedUnits.filter(
-        (u) => !(String(u.id) === 'unit-default-1' && String(u.name) === 'Unidade Principal')
-      );
-    }
-  }
+  const mergedUnits =
+    !isOnlyDefaultPlaceholder(primaryUnits)
+      ? primaryUnits
+      : !isOnlyDefaultPlaceholder(secondaryUnits)
+      ? secondaryUnits
+      : primaryUnits.length > 0
+      ? primaryUnits
+      : secondaryUnits;
 
-  // Mescla colaboradores e seus históricos (Folgas, Faltas, Atestados, Férias)
+  // Colaboradores: quando preferIncoming é true, respeita integralmente os dados e saldos de banco de horas enviados pelo aparelho ativo
   const exEmps = Array.isArray(ex.employees) ? ex.employees : [];
   const incEmps = Array.isArray(inc.employees) ? inc.employees : [];
-  const empMap = new Map<string, Record<string, unknown>>();
-  const baseEmps = preferIncoming ? exEmps : incEmps;
-  const newerEmps = preferIncoming ? incEmps : exEmps;
+  const chosenEmployees = preferIncoming ? incEmps : exEmps;
 
-  for (const e of baseEmps) {
-    if (e && e.id) empMap.set(String(e.id), e);
-  }
-  for (const e of newerEmps) {
-    if (!e || !e.id) continue;
-    const id = String(e.id);
-    const prev = empMap.get(id);
-    if (!prev) {
-      empMap.set(id, e);
-    } else {
-      const histMap = new Map<string, Record<string, unknown>>();
-      const prevHist = Array.isArray(prev.history)
-        ? (prev.history as Array<Record<string, unknown>>)
-        : [];
-      const newHist = Array.isArray(e.history)
-        ? (e.history as Array<Record<string, unknown>>)
-        : [];
-      for (const h of prevHist) {
-        if (h && h.id) histMap.set(String(h.id), h);
-      }
-      for (const h of newHist) {
-        if (h && h.id) histMap.set(String(h.id), h);
-      }
-      empMap.set(id, {
-        ...prev,
-        ...e,
-        avatarBase64: e.avatarBase64 || prev.avatarBase64 || '',
-        history: Array.from(histMap.values()),
-      });
-    }
-  }
-
-  // Mescla células de escala mensal
+  // Escalas: quando preferIncoming é true, usa exatamente a escala enviada pelo aparelho ativo para os meses presentes
   const exSched = ex.schedules && typeof ex.schedules === 'object' ? ex.schedules : {};
   const incSched = inc.schedules && typeof inc.schedules === 'object' ? inc.schedules : {};
-  const mergedSchedules: Record<string, Record<string, Record<string, Record<string, unknown>>>> = {};
-  const allYm = new Set([...Object.keys(exSched), ...Object.keys(incSched)]);
-
-  for (const ym of allYm) {
-    mergedSchedules[ym] = {};
-    const exYm = exSched[ym] || {};
-    const incYm = incSched[ym] || {};
-    const allEmpIds = new Set([...Object.keys(exYm), ...Object.keys(incYm)]);
-    for (const empId of allEmpIds) {
-      const exDays = exYm[empId] || {};
-      const incDays = incYm[empId] || {};
-      mergedSchedules[ym][empId] = preferIncoming
-        ? { ...exDays, ...incDays }
-        : { ...incDays, ...exDays };
-    }
-  }
+  const mergedSchedules = preferIncoming
+    ? { ...exSched, ...incSched }
+    : { ...incSched, ...exSched };
 
   const customRolesSet = new Set<string>([
     ...(Array.isArray(ex.customRoles) ? ex.customRoles : []),
     ...(Array.isArray(inc.customRoles) ? inc.customRoles : []),
   ]);
 
-  return {
+  return deduplicateWorkspaceOnServer({
     ...(preferIncoming ? inc : ex),
     manager: mergedManager,
     units: mergedUnits,
     customRoles: Array.from(customRolesSet),
-    employees: Array.from(empMap.values()),
+    employees: chosenEmployees,
     schedules: mergedSchedules,
     lastUpdated: new Date().toISOString(),
-  };
+  });
 }
 
 async function startServer() {
@@ -1064,11 +1481,17 @@ async function startServer() {
         return;
       }
 
+      const cleanedState = deduplicateWorkspaceOnServer(entry.state || {});
+      entry.state = cleanedState;
+      if (Array.isArray(cleanedState.units) && cleanedState.units.length > 0) {
+        entry.account = { ...entry.account, units: cleanedState.units };
+      }
+
       res.json({
         ok: true,
         found: true,
         account: entry.account,
-        state: entry.state,
+        state: cleanedState,
         updatedAt: entry.updatedAt,
       });
     } catch (err) {
@@ -1096,10 +1519,14 @@ async function startServer() {
       const existing = store[cleanEmail];
 
       if (existing) {
+        existing.state = deduplicateWorkspaceOnServer(existing.state || {});
+        if (Array.isArray(existing.state.units) && existing.state.units.length > 0) {
+          existing.account = { ...existing.account, units: existing.state.units };
+        }
         if (passwordHash && !existing.passwordHash) {
           existing.passwordHash = passwordHash;
-          writeCloudStore(store);
         }
+        writeCloudStore(store);
         res.json({
           ok: true,
           found: true,
@@ -1165,6 +1592,191 @@ async function startServer() {
     } catch (err) {
       console.error('Erro em /api/cloud-sync/login:', err);
       res.status(500).json({ ok: false, error: 'Erro ao autenticar conta na nuvem.' });
+    }
+  });
+
+  app.post('/api/cloud-sync/delete-account', (req, res) => {
+    try {
+      const { email, uid } = req.body as { email?: string; uid?: string };
+      const cleanEmail = String(email || '')
+        .trim()
+        .toLowerCase();
+      const store = readCloudStore();
+
+      if (cleanEmail && store[cleanEmail]) {
+        delete store[cleanEmail];
+      }
+      if (uid) {
+        for (const [k, v] of Object.entries(store)) {
+          if (v.uid === uid) {
+            delete store[k];
+          }
+        }
+      }
+
+      writeCloudStore(store);
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('Erro em /api/cloud-sync/delete-account:', err);
+      res.status(500).json({ ok: false });
+    }
+  });
+
+  // Endpoint inteligente de leitura de arquivos de Banco de Horas (Excel, Word, CSV, PDF ou Imagem)
+  app.post('/api/extract-hour-bank', async (req, res) => {
+    try {
+      const { base64File, fileName, mimeType, availableUnits, availableRoles } = req.body as {
+        base64File?: string;
+        fileName?: string;
+        mimeType?: string;
+        availableUnits?: string[];
+        availableRoles?: string[];
+      };
+
+      if (!base64File) {
+        res.status(400).json({ error: 'Arquivo não fornecido para leitura.' });
+        return;
+      }
+
+      const dataUrlMatch = base64File.match(/^data:([^;]+);base64,(.+)$/s);
+      const detectedMime = dataUrlMatch ? dataUrlMatch[1].trim() : mimeType || '';
+      const cleanBase64 = (
+        dataUrlMatch ? dataUrlMatch[2] : base64File.replace(/^data:.*?,/, '')
+      ).trim();
+
+      const fileBuffer = Buffer.from(cleanBase64, 'base64');
+      const safeUnits = Array.isArray(availableUnits) ? availableUnits : [];
+      const safeRoles = Array.isArray(availableRoles) ? availableRoles : [];
+
+      const parsedSource = await extractTextOrInlinePart(
+        fileBuffer,
+        fileName || '',
+        detectedMime
+      );
+
+      // Extração determinística local imediata (Excel / Word / CSV / TXT)
+      const deterministicEntries = extractHourBankDeterministically(
+        fileBuffer,
+        parsedSource.extractedText || '',
+        safeUnits,
+        safeRoles
+      );
+
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        res.json({
+          success: true,
+          entries: deterministicEntries,
+        });
+        return;
+      }
+
+      const ai = new GoogleGenAI({
+        apiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          },
+        },
+      });
+
+      const promptText = `Você é um especialista em leitura de planilhas e relatórios de Banco de Horas e escalas hospitalares.
+Analise o arquivo enviado (${fileName || 'relatório'}) e extraia TODOS os colaboradores listados junto com o respectivo saldo de Banco de Horas (em horas decimais, ex: +12, -4.5, 8, 0).
+Regras de conversão:
+- Se o documento mostrar "+12:30" ou "12h30", converta para 12.5.
+- Se mostrar débito/negativo como "-04:00", "(04:00)" ou "4h devendo", converta para -4.
+- Se o arquivo for uma planilha de cadastro/escala que tem os nomes dos colaboradores mas alguma linha não tiver saldo explícito, retorne hoursBalance: 0 para que o colaborador ainda seja identificado e vinculado!`;
+
+      const responseSchema = {
+        type: Type.ARRAY,
+        description: 'Lista de colaboradores e seus saldos de banco de horas extraídos do arquivo.',
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            name: {
+              type: Type.STRING,
+              description: 'Nome completo do colaborador.',
+            },
+            hoursBalance: {
+              type: Type.NUMBER,
+              description: 'Saldo do banco de horas em número decimal (positivo, negativo ou zero).',
+            },
+            formattedOriginal: {
+              type: Type.STRING,
+              description: 'Texto original do saldo encontrado no arquivo (ex: "+12:30", "-4h").',
+            },
+            unitHint: {
+              type: Type.STRING,
+              description: 'Setor ou unidade identificada, se houver.',
+            },
+            roleHint: {
+              type: Type.STRING,
+              description: 'Cargo ou função identificada, se houver.',
+            },
+            notes: {
+              type: Type.STRING,
+              description: 'Observação sobre horas extras, folga compensatória ou período.',
+            },
+          },
+          required: ['name', 'hoursBalance'],
+        },
+      };
+
+      const contentParts =
+        parsedSource.mode === 'INLINE_MEDIA' && parsedSource.inlineMimeType
+          ? [
+              {
+                inlineData: {
+                  mimeType: parsedSource.inlineMimeType,
+                  data: cleanBase64,
+                },
+              },
+              { text: promptText },
+            ]
+          : [
+              {
+                text: `${promptText}\n\n=== CONTEÚDO EXTRAÍDO DO ARQUIVO (${
+                  fileName || 'banco_de_horas'
+                }) ===\n${(parsedSource.extractedText || '').slice(0, 90000)}`,
+              },
+            ];
+
+      try {
+        const aiEntries = await callGeminiWithFallback<ExtractedHourBankItem>(
+          ai,
+          contentParts,
+          responseSchema
+        );
+        if (Array.isArray(aiEntries) && aiEntries.length > 0) {
+          res.json({
+            success: true,
+            entries: aiEntries,
+          });
+          return;
+        }
+      } catch (aiErr) {
+        console.warn(
+          'Aviso na leitura IA de Banco de Horas, utilizando extração nativa de planilha:',
+          aiErr instanceof Error ? aiErr.message : aiErr
+        );
+        if (deterministicEntries.length > 0) {
+          res.json({
+            success: true,
+            entries: deterministicEntries,
+          });
+          return;
+        }
+      }
+
+      res.json({
+        success: true,
+        entries: deterministicEntries,
+      });
+    } catch (err) {
+      console.error('Erro em /api/extract-hour-bank:', err);
+      res.status(500).json({
+        error: 'Não foi possível processar o arquivo de Banco de Horas. Verifique se o documento possui nomes legíveis.',
+      });
     }
   });
 

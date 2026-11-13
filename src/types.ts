@@ -1,4 +1,10 @@
-export type PageId = 'inicio' | 'escala' | 'colaboradores' | 'importar' | 'configuracoes';
+export type PageId =
+  | 'inicio'
+  | 'escala'
+  | 'colaboradores'
+  | 'banco_horas'
+  | 'importar'
+  | 'configuracoes';
 
 export type ShiftStatus = 'D' | 'N' | 'F' | 'AT' | 'FA' | 'FE' | 'TR';
 
@@ -147,6 +153,16 @@ export interface ExtractedPdfEmployee {
   shiftHint: 'Diurno' | 'Noturno';
   workHoursHint: string;
   scheduleRegimeHint: ScheduleRegime;
+  registrationNumber?: string;
+  notes?: string;
+}
+
+export interface ExtractedHourBankEntry {
+  name: string;
+  hoursBalance: number;
+  formattedOriginal?: string;
+  unitHint?: string;
+  roleHint?: string;
   registrationNumber?: string;
   notes?: string;
 }

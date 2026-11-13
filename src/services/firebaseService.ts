@@ -2,6 +2,7 @@ import { initializeApp } from 'firebase/app';
 import {
   browserLocalPersistence,
   createUserWithEmailAndPassword,
+  deleteUser,
   getAuth,
   GoogleAuthProvider,
   linkWithPopup,
@@ -17,6 +18,7 @@ import {
 } from 'firebase/auth';
 import {
   collection,
+  deleteDoc,
   doc,
   getDoc,
   getDocFromServer,
@@ -39,6 +41,7 @@ import {
 } from '../types';
 import {
   computeRegimeShiftForDay,
+  deduplicateEscalaProState,
   reapplyEmployeeHistoryToSchedules,
 } from './storageService';
 
@@ -209,6 +212,68 @@ export async function signOutFirebase(): Promise<void> {
   }
 }
 
+export async function deleteUserAccountFromCloud(
+  userId: string,
+  email?: string
+): Promise<void> {
+  const cleanEmail = (email || auth.currentUser?.email || '').trim().toLowerCase();
+
+  // 1. Apaga do espelho de sincronização no servidor
+  try {
+    await fetch('/api/cloud-sync/delete-account', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: cleanEmail,
+        uid: userId || auth.currentUser?.uid,
+      }),
+    });
+  } catch (err) {
+    console.warn('Aviso ao remover conta do espelho em nuvem:', err);
+  }
+
+  // 2. Apaga coleções do Firestore caso o usuário esteja autenticado no Firebase
+  if (auth.currentUser) {
+    const safeUid = sanitizeId(auth.currentUser.uid);
+    const subcollections = ['units', 'employees', 'absences', 'scheduleCells'];
+    for (const sub of subcollections) {
+      try {
+        const q = query(
+          collection(db, 'workspaces', safeUid, sub),
+          where('ownerId', '==', safeUid)
+        );
+        const snap = await getDocs(q);
+        for (const d of snap.docs) {
+          await deleteDoc(doc(db, 'workspaces', safeUid, sub, d.id));
+        }
+      } catch {
+        // Continua limpeza
+      }
+    }
+    try {
+      await deleteDoc(doc(db, 'workspaces', safeUid));
+    } catch {
+      // Continua
+    }
+    try {
+      await deleteDoc(doc(db, 'users', safeUid));
+    } catch {
+      // Continua
+    }
+
+    // 3. Remove o usuário do Firebase Auth (ou encerra a sessão caso exija reautenticação recente)
+    try {
+      await deleteUser(auth.currentUser);
+    } catch {
+      try {
+        await signOut(auth);
+      } catch {
+        // Ignora
+      }
+    }
+  }
+}
+
 export function subscribeToFirebaseAuth(callback: (user: User | null) => void): () => void {
   return onAuthStateChanged(auth, callback);
 }
@@ -317,9 +382,12 @@ export async function loginViaCloudMirror(params: {
 }
 
 export function mergeTwoEscalaProStates(
-  baseState: EscalaProState,
-  otherState: EscalaProState
+  baseStateRaw: EscalaProState,
+  otherStateRaw: EscalaProState
 ): EscalaProState {
+  const baseState = deduplicateEscalaProState(baseStateRaw);
+  const otherState = deduplicateEscalaProState(otherStateRaw);
+
   const baseEmpCount = Array.isArray(baseState.employees) ? baseState.employees.length : 0;
   const otherEmpCount = Array.isArray(otherState.employees) ? otherState.employees.length : 0;
   const baseTime = new Date(baseState.lastUpdated || 0).getTime();
@@ -338,47 +406,24 @@ export function mergeTwoEscalaProStates(
   const isGenericHospital = (h?: string) =>
     !h || !h.trim() || h.trim() === 'Instituição' || h.trim() === 'Hospital / Instituição';
 
-  const mergedUnitsMap = new Map<string, HospitalUnit>();
-  for (const u of secondary.units || []) {
-    if (u && u.id) mergedUnitsMap.set(u.id, u);
-  }
-  for (const u of primary.units || []) {
-    if (u && u.id) mergedUnitsMap.set(u.id, u);
-  }
-  let mergedUnits = Array.from(mergedUnitsMap.values());
-  if (mergedUnits.length > 1) {
-    const hasCustomUnits = mergedUnits.some(
-      (u) => u.id !== 'unit-default-1' && u.name !== 'Unidade Principal'
-    );
-    if (hasCustomUnits) {
-      mergedUnits = mergedUnits.filter(
-        (u) => !(u.id === 'unit-default-1' && u.name === 'Unidade Principal')
-      );
-    }
-  }
+  const primaryOnlyHasDefaultPlaceholder =
+    !primary.units ||
+    primary.units.length === 0 ||
+    (primary.units.length === 1 && primary.units[0].id === 'unit-default-1');
 
-  const empMap = new Map<string, Employee>();
-  for (const e of secondary.employees || []) {
-    if (e && e.id) empMap.set(e.id, e);
-  }
-  for (const e of primary.employees || []) {
-    if (!e || !e.id) continue;
-    const prev = empMap.get(e.id);
-    if (!prev) {
-      empMap.set(e.id, e);
-    } else {
-      const histMap = new Map<string, AbsenceRecord>();
-      for (const h of prev.history || []) histMap.set(h.id, h);
-      for (const h of e.history || []) histMap.set(h.id, h);
-      empMap.set(e.id, {
-        ...prev,
-        ...e,
-        avatarBase64: e.avatarBase64 || prev.avatarBase64,
-        history: Array.from(histMap.values()),
-      });
-    }
-  }
-  const mergedEmployees = Array.from(empMap.values());
+  // Respeita exclusões de setores feitas no estado mais recente (primary): só herda setores de secondary se primary estiver vazio/placeholder
+  const chosenUnits =
+    !primaryOnlyHasDefaultPlaceholder
+      ? primary.units
+      : secondary.units && secondary.units.length > 0
+      ? secondary.units
+      : primary.units;
+
+  // Para colaboradores, se primary já possui colaboradores cadastrados, usa primary como base e mescla históricos pelo nome (via deduplicateEscalaProState)
+  const combinedEmployees =
+    primary.employees && primary.employees.length > 0
+      ? [...primary.employees, ...(secondary.employees || [])]
+      : [...(secondary.employees || []), ...(primary.employees || [])];
 
   const mergedSchedules: MonthlyScheduleMap = {};
   const allYmKeys = new Set([
@@ -411,13 +456,12 @@ export function mergeTwoEscalaProStates(
     }
   }
 
-  const finalSchedules = reapplyEmployeeHistoryToSchedules(mergedEmployees, mergedSchedules);
   const customRolesSet = new Set<string>([
     ...(secondary.customRoles || []),
     ...(primary.customRoles || []),
   ]);
 
-  return {
+  return deduplicateEscalaProState({
     ...primary,
     manager: {
       ...secondary.manager,
@@ -436,12 +480,12 @@ export function mergeTwoEscalaProStates(
         primary.manager.onboardingCompleted || secondary.manager.onboardingCompleted
       ),
     },
-    units: mergedUnits,
+    units: chosenUnits,
     customRoles: Array.from(customRolesSet),
-    employees: mergedEmployees,
-    schedules: finalSchedules,
+    employees: combinedEmployees,
+    schedules: mergedSchedules,
     lastUpdated: new Date(Math.max(baseTime, otherTime, Date.now())).toISOString(),
-  };
+  });
 }
 
 /**
@@ -452,7 +496,9 @@ export async function loadWorkspaceFromFirestore(
   email?: string
 ): Promise<EscalaProState | null> {
   const mirrorResult = await pullWorkspaceFromCloudMirror(email, userId);
-  const mirrorState = mirrorResult?.state || null;
+  const mirrorState = mirrorResult?.state
+    ? deduplicateEscalaProState(mirrorResult.state)
+    : null;
 
   if (!auth.currentUser || auth.currentUser.uid !== userId) {
     return mirrorState;
@@ -593,7 +639,7 @@ export async function loadWorkspaceFromFirestore(
       ? wsData.updatedAt.toDate().toISOString()
       : new Date(0).toISOString();
 
-  const firestoreState: EscalaProState = {
+  const firestoreState = deduplicateEscalaProState({
     manager: {
       name: String(wsData.managerName || ''),
       hospitalName: String(wsData.hospitalName || ''),
@@ -614,7 +660,7 @@ export async function loadWorkspaceFromFirestore(
       webhookOrVapidKey: '',
     },
     lastUpdated: remoteUpdatedIso,
-  };
+  });
 
   if (mirrorState) {
     return mergeTwoEscalaProStates(firestoreState, mirrorState);
@@ -627,10 +673,11 @@ export async function loadWorkspaceFromFirestore(
  */
 export async function syncWorkspaceToFirestore(
   userId: string,
-  state: EscalaProState,
+  rawState: EscalaProState,
   accountEmail?: string,
   accountObj?: Partial<UserAccount>
 ): Promise<boolean> {
+  const state = deduplicateEscalaProState(rawState);
   const emailToSync = (accountEmail || accountObj?.email || auth.currentUser?.email || '')
     .trim()
     .toLowerCase();
@@ -691,9 +738,11 @@ export async function syncWorkspaceToFirestore(
     handleFirestoreError(error, OperationType.WRITE, wsPath);
   }
 
-  // Sincroniza Unidades
+  // 1. Sincroniza Unidades Atuais
+  const activeUnitDocIds = new Set<string>();
   for (const unit of state.units) {
     const unitId = sanitizeId(unit.id);
+    activeUnitDocIds.add(unitId);
     const unitRef = doc(db, 'workspaces', safeUid, 'units', unitId);
     const unitPath = `workspaces/${safeUid}/units/${unitId}`;
     let existingUnit;
@@ -721,10 +770,12 @@ export async function syncWorkspaceToFirestore(
     }
   }
 
-  // Sincroniza Colaboradores e seus Afastamentos
+  // 2. Sincroniza Colaboradores e seus Afastamentos
+  const activeEmpDocIds = new Set<string>();
   const fallbackUnitId = sanitizeId(state.units[0]?.id || 'unit-1');
   for (const emp of state.employees) {
     const empId = sanitizeId(emp.id);
+    activeEmpDocIds.add(empId);
     const empRef = doc(db, 'workspaces', safeUid, 'employees', empId);
     const empPath = `workspaces/${safeUid}/employees/${empId}`;
     let existingEmp;
@@ -799,6 +850,37 @@ export async function syncWorkspaceToFirestore(
         handleFirestoreError(error, OperationType.WRITE, absPath);
       }
     }
+  }
+
+  // 3. Remove do Firestore colaboradores e setores (unidades) que foram excluídos ou desduplicados pelo usuário
+  try {
+    const qExistingEmps = query(
+      collection(db, 'workspaces', safeUid, 'employees'),
+      where('ownerId', '==', safeUid)
+    );
+    const existingEmpsSnap = await getDocs(qExistingEmps);
+    for (const docSnap of existingEmpsSnap.docs) {
+      if (!activeEmpDocIds.has(docSnap.id)) {
+        await deleteDoc(doc(db, 'workspaces', safeUid, 'employees', docSnap.id));
+      }
+    }
+  } catch (err) {
+    console.warn('Aviso ao limpar colaboradores duplicados/excluídos no Firestore:', err);
+  }
+
+  try {
+    const qExistingUnits = query(
+      collection(db, 'workspaces', safeUid, 'units'),
+      where('ownerId', '==', safeUid)
+    );
+    const existingUnitsSnap = await getDocs(qExistingUnits);
+    for (const docSnap of existingUnitsSnap.docs) {
+      if (!activeUnitDocIds.has(docSnap.id)) {
+        await deleteDoc(doc(db, 'workspaces', safeUid, 'units', docSnap.id));
+      }
+    }
+  } catch (err) {
+    console.warn('Aviso ao limpar setores duplicados/excluídos no Firestore:', err);
   }
 
   // Sincroniza células customizadas (qualquer alteração manual de Folga F, D, N, AT, FA, FE, TR, setor pontual, nota ou hora extra)

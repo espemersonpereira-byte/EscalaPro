@@ -235,6 +235,284 @@ export function reapplyEmployeeHistoryToSchedules(
   return updated;
 }
 
+export function normalizeNameKey(raw: string | undefined | null): string {
+  return String(raw || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Identifica automaticamente um colaborador já cadastrado a partir do nome lido em um arquivo de Banco de Horas ou Escala.
+ */
+export function matchEmployeeByName(
+  candidateName: string,
+  employees: Employee[]
+): Employee | null {
+  const cleanCandidate = normalizeNameKey(candidateName);
+  if (!cleanCandidate) return null;
+
+  const activeEmps = employees.filter((e) => e.active);
+
+  // 1. Casamento exato normalizado
+  const exact = activeEmps.find((e) => normalizeNameKey(e.name) === cleanCandidate);
+  if (exact) return exact;
+
+  // 2. Casamento por inclusão (ex: "Maria Silva" vs "Maria Aparecida Silva")
+  const ignoreStopWords = new Set(['de', 'da', 'do', 'das', 'dos', 'dr', 'dra', 'enf']);
+  const candidateTokens = cleanCandidate
+    .split(' ')
+    .filter((t) => t.length >= 2 && !ignoreStopWords.has(t));
+
+  if (candidateTokens.length === 0) return null;
+
+  let bestMatch: Employee | null = null;
+  let bestScore = 0;
+
+  for (const emp of activeEmps) {
+    const empClean = normalizeNameKey(emp.name);
+    if (!empClean) continue;
+
+    if (empClean.includes(cleanCandidate) || cleanCandidate.includes(empClean)) {
+      return emp;
+    }
+
+    const empTokens = empClean
+      .split(' ')
+      .filter((t) => t.length >= 2 && !ignoreStopWords.has(t));
+
+    if (empTokens.length === 0) continue;
+
+    // Primeiro nome precisa coincidir
+    if (empTokens[0] !== candidateTokens[0]) continue;
+
+    const sharedCount = candidateTokens.filter((t) => empTokens.includes(t)).length;
+    const minTokens = Math.min(candidateTokens.length, empTokens.length);
+
+    if (sharedCount >= 2 || (minTokens === 1 && sharedCount === 1)) {
+      const score = sharedCount / Math.max(candidateTokens.length, empTokens.length);
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = emp;
+      }
+    }
+  }
+
+  return bestMatch;
+}
+
+/**
+ * Remove automaticamente setores (unidades) e colaboradores duplicados pelo nome,
+ * redirecionando vínculos de setor, históricos e células de escala para o registro principal.
+ */
+export function deduplicateEscalaProState(state: EscalaProState): EscalaProState {
+  if (!state || typeof state !== 'object') return state;
+
+  const rawUnits = Array.isArray(state.units) ? state.units : [];
+  const rawEmployees = Array.isArray(state.employees) ? state.employees : [];
+
+  // Conta quantos colaboradores apontam para cada unitId para preferir manter o ID mais usado
+  const unitUsageCount = new Map<string, number>();
+  for (const emp of rawEmployees) {
+    if (emp && emp.unitId) {
+      unitUsageCount.set(emp.unitId, (unitUsageCount.get(emp.unitId) || 0) + 1);
+    }
+  }
+
+  // 1. Desduplica Unidades (Setores) pelo nome normalizado
+  const unitsByName = new Map<string, HospitalUnit>();
+  const unitRedirectMap = new Map<string, string>();
+
+  for (const unit of rawUnits) {
+    if (!unit || !unit.id) continue;
+    const cleanName = String(unit.name || '').trim();
+    const key = normalizeNameKey(cleanName);
+    if (!key) {
+      // Mantém temporariamente unidades em edição sem nome na tela de configurações se tiverem ID único
+      if (! Array.from(unitsByName.values()).some((u) => u.id === unit.id)) {
+        unitsByName.set(`__blank_${unit.id}`, unit);
+      }
+      continue;
+    }
+
+    const existing = unitsByName.get(key);
+    if (!existing) {
+      unitsByName.set(key, { ...unit, name: cleanName });
+    } else {
+      const existingUsage = unitUsageCount.get(existing.id) || 0;
+      const candidateUsage = unitUsageCount.get(unit.id) || 0;
+      if (candidateUsage > existingUsage) {
+        unitRedirectMap.set(existing.id, unit.id);
+        // Atualiza redirecionamentos anteriores que apontavam para existing.id
+        for (const [oldId, targetId] of unitRedirectMap.entries()) {
+          if (targetId === existing.id) {
+            unitRedirectMap.set(oldId, unit.id);
+          }
+        }
+        unitsByName.set(key, { ...unit, name: cleanName });
+      } else if (unit.id !== existing.id) {
+        unitRedirectMap.set(unit.id, existing.id);
+      }
+    }
+  }
+
+  let dedupedUnits = Array.from(unitsByName.values());
+
+  // Se houver setores reais criados pelo usuário e também o placeholder genérico 'unit-default-1' ("Unidade Principal"), redireciona e remove o placeholder
+  if (dedupedUnits.length > 1) {
+    const realUnits = dedupedUnits.filter(
+      (u) => !(u.id === 'unit-default-1' && normalizeNameKey(u.name) === 'unidade principal')
+    );
+    if (realUnits.length > 0 && realUnits.length < dedupedUnits.length) {
+      unitRedirectMap.set('unit-default-1', realUnits[0].id);
+      dedupedUnits = realUnits;
+    }
+  }
+
+  const validUnitIds = new Set(dedupedUnits.map((u) => u.id));
+  const fallbackUnitId = dedupedUnits[0]?.id || 'unit-1';
+
+  // 2. Desduplica Colaboradores pelo nome normalizado e corrige unitId redirecionado
+  const employeesByName = new Map<string, Employee>();
+  const empRedirectMap = new Map<string, string>();
+
+  for (const emp of rawEmployees) {
+    if (!emp || !emp.id) continue;
+    let resolvedUnitId = unitRedirectMap.get(emp.unitId) || emp.unitId;
+    if (!validUnitIds.has(resolvedUnitId)) {
+      resolvedUnitId = fallbackUnitId;
+    }
+
+    const cleanEmp: Employee = {
+      ...emp,
+      name: String(emp.name || '').trim(),
+      unitId: resolvedUnitId,
+    };
+
+    const empKey = normalizeNameKey(cleanEmp.name);
+    if (!empKey) continue;
+
+    const existingEmp = employeesByName.get(empKey);
+    if (!existingEmp) {
+      employeesByName.set(empKey, cleanEmp);
+    } else {
+      // Mescla histórico sem duplicar ocorrências na mesma data e tipo
+      const histMap = new Map<string, AbsenceRecord>();
+      for (const h of [...(existingEmp.history || []), ...(cleanEmp.history || [])]) {
+        if (!h) continue;
+        const sig = `${h.type}_${h.startDate}_${h.daysCount || 1}`;
+        if (!histMap.has(sig)) {
+          histMap.set(sig, h);
+        }
+      }
+
+      // Se um deles estiver ativo e o outro inativo, ou se um tiver mais dados, prioriza o ativo/mais completo
+      const preferCandidate =
+        (cleanEmp.active && !existingEmp.active) ||
+        (cleanEmp.active === existingEmp.active &&
+          (cleanEmp.history?.length || 0) > (existingEmp.history?.length || 0));
+
+      const winner = preferCandidate ? cleanEmp : existingEmp;
+      const loser = preferCandidate ? existingEmp : cleanEmp;
+
+      if (loser.id !== winner.id) {
+        empRedirectMap.set(loser.id, winner.id);
+        for (const [oldEmpId, targetEmpId] of empRedirectMap.entries()) {
+          if (targetEmpId === loser.id) {
+            empRedirectMap.set(oldEmpId, winner.id);
+          }
+        }
+      }
+
+      const mergedHistory = Array.from(histMap.values()).map((h) => ({
+        ...h,
+        employeeId: winner.id,
+      }));
+
+      employeesByName.set(empKey, {
+        ...loser,
+        ...winner,
+        unitId: winner.unitId || loser.unitId || fallbackUnitId,
+        registrationNumber: winner.registrationNumber || loser.registrationNumber || '',
+        avatarBase64: winner.avatarBase64 || loser.avatarBase64,
+        hourBankBalance: winner.hourBankBalance || loser.hourBankBalance || 0,
+        active: existingEmp.active && cleanEmp.active,
+        history: mergedHistory,
+      });
+    }
+  }
+
+  const dedupedEmployees = Array.from(employeesByName.values());
+  const validEmpIds = new Set(dedupedEmployees.map((e) => e.id));
+
+  // 3. Atualiza e limpa as células da escala mensal (redirecionando empId e unitOverrideId)
+  const rawSchedules = state.schedules || {};
+  const cleanedSchedules: MonthlyScheduleMap = {};
+
+  for (const [ymKey, monthMap] of Object.entries(rawSchedules)) {
+    if (!monthMap || typeof monthMap !== 'object') continue;
+    cleanedSchedules[ymKey] = {};
+
+    for (const [rawEmpId, daysMap] of Object.entries(monthMap)) {
+      const targetEmpId = empRedirectMap.get(rawEmpId) || rawEmpId;
+      if (!validEmpIds.has(targetEmpId) || !daysMap || typeof daysMap !== 'object') continue;
+
+      const existingDays = cleanedSchedules[ymKey][targetEmpId] || {};
+      const nextDays: Record<number, ScheduleCellData> = { ...existingDays };
+
+      for (const [dayStr, cell] of Object.entries(daysMap)) {
+        const dayNum = Number(dayStr);
+        if (!cell || isNaN(dayNum)) continue;
+
+        let resolvedOverride = cell.unitOverrideId
+          ? unitRedirectMap.get(cell.unitOverrideId) || cell.unitOverrideId
+          : undefined;
+        if (resolvedOverride && !validUnitIds.has(resolvedOverride)) {
+          resolvedOverride = undefined;
+        }
+
+        const resolvedSwapPartner = cell.swapWithEmployeeId
+          ? empRedirectMap.get(cell.swapWithEmployeeId) || cell.swapWithEmployeeId
+          : undefined;
+
+        const cleanCell: ScheduleCellData = {
+          ...cell,
+          unitOverrideId: resolvedOverride,
+          swapWithEmployeeId: resolvedSwapPartner,
+        };
+
+        const prevCell = nextDays[dayNum];
+        // Se já havia célula (por exemplo do registro mesclado), prioriza aquela que possui observação, folga manual, atestado ou direcionamento de setor
+        if (
+          !prevCell ||
+          cleanCell.note ||
+          cleanCell.unitOverrideId ||
+          cleanCell.status === 'F' ||
+          cleanCell.status === 'AT' ||
+          cleanCell.status === 'FA' ||
+          cleanCell.status === 'FE' ||
+          cleanCell.status === 'TR'
+        ) {
+          nextDays[dayNum] = cleanCell;
+        }
+      }
+
+      cleanedSchedules[ymKey][targetEmpId] = nextDays;
+    }
+  }
+
+  return {
+    ...state,
+    units: dedupedUnits,
+    employees: dedupedEmployees,
+    schedules: reapplyEmployeeHistoryToSchedules(dedupedEmployees, cleanedSchedules),
+  };
+}
+
 // Gera ou atualiza a escala automática de um mês preservando Férias (FE), Atestados (AT), Faltas (FA), Trocas (TR) e Folgas/ajustes manuais
 export function generateAutomaticScheduleForMonth(
   employees: Employee[],
@@ -687,7 +965,7 @@ export const storageService = {
       if (!parsed || typeof parsed !== 'object' || !parsed.manager) {
         return createBlankInitialState();
       }
-      return parsed;
+      return deduplicateEscalaProState(parsed);
     } catch (e) {
       console.error('Erro ao carregar estado do localStorage:', e);
       return createBlankInitialState();
@@ -696,8 +974,9 @@ export const storageService = {
 
   saveState(state: EscalaProState): void {
     try {
+      const deduped = deduplicateEscalaProState(state);
       const updated: EscalaProState = {
-        ...state,
+        ...deduped,
         lastUpdated: new Date().toISOString(),
       };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
@@ -713,7 +992,8 @@ export const storageService = {
       if (raw) {
         const parsed = JSON.parse(raw) as EscalaProState;
         if (parsed && typeof parsed === 'object' && parsed.manager) {
-          return parsed;
+          const deduped = deduplicateEscalaProState(parsed);
+          return deduped;
         }
       }
 
@@ -731,7 +1011,7 @@ export const storageService = {
           userUnits.length > 0
       );
 
-      const initializedState: EscalaProState = {
+      const initializedState = deduplicateEscalaProState({
         ...initial,
         manager: {
           ...initial.manager,
@@ -743,7 +1023,7 @@ export const storageService = {
         },
         units: userUnits,
         lastUpdated: new Date().toISOString(),
-      };
+      });
       localStorage.setItem(userKey, JSON.stringify(initializedState));
       return initializedState;
     } catch (e) {
@@ -754,8 +1034,9 @@ export const storageService = {
 
   saveStateForUser(userId: string, state: EscalaProState): void {
     try {
+      const deduped = deduplicateEscalaProState(state);
       const updated: EscalaProState = {
-        ...state,
+        ...deduped,
         lastUpdated: new Date().toISOString(),
       };
       localStorage.setItem(`${USER_STATE_PREFIX}${userId}`, JSON.stringify(updated));
@@ -937,6 +1218,36 @@ export const storageService = {
     } catch (e) {
       console.error('Erro ao salvar sessão ativa:', e);
     }
+  },
+
+  deleteUserAccountCompletely(uid: string, email?: string): EscalaProState {
+    try {
+      const cleanEmail = (email || '').trim().toLowerCase();
+      const accounts = this.listRegisteredAccounts().filter(
+        (a) =>
+          a.uid !== uid &&
+          (!cleanEmail || a.email.trim().toLowerCase() !== cleanEmail)
+      );
+      localStorage.setItem(ACCOUNTS_LIST_KEY, JSON.stringify(accounts));
+      localStorage.removeItem(`${USER_STATE_PREFIX}${uid}`);
+      localStorage.removeItem(ACTIVE_SESSION_KEY);
+      localStorage.removeItem(STORAGE_KEY);
+
+      // Remove também qualquer chave local órfã associada ao mesmo usuário
+      const keysToRemove: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith(USER_STATE_PREFIX)) {
+          keysToRemove.push(k);
+        }
+      }
+      for (const k of keysToRemove) {
+        localStorage.removeItem(k);
+      }
+    } catch (e) {
+      console.error('Erro ao apagar dados locais da conta:', e);
+    }
+    return createBlankInitialState();
   },
 
   exportBackupJson(state: EscalaProState): void {

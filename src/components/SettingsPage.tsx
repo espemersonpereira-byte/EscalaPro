@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   EscalaProState,
   HospitalUnit,
@@ -36,6 +36,7 @@ interface SettingsPageProps {
   state: EscalaProState;
   currentUser?: UserAccount | null;
   onLogout?: () => void;
+  onDeleteAccount?: () => Promise<void> | void;
   onUpdateManagerAndUnits: (manager: ManagerProfile, units: HospitalUnit[]) => void;
   onUpdatePushConfig: (pushConfig: PushNotificationConfig) => void;
   onLoadDemoData: () => void;
@@ -46,6 +47,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
   state,
   currentUser,
   onLogout,
+  onDeleteAccount,
   onUpdateManagerAndUnits,
   onUpdatePushConfig,
   onOpenNewEmployeeForUnit,
@@ -75,6 +77,30 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
   const [pushConfig, setPushConfig] = useState<PushNotificationConfig>(state.pushConfig);
   const [saveFeedback, setSaveFeedback] = useState<string | null>(null);
   const [pushFeedback, setPushFeedback] = useState<string | null>(null);
+  const [confirmingDeleteAccount, setConfirmingDeleteAccount] = useState(false);
+  const [isDeletingAccount, setIsDeletingAccount] = useState(false);
+
+  // Mantém a lista de setores em sincronia caso duplicatas sejam limpas ou atualizadas pela nuvem
+  useEffect(() => {
+    setUnits((prev) => {
+      const emptyDrafts = prev.filter((u) => u.name.trim().length === 0);
+      return [...state.units, ...emptyDrafts];
+    });
+  }, [state.units]);
+
+  useEffect(() => {
+    setName(state.manager.name);
+    setHospitalName(state.manager.hospitalName);
+    setRole(state.manager.role);
+    setSectorName(state.manager.sectorName);
+    setAvatarBase64(state.manager.avatarBase64);
+  }, [
+    state.manager.name,
+    state.manager.hospitalName,
+    state.manager.role,
+    state.manager.sectorName,
+    state.manager.avatarBase64,
+  ]);
 
   const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -140,9 +166,16 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
 
   const handleRemoveUnit = (unitId: string) => {
     if (units.length <= 1) return;
+    const removedUnit = units.find((u) => u.id === unitId);
     const nextUnits = units.filter((u) => u.id !== unitId);
     setUnits(nextUnits);
     syncValidUnitsToApp(nextUnits);
+    setSaveFeedback(
+      removedUnit?.name
+        ? `Setor "${removedUnit.name}" removido permanentemente da sua conta!`
+        : 'Setor removido com sucesso!'
+    );
+    setTimeout(() => setSaveFeedback(null), 4000);
   };
 
   const handleUnitChange = <K extends keyof HospitalUnit>(
@@ -231,28 +264,83 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
         </div>
       )}
 
-      {/* CONTA DO USUÁRIO LOGADO & TROCAR DE CONTA */}
+      {/* CONTA DO USUÁRIO LOGADO, TROCAR DE CONTA & APAGAR CONTA */}
       {currentUser && (
-        <section className="bg-[#0f172a] text-white rounded-2xl border border-slate-800 p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div className="flex items-center gap-3.5">
-            <div className="w-11 h-11 rounded-2xl bg-[#0d9488] text-white flex items-center justify-center font-bold text-sm shrink-0">
-              {(currentUser.name || 'U').slice(0, 2).toUpperCase()}
+        <section className="bg-[#0f172a] text-white rounded-2xl border border-slate-800 p-5 space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="flex items-center gap-3.5">
+              <div className="w-11 h-11 rounded-2xl bg-[#0d9488] text-white flex items-center justify-center font-bold text-sm shrink-0">
+                {(currentUser.name || 'U').slice(0, 2).toUpperCase()}
+              </div>
+              <div>
+                <h2 className="text-sm md:text-base font-bold text-white">{currentUser.name}</h2>
+                <p className="text-xs text-slate-400">{currentUser.email}</p>
+              </div>
             </div>
-            <div>
-              <h2 className="text-sm md:text-base font-bold text-white">{currentUser.name}</h2>
-              <p className="text-xs text-slate-400">{currentUser.email}</p>
+
+            <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+              {onLogout && (
+                <button
+                  type="button"
+                  onClick={onLogout}
+                  className="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-bold transition-colors cursor-pointer"
+                >
+                  <LogOut className="w-4 h-4" />
+                  <span>Trocar de Conta / Sair</span>
+                </button>
+              )}
+
+              {onDeleteAccount && (
+                <button
+                  type="button"
+                  onClick={() => setConfirmingDeleteAccount((prev) => !prev)}
+                  className="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-xl bg-red-950/70 hover:bg-red-900 text-red-200 border border-red-800/80 text-xs font-bold transition-colors cursor-pointer"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  <span>Apagar Minha Conta</span>
+                </button>
+              )}
             </div>
           </div>
 
-          {onLogout && (
-            <button
-              type="button"
-              onClick={onLogout}
-              className="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-xl bg-slate-800 hover:bg-red-950/80 text-slate-200 hover:text-red-200 border border-slate-700 hover:border-red-800 text-xs font-bold transition-colors cursor-pointer shrink-0"
-            >
-              <LogOut className="w-4 h-4" />
-              <span>Trocar de Conta / Sair</span>
-            </button>
+          {confirmingDeleteAccount && onDeleteAccount && (
+            <div className="p-4 rounded-xl bg-red-950/60 border border-red-800/80 flex flex-col md:flex-row md:items-center justify-between gap-4">
+              <div>
+                <h3 className="text-xs md:text-sm font-bold text-red-200">
+                  Tem certeza que deseja apagar sua conta ({currentUser.email})?
+                </h3>
+                <p className="text-xs text-red-300/90 mt-0.5">
+                  Todos os setores, colaboradores e escalas vinculados a esta conta serão apagados na
+                  nuvem e neste aparelho, permitindo que você se cadastre novamente do zero.
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  disabled={isDeletingAccount}
+                  onClick={() => setConfirmingDeleteAccount(false)}
+                  className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold cursor-pointer"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  disabled={isDeletingAccount}
+                  onClick={async () => {
+                    setIsDeletingAccount(true);
+                    try {
+                      await onDeleteAccount();
+                    } finally {
+                      setIsDeletingAccount(false);
+                    }
+                  }}
+                  className="px-4 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold cursor-pointer disabled:opacity-60"
+                >
+                  {isDeletingAccount ? 'Apagando Conta...' : 'Sim, Apagar Conta e Recadastrar'}
+                </button>
+              </div>
+            </div>
           )}
         </section>
       )}
