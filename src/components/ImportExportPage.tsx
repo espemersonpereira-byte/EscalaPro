@@ -353,26 +353,16 @@ startxref
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-100 pb-4">
           <div>
             <span className="text-xs font-bold text-teal-700">
-              Leitura Universal com IA · PDF, Excel (.xlsx/.xls), Word (.docx/.doc), CSV e Fotos
+              Leitura Universal · PDF, Excel (.xlsx/.xls), Word (.docx/.doc), CSV e Fotos
             </span>
             <h1 className="text-xl font-bold text-slate-900 mt-0.5">
               Importador Inteligente de Escalas (PDF, Word ou Excel)
             </h1>
             <p className="text-xs text-slate-500 mt-0.5">
               Envie qualquer arquivo de escala antiga, planilha do Excel, documento do Word, PDF
-              ou foto da folha de ponto. A IA extrai todos os nomes e conduz a entrevista guiada.
+              ou foto da folha de ponto para extrair os colaboradores e confirmar na entrevista guiada.
             </p>
           </div>
-
-          <button
-            type="button"
-            onClick={handleSimulateSamplePdfWithGemini}
-            disabled={isAnalyzingPdf}
-            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-teal-50 hover:bg-teal-100 text-teal-900 border border-teal-200 text-xs font-bold transition-colors cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-50"
-          >
-            <Sparkles className="w-4 h-4 text-teal-600" />
-            <span>Testar Leitura IA com Escala Exemplo</span>
-          </button>
         </div>
 
         {pdfError && (
