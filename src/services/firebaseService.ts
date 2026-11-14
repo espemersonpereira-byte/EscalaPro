@@ -20,13 +20,14 @@ import {
   collection,
   deleteDoc,
   doc,
+  DocumentReference,
   getDoc,
   getDocFromServer,
   getDocs,
   query,
   serverTimestamp,
-  setDoc,
   where,
+  writeBatch,
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 import {
@@ -390,8 +391,10 @@ export function mergeTwoEscalaProStates(
 
   const baseEmpCount = Array.isArray(baseState.employees) ? baseState.employees.length : 0;
   const otherEmpCount = Array.isArray(otherState.employees) ? otherState.employees.length : 0;
-  const baseTime = new Date(baseState.lastUpdated || 0).getTime();
-  const otherTime = new Date(otherState.lastUpdated || 0).getTime();
+  const rawBaseTime = new Date(baseState.lastUpdated || 0).getTime();
+  const rawOtherTime = new Date(otherState.lastUpdated || 0).getTime();
+  const baseTime = Number.isFinite(rawBaseTime) ? rawBaseTime : 0;
+  const otherTime = Number.isFinite(rawOtherTime) ? rawOtherTime : 0;
 
   const preferOther =
     otherEmpCount > 0 && baseEmpCount === 0
@@ -419,7 +422,7 @@ export function mergeTwoEscalaProStates(
       ? secondary.units
       : primary.units;
 
-  // Para colaboradores, se primary já possui colaboradores cadastrados, usa primary como base e mescla históricos pelo nome (via deduplicateEscalaProState)
+  // Para colaboradores, usa primary como base e mescla históricos/saldos pelo nome (via deduplicateEscalaProState)
   const combinedEmployees =
     primary.employees && primary.employees.length > 0
       ? [...primary.employees, ...(secondary.employees || [])]
@@ -461,6 +464,8 @@ export function mergeTwoEscalaProStates(
     ...(primary.customRoles || []),
   ]);
 
+  const maxKnownTime = Math.max(baseTime, otherTime);
+
   return deduplicateEscalaProState({
     ...primary,
     manager: {
@@ -484,7 +489,7 @@ export function mergeTwoEscalaProStates(
     customRoles: Array.from(customRolesSet),
     employees: combinedEmployees,
     schedules: mergedSchedules,
-    lastUpdated: new Date(Math.max(baseTime, otherTime, Date.now())).toISOString(),
+    lastUpdated: new Date(maxKnownTime > 0 ? maxKnownTime : 0).toISOString(),
   });
 }
 
@@ -559,6 +564,11 @@ export async function loadWorkspaceFromFirestore(
             : 'HORA_EXTRA'
           : (d.type as AbsenceRecord['type']) || 'ATESTADO';
 
+      const recCreatedAt =
+        d.createdAt && typeof d.createdAt.toDate === 'function'
+          ? d.createdAt.toDate().toISOString()
+          : new Date(0).toISOString();
+
       const rec: AbsenceRecord = {
         id: docSnap.id,
         employeeId: empId,
@@ -569,7 +579,7 @@ export async function loadWorkspaceFromFirestore(
         daysCount: Number(d.daysCount || 1),
         reason: String(d.reason || ''),
         cid: d.cid ? String(d.cid) : undefined,
-        createdAt: new Date().toISOString(),
+        createdAt: recCreatedAt,
       };
       if (!absencesByEmployee[empId]) {
         absencesByEmployee[empId] = [];
@@ -674,10 +684,55 @@ export async function loadWorkspaceFromFirestore(
   return firestoreState;
 }
 
-/**
- * Sincroniza o estado completo do usuário para o Firestore e para o espelho em nuvem por e-mail.
- */
-export async function syncWorkspaceToFirestore(
+type BatchWriteOp =
+  | { kind: 'set'; ref: DocumentReference; data: Record<string, unknown>; path: string }
+  | { kind: 'delete'; ref: DocumentReference; path: string };
+
+async function commitBatchWave(ops: BatchWriteOp[]): Promise<void> {
+  if (ops.length === 0) return;
+  const CHUNK_SIZE = 400;
+  for (let i = 0; i < ops.length; i += CHUNK_SIZE) {
+    const chunk = ops.slice(i, i + CHUNK_SIZE);
+    const batch = writeBatch(db);
+    for (const op of chunk) {
+      if (op.kind === 'set') {
+        batch.set(op.ref, op.data);
+      } else {
+        batch.delete(op.ref);
+      }
+    }
+    try {
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, chunk[0]?.path || 'workspaces');
+    }
+  }
+}
+
+function shallowEqualFields(
+  existing: Record<string, unknown> | undefined,
+  candidate: Record<string, unknown>,
+  keys: string[]
+): boolean {
+  if (!existing) return false;
+  for (const k of keys) {
+    if ((existing[k] ?? null) !== (candidate[k] ?? null)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+interface QueuedSyncJob {
+  rawState: EscalaProState;
+  accountEmail?: string;
+  accountObj?: Partial<UserAccount>;
+}
+
+const activeSyncByUid = new Map<string, Promise<boolean>>();
+const pendingSyncByUid = new Map<string, QueuedSyncJob>();
+
+async function performSyncWorkspaceToFirestore(
   userId: string,
   rawState: EscalaProState,
   accountEmail?: string,
@@ -718,14 +773,49 @@ export async function syncWorkspaceToFirestore(
   const wsRef = doc(db, 'workspaces', safeUid);
   const wsPath = `workspaces/${safeUid}`;
 
+  // Leituras em paralelo (5 chamadas simultâneas no máximo em vez de 300 sequenciais)
   let existingWsSnap;
+  let unitsSnap;
+  let empsSnap;
+  let absSnap;
+  let cellsSnap;
   try {
-    existingWsSnap = await getDoc(wsRef);
+    [existingWsSnap, unitsSnap, empsSnap, absSnap, cellsSnap] = await Promise.all([
+      getDoc(wsRef),
+      getDocs(query(collection(db, 'workspaces', safeUid, 'units'), where('ownerId', '==', safeUid))),
+      getDocs(
+        query(collection(db, 'workspaces', safeUid, 'employees'), where('ownerId', '==', safeUid))
+      ),
+      getDocs(
+        query(collection(db, 'workspaces', safeUid, 'absences'), where('ownerId', '==', safeUid))
+      ),
+      getDocs(
+        query(
+          collection(db, 'workspaces', safeUid, 'scheduleCells'),
+          where('ownerId', '==', safeUid)
+        )
+      ),
+    ]);
   } catch (error) {
     handleFirestoreError(error, OperationType.GET, wsPath);
   }
 
-  const wsPayload = {
+  const existingUnitsMap = new Map<string, Record<string, unknown>>();
+  unitsSnap?.forEach((d) => existingUnitsMap.set(d.id, d.data()));
+
+  const existingEmpsMap = new Map<string, Record<string, unknown>>();
+  empsSnap?.forEach((d) => existingEmpsMap.set(d.id, d.data()));
+
+  const existingAbsMap = new Map<string, Record<string, unknown>>();
+  absSnap?.forEach((d) => existingAbsMap.set(d.id, d.data()));
+
+  const existingCellsMap = new Map<string, Record<string, unknown>>();
+  cellsSnap?.forEach((d) => existingCellsMap.set(d.id, d.data()));
+
+  // Onda 1: Workspace + Unidades (precisam estar gravadas antes de criar colaboradores por causa do exists() nas regras)
+  const wave1Ops: BatchWriteOp[] = [];
+  const existingWsData = existingWsSnap?.exists() ? existingWsSnap.data() : undefined;
+  const wsCore = {
     ownerId: safeUid,
     managerName: clampString(state.manager.name, 1, 120, 'Gestor(a)'),
     managerRole: clampString(state.manager.role, 1, 100, 'Gestor(a)'),
@@ -734,68 +824,94 @@ export async function syncWorkspaceToFirestore(
     onboardingCompleted: Boolean(state.manager.onboardingCompleted),
     pushEnabled: Boolean(state.pushConfig.enabled),
     pushTime: '06:30',
-    createdAt: existingWsSnap?.exists() ? existingWsSnap.data().createdAt : serverTimestamp(),
-    updatedAt: serverTimestamp(),
   };
-
-  try {
-    await setDoc(wsRef, wsPayload);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, wsPath);
+  if (
+    !shallowEqualFields(existingWsData, wsCore, [
+      'ownerId',
+      'managerName',
+      'managerRole',
+      'sectorName',
+      'hospitalName',
+      'onboardingCompleted',
+      'pushEnabled',
+      'pushTime',
+    ])
+  ) {
+    wave1Ops.push({
+      kind: 'set',
+      ref: wsRef,
+      path: wsPath,
+      data: {
+        ...wsCore,
+        createdAt: existingWsData ? existingWsData.createdAt : serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
+    });
   }
 
-  // 1. Sincroniza Unidades Atuais
   const activeUnitDocIds = new Set<string>();
   for (const unit of state.units) {
     const unitId = sanitizeId(unit.id);
     activeUnitDocIds.add(unitId);
     const unitRef = doc(db, 'workspaces', safeUid, 'units', unitId);
     const unitPath = `workspaces/${safeUid}/units/${unitId}`;
-    let existingUnit;
-    try {
-      existingUnit = await getDoc(unitRef);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.GET, unitPath);
-    }
+    const existingUnit = existingUnitsMap.get(unitId);
 
-    const unitPayload = {
+    const unitCore = {
       ownerId: safeUid,
       name: clampString(unit.name, 1, 100, 'Unidade Hospitalar'),
       shiftMode:
         unit.shiftMode === 'DIURNO' || unit.shiftMode === 'NOTURNO' ? unit.shiftMode : '24H',
       minStaffDay: Math.max(0, Math.min(500, Math.round(Number(unit.minStaffDay) || 0))),
       minStaffNight: Math.max(0, Math.min(500, Math.round(Number(unit.minStaffNight) || 0))),
-      createdAt: existingUnit?.exists() ? existingUnit.data().createdAt : serverTimestamp(),
-      updatedAt: serverTimestamp(),
     };
 
-    try {
-      await setDoc(unitRef, unitPayload);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, unitPath);
+    if (
+      !shallowEqualFields(existingUnit, unitCore, [
+        'ownerId',
+        'name',
+        'shiftMode',
+        'minStaffDay',
+        'minStaffNight',
+      ])
+    ) {
+      wave1Ops.push({
+        kind: 'set',
+        ref: unitRef,
+        path: unitPath,
+        data: {
+          ...unitCore,
+          createdAt: existingUnit ? existingUnit.createdAt : serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+      });
     }
   }
 
-  // 2. Sincroniza Colaboradores e seus Afastamentos
+  await commitBatchWave(wave1Ops);
+
+  // Onda 2: Colaboradores (incluindo hourBankBalance — enviado em bloco atômico logo em seguida)
+  const wave2Ops: BatchWriteOp[] = [];
   const activeEmpDocIds = new Set<string>();
   const fallbackUnitId = sanitizeId(state.units[0]?.id || 'unit-1');
+
   for (const emp of state.employees) {
     const empId = sanitizeId(emp.id);
     activeEmpDocIds.add(empId);
     const empRef = doc(db, 'workspaces', safeUid, 'employees', empId);
     const empPath = `workspaces/${safeUid}/employees/${empId}`;
-    let existingEmp;
-    try {
-      existingEmp = await getDoc(empRef);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.GET, empPath);
-    }
+    const existingEmp = existingEmpsMap.get(empId);
 
     const validUnitId = state.units.some((u) => sanitizeId(u.id) === sanitizeId(emp.unitId))
       ? sanitizeId(emp.unitId)
       : fallbackUnitId;
 
-    const empPayload = {
+    const rawBal = Number(emp.hourBankBalance);
+    const safeBal = Number.isFinite(rawBal)
+      ? Math.round(Math.max(-10000, Math.min(10000, rawBal)) * 100) / 100
+      : 0;
+
+    const empCore = {
       ownerId: safeUid,
       name: clampString(emp.name, 1, 140, 'Colaborador'),
       role: clampString(emp.role, 1, 100, 'Profissional'),
@@ -807,27 +923,50 @@ export async function syncWorkspaceToFirestore(
       active: Boolean(emp.active),
       phone: '',
       preferredOffDay: 0,
-      hourBankBalance: Math.max(-10000, Math.min(10000, Number(emp.hourBankBalance) || 0)),
-      createdAt: existingEmp?.exists() ? existingEmp.data().createdAt : serverTimestamp(),
-      updatedAt: serverTimestamp(),
+      hourBankBalance: safeBal,
     };
 
-    try {
-      await setDoc(empRef, empPayload);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, empPath);
+    if (
+      !shallowEqualFields(existingEmp, empCore, [
+        'ownerId',
+        'name',
+        'role',
+        'registrationId',
+        'unitId',
+        'defaultShift',
+        'workHours',
+        'regime',
+        'active',
+        'phone',
+        'preferredOffDay',
+        'hourBankBalance',
+      ])
+    ) {
+      wave2Ops.push({
+        kind: 'set',
+        ref: empRef,
+        path: empPath,
+        data: {
+          ...empCore,
+          createdAt: existingEmp ? existingEmp.createdAt : serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+      });
     }
+  }
 
+  await commitBatchWave(wave2Ops);
+
+  // Onda 3: Ocorrências (absences), células customizadas da escala e remoção de registros excluídos
+  const wave3Ops: BatchWriteOp[] = [];
+
+  for (const emp of state.employees) {
+    const empId = sanitizeId(emp.id);
     for (const rec of emp.history || []) {
       const absId = sanitizeId(rec.id);
       const absRef = doc(db, 'workspaces', safeUid, 'absences', absId);
       const absPath = `workspaces/${safeUid}/absences/${absId}`;
-      let existingAbs;
-      try {
-        existingAbs = await getDoc(absRef);
-      } catch (error) {
-        handleFirestoreError(error, OperationType.GET, absPath);
-      }
+      const existingAbs = existingAbsMap.get(absId);
 
       const mappedType =
         rec.type === 'TROCA'
@@ -836,7 +975,7 @@ export async function syncWorkspaceToFirestore(
           ? 'BANCO_HORAS'
           : rec.type;
 
-      const absPayload = {
+      const absCore = {
         ownerId: safeUid,
         employeeId: empId,
         type: mappedType,
@@ -846,50 +985,35 @@ export async function syncWorkspaceToFirestore(
         nextShiftDate: clampString(rec.nextShiftDate || '', 0, 20, ''),
         reason: clampString(rec.reason, 1, 500, 'Registro lançado no sistema'),
         cid: clampString(rec.cid || '', 0, 30, ''),
-        createdAt: existingAbs?.exists() ? existingAbs.data().createdAt : serverTimestamp(),
-        updatedAt: serverTimestamp(),
       };
 
-      try {
-        await setDoc(absRef, absPayload);
-      } catch (error) {
-        handleFirestoreError(error, OperationType.WRITE, absPath);
+      if (
+        !shallowEqualFields(existingAbs, absCore, [
+          'ownerId',
+          'employeeId',
+          'type',
+          'startDate',
+          'endDate',
+          'daysCount',
+          'nextShiftDate',
+          'reason',
+          'cid',
+        ])
+      ) {
+        wave3Ops.push({
+          kind: 'set',
+          ref: absRef,
+          path: absPath,
+          data: {
+            ...absCore,
+            createdAt: existingAbs ? existingAbs.createdAt : serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          },
+        });
       }
     }
   }
 
-  // 3. Remove do Firestore colaboradores e setores (unidades) que foram excluídos ou desduplicados pelo usuário
-  try {
-    const qExistingEmps = query(
-      collection(db, 'workspaces', safeUid, 'employees'),
-      where('ownerId', '==', safeUid)
-    );
-    const existingEmpsSnap = await getDocs(qExistingEmps);
-    for (const docSnap of existingEmpsSnap.docs) {
-      if (!activeEmpDocIds.has(docSnap.id)) {
-        await deleteDoc(doc(db, 'workspaces', safeUid, 'employees', docSnap.id));
-      }
-    }
-  } catch (err) {
-    console.warn('Aviso ao limpar colaboradores duplicados/excluídos no Firestore:', err);
-  }
-
-  try {
-    const qExistingUnits = query(
-      collection(db, 'workspaces', safeUid, 'units'),
-      where('ownerId', '==', safeUid)
-    );
-    const existingUnitsSnap = await getDocs(qExistingUnits);
-    for (const docSnap of existingUnitsSnap.docs) {
-      if (!activeUnitDocIds.has(docSnap.id)) {
-        await deleteDoc(doc(db, 'workspaces', safeUid, 'units', docSnap.id));
-      }
-    }
-  } catch (err) {
-    console.warn('Aviso ao limpar setores duplicados/excluídos no Firestore:', err);
-  }
-
-  // Sincroniza células customizadas (qualquer alteração manual de Folga F, D, N, AT, FA, FE, TR, setor pontual, nota ou hora extra)
   for (const [ymKey, empScheduleMap] of Object.entries(state.schedules)) {
     const [yStr, mStr] = ymKey.split('-');
     const yNum = Number(yStr) || new Date().getFullYear();
@@ -917,19 +1041,14 @@ export async function syncWorkspaceToFirestore(
           const cellId = sanitizeId(`${ymKey}_${empId}_${dayNum}`);
           const cellRef = doc(db, 'workspaces', safeUid, 'scheduleCells', cellId);
           const cellPath = `workspaces/${safeUid}/scheduleCells/${cellId}`;
-          let existingCell;
-          try {
-            existingCell = await getDoc(cellRef);
-          } catch (error) {
-            handleFirestoreError(error, OperationType.GET, cellPath);
-          }
+          const existingCell = existingCellsMap.get(cellId);
 
           const cleanUnitOverride =
             cell.unitOverrideId && cell.unitOverrideId.trim().length > 0
               ? sanitizeId(cell.unitOverrideId)
               : '';
 
-          const cellPayload = {
+          const cellCore = {
             ownerId: safeUid,
             yearMonth: clampString(ymKey, 7, 10, '2026-11'),
             employeeId: empId,
@@ -938,18 +1057,99 @@ export async function syncWorkspaceToFirestore(
             note: clampString(cell.note || '', 0, 300, ''),
             extraHours: Math.max(-24, Math.min(24, Number(cell.extraHours) || 0)),
             unitOverrideId: cleanUnitOverride,
-            createdAt: existingCell?.exists() ? existingCell.data().createdAt : serverTimestamp(),
-            updatedAt: serverTimestamp(),
           };
 
-          try {
-            await setDoc(cellRef, cellPayload);
-          } catch (error) {
-            handleFirestoreError(error, OperationType.WRITE, cellPath);
+          if (
+            !shallowEqualFields(existingCell, cellCore, [
+              'ownerId',
+              'yearMonth',
+              'employeeId',
+              'day',
+              'status',
+              'note',
+              'extraHours',
+              'unitOverrideId',
+            ])
+          ) {
+            wave3Ops.push({
+              kind: 'set',
+              ref: cellRef,
+              path: cellPath,
+              data: {
+                ...cellCore,
+                createdAt: existingCell ? existingCell.createdAt : serverTimestamp(),
+                updatedAt: serverTimestamp(),
+              },
+            });
           }
         }
       }
     }
   }
+
+  for (const existingEmpId of existingEmpsMap.keys()) {
+    if (!activeEmpDocIds.has(existingEmpId)) {
+      wave3Ops.push({
+        kind: 'delete',
+        ref: doc(db, 'workspaces', safeUid, 'employees', existingEmpId),
+        path: `workspaces/${safeUid}/employees/${existingEmpId}`,
+      });
+    }
+  }
+
+  for (const existingUnitId of existingUnitsMap.keys()) {
+    if (!activeUnitDocIds.has(existingUnitId)) {
+      wave3Ops.push({
+        kind: 'delete',
+        ref: doc(db, 'workspaces', safeUid, 'units', existingUnitId),
+        path: `workspaces/${safeUid}/units/${existingUnitId}`,
+      });
+    }
+  }
+
+  await commitBatchWave(wave3Ops);
   return true;
 }
+
+/**
+ * Sincroniza o estado completo do usuário para o Firestore e para o espelho em nuvem por e-mail
+ * com fila sequencial por UID (coalescing) para impedir corridas entre edições rápidas.
+ */
+export async function syncWorkspaceToFirestore(
+  userId: string,
+  rawState: EscalaProState,
+  accountEmail?: string,
+  accountObj?: Partial<UserAccount>
+): Promise<boolean> {
+  if (activeSyncByUid.has(userId)) {
+    pendingSyncByUid.set(userId, { rawState, accountEmail, accountObj });
+    return activeSyncByUid.get(userId)!;
+  }
+
+  const runLoop = async (): Promise<boolean> => {
+    let result = await performSyncWorkspaceToFirestore(
+      userId,
+      rawState,
+      accountEmail,
+      accountObj
+    );
+    while (pendingSyncByUid.has(userId)) {
+      const nextJob = pendingSyncByUid.get(userId)!;
+      pendingSyncByUid.delete(userId);
+      result = await performSyncWorkspaceToFirestore(
+        userId,
+        nextJob.rawState,
+        nextJob.accountEmail,
+        nextJob.accountObj
+      );
+    }
+    return result;
+  };
+
+  const promise = runLoop().finally(() => {
+    activeSyncByUid.delete(userId);
+  });
+  activeSyncByUid.set(userId, promise);
+  return promise;
+}
+

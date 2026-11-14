@@ -25,9 +25,11 @@ import {
   getYearMonthKey,
   parseIsoDateParts,
   reapplyEmployeeHistoryToSchedules,
+  resolveHourBankBalanceBetweenRecords,
   storageService,
 } from './services/storageService';
 import {
+  auth,
   deleteUserAccountFromCloud,
   loadWorkspaceFromFirestore,
   mergeTwoEscalaProStates,
@@ -96,6 +98,18 @@ export default function App() {
   const isPushingRef = useRef<boolean>(false);
   const isHydratingRef = useRef<boolean>(false);
   const hydratedUidRef = useRef<string | null>(null);
+  const hydratedFirestoreUidRef = useRef<string | null>(null);
+  const mutationVersionRef = useRef<number>(0);
+  const syncedVersionRef = useRef<number>(0);
+  const latestStateRef = useRef<EscalaProState>(state);
+  const latestUserRef = useRef<UserAccount | null>(currentUser);
+  latestStateRef.current = state;
+  latestUserRef.current = currentUser;
+
+  const commitUserMutation = (updater: (prev: EscalaProState) => EscalaProState) => {
+    mutationVersionRef.current += 1;
+    setState((prev) => updater(prev));
+  };
 
   const [navContext, setNavContext] = useState<NavigationContext>({
     activePage: 'inicio',
@@ -127,12 +141,81 @@ export default function App() {
 
   const { isInstallable, isInstalled, installApp } = usePWAInstall();
 
+  const normalizeEmpLookup = (name: string) =>
+    String(name || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .trim()
+      .replace(/\s+/g, ' ');
+
+  const preserveHourBankFromSibling = (
+    chosenState: EscalaProState,
+    otherState: EscalaProState
+  ): { state: EscalaProState; preservedAny: boolean } => {
+    if (!otherState.employees || otherState.employees.length === 0) {
+      return { state: chosenState, preservedAny: false };
+    }
+    let preservedAny = false;
+    const byId = new Map(otherState.employees.map((e) => [e.id, e]));
+    const byName = new Map(otherState.employees.map((e) => [normalizeEmpLookup(e.name), e]));
+
+    const nextEmployees = chosenState.employees.map((emp) => {
+      const sibling = byId.get(emp.id) || byName.get(normalizeEmpLookup(emp.name));
+      if (!sibling) return emp;
+      const resolvedBal = resolveHourBankBalanceBetweenRecords(emp, sibling);
+      if (resolvedBal !== (Number(emp.hourBankBalance) || 0)) {
+        preservedAny = true;
+        const existingLogIds = new Set((emp.history || []).map((h) => h.id));
+        const missingHbLogs = (sibling.history || []).filter(
+          (h) =>
+            !existingLogIds.has(h.id) &&
+            (h.type === 'HORA_EXTRA' || h.type === 'BANCO_HORAS' || h.type === 'DECLARACAO_HORAS')
+        );
+        return {
+          ...emp,
+          hourBankBalance: resolvedBal,
+          history: [...missingHbLogs, ...(emp.history || [])],
+        };
+      }
+      return emp;
+    });
+
+    if (!preservedAny) {
+      return { state: chosenState, preservedAny: false };
+    }
+    return {
+      state: deduplicateEscalaProState({
+        ...chosenState,
+        employees: nextEmployees,
+        lastUpdated: new Date().toISOString(),
+      }),
+      preservedAny: true,
+    };
+  };
+
   const hydrateCloudAccount = async (account: UserAccount, forceManualSync = false) => {
-    if (isHydratingRef.current && !forceManualSync && hydratedUidRef.current === account.uid) {
+    const hasFirebaseAuthNow = Boolean(auth.currentUser && auth.currentUser.uid === account.uid);
+
+    if (
+      !forceManualSync &&
+      isHydratingRef.current &&
+      hydratedUidRef.current === account.uid
+    ) {
       return;
     }
+    if (
+      !forceManualSync &&
+      hydratedFirestoreUidRef.current === account.uid
+    ) {
+      return;
+    }
+
     isHydratingRef.current = true;
     hydratedUidRef.current = account.uid;
+    if (hasFirebaseAuthNow) {
+      hydratedFirestoreUidRef.current = account.uid;
+    }
 
     try {
       let localUserState = storageService.loadStateForUser(account);
@@ -162,17 +245,18 @@ export default function App() {
       }
       setCloudSyncStatus('syncing');
 
-      // 1. Consulta primeiro a nuvem para verificar se há dados mais novos vindos de outro aparelho (Celular ou PC)
+      // Consulta primeiro a nuvem (Firestore + espelho) para verificar se há dados mais novos vindos de outro aparelho (Celular ou PC)
       const remoteState = await loadWorkspaceFromFirestore(account.uid, account.email);
 
       if (remoteState) {
-        const localTime = new Date(localUserState.lastUpdated || 0).getTime();
-        const remoteTime = new Date(remoteState.lastUpdated || 0).getTime();
+        const rawLocalTime = new Date(localUserState.lastUpdated || 0).getTime();
+        const rawRemoteTime = new Date(remoteState.lastUpdated || 0).getTime();
+        const localTime = Number.isFinite(rawLocalTime) ? rawLocalTime : 0;
+        const remoteTime = Number.isFinite(rawRemoteTime) ? rawRemoteTime : 0;
         const localEmpCount = localUserState.employees.length;
         const remoteEmpCount = remoteState.employees.length;
 
-        // Se o estado na nuvem foi atualizado mais recentemente (ou se este aparelho está vazio e a nuvem tem dados), adota o estado da nuvem
-        const finalState =
+        const baseWinner =
           localEmpCount === 0 && remoteEmpCount > 0
             ? deduplicateEscalaProState(remoteState)
             : remoteEmpCount === 0 && localEmpCount > 0
@@ -181,6 +265,17 @@ export default function App() {
             ? deduplicateEscalaProState(remoteState)
             : deduplicateEscalaProState(localUserState);
 
+        const losingSide =
+          baseWinner === remoteState || remoteTime > localTime
+            ? localUserState
+            : remoteState;
+        const { state: finalState, preservedAny } = preserveHourBankFromSibling(
+          baseWinner,
+          losingSide
+        );
+
+        // Marca versão sincronizada para impedir push redundante gerado pela própria hidratação
+        syncedVersionRef.current = mutationVersionRef.current;
         storageService.saveStateForUser(account.uid, finalState);
         setState(finalState);
 
@@ -205,12 +300,22 @@ export default function App() {
         storageService.setActiveSessionAccount(mergedAccount);
         setCurrentUser(mergedAccount);
 
-        await syncWorkspaceToFirestore(
-          mergedAccount.uid,
-          finalState,
-          mergedAccount.email,
-          mergedAccount
-        );
+        // Só reenvia para a nuvem se o estado local tinha alterações mais novas, saldos preservados ou sincronização manual
+        const shouldPushUp =
+          forceManualSync ||
+          preservedAny ||
+          localTime > remoteTime ||
+          (remoteEmpCount === 0 && localEmpCount > 0) ||
+          Boolean(orphaned);
+
+        if (shouldPushUp) {
+          await syncWorkspaceToFirestore(
+            mergedAccount.uid,
+            finalState,
+            mergedAccount.email,
+            mergedAccount
+          );
+        }
         setCloudSyncStatus('synced');
       } else if (localUserState.manager.onboardingCompleted) {
         const pushed = await syncWorkspaceToFirestore(
@@ -240,7 +345,7 @@ export default function App() {
     }
   }, []);
 
-  // Escuta autenticação Firebase (Google ou E-mail/Senha) em qualquer dispositivo
+  // Escuta autenticação Firebase (Google ou E-mail/Senha) em qualquer dispositivo e busca Firestore assim que auth estiver pronto
   useEffect(() => {
     const unsubscribe = subscribeToFirebaseAuth(async (fbUser) => {
       if (!fbUser) return;
@@ -282,7 +387,7 @@ export default function App() {
         storageService.setActiveSessionAccount(fbAcc);
         setCurrentUser(fbAcc);
 
-        if (hydratedUidRef.current !== fbUser.uid) {
+        if (hydratedFirestoreUidRef.current !== fbUser.uid) {
           await hydrateCloudAccount(fbAcc);
         }
       }
@@ -290,7 +395,7 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // Salva automaticamente no cache offline do usuário e envia para a nuvem (sem sobrescrever a tela com polling reverso)
+  // Salva automaticamente no cache offline do usuário e envia para a nuvem somente após alterações reais do usuário
   useEffect(() => {
     if (!currentUser) return;
     storageService.saveStateForUser(currentUser.uid, state);
@@ -305,10 +410,12 @@ export default function App() {
     };
     storageService.saveRegisteredAccountMetadata(updatedAccMeta);
 
-    if (!isHydratingRef.current) {
+    if (mutationVersionRef.current > syncedVersionRef.current && !isHydratingRef.current) {
+      const targetVersion = mutationVersionRef.current;
       if (syncTimeoutRef.current) {
         window.clearTimeout(syncTimeoutRef.current);
       }
+      setCloudSyncStatus('syncing');
       isPushingRef.current = true;
       syncTimeoutRef.current = window.setTimeout(() => {
         syncTimeoutRef.current = null;
@@ -317,7 +424,12 @@ export default function App() {
           lastUpdated: state.lastUpdated || new Date().toISOString(),
         };
         syncWorkspaceToFirestore(currentUser.uid, stampedState, currentUser.email, updatedAccMeta)
-          .then((ok) => setCloudSyncStatus(ok ? 'synced' : 'idle'))
+          .then((ok) => {
+            if (ok) {
+              syncedVersionRef.current = Math.max(syncedVersionRef.current, targetVersion);
+            }
+            setCloudSyncStatus(ok ? 'synced' : 'idle');
+          })
           .catch((err) => {
             console.error('Erro ao sincronizar estado com a nuvem:', err);
             setCloudSyncStatus('idle');
@@ -325,9 +437,42 @@ export default function App() {
           .finally(() => {
             isPushingRef.current = false;
           });
-      }, 350);
+      }, 250);
     }
   }, [state, currentUser]);
+
+  // Garante envio imediato ao Firestore caso o usuário feche ou troque de aba logo após alterar saldo/escala
+  useEffect(() => {
+    const flushPendingSync = () => {
+      if (
+        syncTimeoutRef.current &&
+        latestUserRef.current &&
+        mutationVersionRef.current > syncedVersionRef.current
+      ) {
+        window.clearTimeout(syncTimeoutRef.current);
+        syncTimeoutRef.current = null;
+        const user = latestUserRef.current;
+        const st = latestStateRef.current;
+        const targetVersion = mutationVersionRef.current;
+        syncWorkspaceToFirestore(user.uid, st, user.email, user)
+          .then((ok) => {
+            if (ok) syncedVersionRef.current = Math.max(syncedVersionRef.current, targetVersion);
+          })
+          .catch(() => {});
+      }
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        flushPendingSync();
+      }
+    };
+    window.addEventListener('pagehide', flushPendingSync);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      window.removeEventListener('pagehide', flushPendingSync);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, []);
 
   // Monitora status online/offline e cliques em notificações Push do Service Worker
   useEffect(() => {
@@ -373,6 +518,7 @@ export default function App() {
   // Quando o usuário entra ou se cadastra na tela de acesso
   const handleUserAuthenticated = async (account: UserAccount, startWithDemo = false) => {
     hydratedUidRef.current = null;
+    hydratedFirestoreUidRef.current = null;
     setCurrentUser(account);
     if (startWithDemo) {
       const demo = createDemoEscalaProState();
@@ -387,6 +533,7 @@ export default function App() {
           onboardingCompleted: true,
         },
       };
+      mutationVersionRef.current += 1;
       storageService.saveStateForUser(account.uid, customizedDemo);
       setState(customizedDemo);
       return;
@@ -416,6 +563,7 @@ export default function App() {
   // Encerra a sessão atual para permitir entrada ou cadastro de outro usuário
   const handleLogout = async () => {
     hydratedUidRef.current = null;
+    hydratedFirestoreUidRef.current = null;
     isHydratingRef.current = false;
     storageService.setActiveSessionAccount(null);
     setCurrentUser(null);
@@ -433,6 +581,7 @@ export default function App() {
     const uidToDelete = currentUser.uid;
     const emailToDelete = currentUser.email;
     hydratedUidRef.current = null;
+    hydratedFirestoreUidRef.current = null;
     isHydratingRef.current = false;
 
     await deleteUserAccountFromCloud(uidToDelete, emailToDelete);
@@ -444,7 +593,7 @@ export default function App() {
 
   // Conclusão do Onboarding
   const handleCompleteOnboarding = (manager: ManagerProfile, units: HospitalUnit[]) => {
-    setState((prev) => ({
+    commitUserMutation((prev) => ({
       ...prev,
       manager: {
         ...manager,
@@ -458,7 +607,7 @@ export default function App() {
   // Carrega dados hospitalares de demonstração
   const handleLoadDemoData = () => {
     const demo = createDemoEscalaProState();
-    setState((prev) => ({
+    commitUserMutation((prev) => ({
       ...demo,
       manager: {
         ...demo.manager,
@@ -477,7 +626,7 @@ export default function App() {
 
   // Geração automática de escala mensal
   const handleGenerateAutoSchedule = (year: number, monthIndex0: number) => {
-    setState((prev) => {
+    commitUserMutation((prev) => {
       const updatedSchedules = generateAutomaticScheduleForMonth(
         prev.employees,
         prev.schedules,
@@ -507,7 +656,7 @@ export default function App() {
       historyRecord?: AbsenceRecord;
     }
   ) => {
-    setState((prev) => {
+    commitUserMutation((prev) => {
       const ymKey = getYearMonthKey(year, monthIndex0);
       const nextSchedules = { ...prev.schedules };
       const monthMap = { ...(nextSchedules[ymKey] || {}) };
@@ -578,7 +727,7 @@ export default function App() {
     newCustomRole?: string,
     newUnitToCreate?: HospitalUnit
   ) => {
-    setState((prev) => {
+    commitUserMutation((prev) => {
       const existingEmp = prev.employees.find((e) => e.id === emp.id);
       const exists = Boolean(existingEmp);
       const nextEmployees = exists
@@ -624,7 +773,7 @@ export default function App() {
   };
 
   const handleDeleteEmployee = (employeeId: string) => {
-    setState((prev) =>
+    commitUserMutation((prev) =>
       deduplicateEscalaProState({
         ...prev,
         employees: prev.employees.filter((e) => e.id !== employeeId),
@@ -639,7 +788,7 @@ export default function App() {
     record: AbsenceRecord,
     statusToApply: 'F' | 'FA' | 'AT' | 'FE'
   ) => {
-    setState((prev) => {
+    commitUserMutation((prev) => {
       const nextEmployees = prev.employees.map((emp) => {
         if (emp.id !== employeeId) return emp;
         return {
@@ -684,7 +833,7 @@ export default function App() {
     scheduleStatusToApply?: 'F' | 'AT' | 'FA' | 'FE';
     hourBankDelta?: number;
   }) => {
-    setState((prev) => {
+    commitUserMutation((prev) => {
       const nextEmployees = prev.employees.map((emp) => {
         if (emp.id !== params.employeeId) return emp;
         return {
@@ -716,7 +865,7 @@ export default function App() {
 
   // Importa lote de colaboradores do Assistente de Arquivos e gera a escala deles
   const handleImportEmployeesBatch = (newEmployees: Employee[]) => {
-    setState((prev) => {
+    commitUserMutation((prev) => {
       const combined = [...prev.employees, ...newEmployees];
       const now = new Date();
       const updatedSchedules = generateAutomaticScheduleForMonth(
@@ -745,7 +894,7 @@ export default function App() {
       reason: string;
     }[]
   ) => {
-    setState((prev) => {
+    commitUserMutation((prev) => {
       const todayIso = new Date().toISOString().slice(0, 10);
       let nextEmployees = [...prev.employees];
       const newlyCreated: Employee[] = [];
@@ -826,7 +975,7 @@ export default function App() {
     deltaHours: number,
     reason: string
   ) => {
-    setState((prev) => {
+    commitUserMutation((prev) => {
       const todayIso = new Date().toISOString().slice(0, 10);
       const nextEmployees = prev.employees.map((emp) => {
         if (emp.id !== employeeId) return emp;
@@ -859,7 +1008,7 @@ export default function App() {
     manager: ManagerProfile,
     units: HospitalUnit[]
   ) => {
-    setState((prev) => {
+    commitUserMutation((prev) => {
       const validIds = new Set(units.map((u) => u.id));
       const fallbackUnitId = units[0]?.id || 'unit-default-1';
 
@@ -890,7 +1039,7 @@ export default function App() {
   };
 
   const handleUpdatePushConfig = (pushConfig: PushNotificationConfig) => {
-    setState((prev) => ({
+    commitUserMutation((prev) => ({
       ...prev,
       pushConfig,
       lastUpdated: new Date().toISOString(),
@@ -1184,10 +1333,10 @@ export default function App() {
               state={state}
               onImportEmployeesBatch={handleImportEmployeesBatch}
               onRestoreBackupState={(restored) =>
-                setState({
+                commitUserMutation(() => ({
                   ...deduplicateEscalaProState(restored),
                   lastUpdated: new Date().toISOString(),
-                })
+                }))
               }
               onNavigate={updateNav}
             />

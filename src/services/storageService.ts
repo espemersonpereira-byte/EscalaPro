@@ -405,6 +405,45 @@ export function matchEmployeeByName(
   return bestMatch;
 }
 
+const HOUR_BANK_HISTORY_TYPES = new Set(['HORA_EXTRA', 'BANCO_HORAS', 'DECLARACAO_HORAS']);
+
+export function getLatestHourBankTimestamp(emp: Employee): number {
+  let latest = 0;
+  for (const h of emp.history || []) {
+    if (!h) continue;
+    if (
+      HOUR_BANK_HISTORY_TYPES.has(h.type) ||
+      (typeof h.extraHours === 'number' && h.extraHours !== 0)
+    ) {
+      const ts = new Date(h.createdAt || h.startDate || 0).getTime();
+      if (Number.isFinite(ts) && ts > latest) {
+        latest = ts;
+      }
+    }
+  }
+  return latest;
+}
+
+export function resolveHourBankBalanceBetweenRecords(
+  primaryEmp: Employee,
+  secondaryEmp: Employee
+): number {
+  const priBal = Math.round((Number(primaryEmp.hourBankBalance) || 0) * 100) / 100;
+  const secBal = Math.round((Number(secondaryEmp.hourBankBalance) || 0) * 100) / 100;
+  if (priBal === secBal) return priBal;
+
+  const priHbTs = getLatestHourBankTimestamp(primaryEmp);
+  const secHbTs = getLatestHourBankTimestamp(secondaryEmp);
+
+  if (priBal !== 0 && secBal === 0) {
+    return secHbTs > priHbTs ? 0 : priBal;
+  }
+  if (priBal === 0 && secBal !== 0) {
+    return priHbTs > secHbTs ? 0 : secBal;
+  }
+  return secHbTs > priHbTs ? secBal : priBal;
+}
+
 /**
  * Remove automaticamente setores (unidades) e colaboradores duplicados pelo nome,
  * redirecionando vínculos de setor, históricos e células de escala para o registro principal.
@@ -539,7 +578,7 @@ export function deduplicateEscalaProState(state: EscalaProState): EscalaProState
         unitId: winner.unitId || loser.unitId || fallbackUnitId,
         registrationNumber: winner.registrationNumber || loser.registrationNumber || '',
         avatarBase64: winner.avatarBase64 || loser.avatarBase64,
-        hourBankBalance: winner.hourBankBalance || loser.hourBankBalance || 0,
+        hourBankBalance: resolveHourBankBalanceBetweenRecords(winner, loser),
         active: existingEmp.active && cleanEmp.active,
         history: mergedHistory,
       });
@@ -1103,7 +1142,7 @@ export const storageService = {
       const deduped = deduplicateEscalaProState(state);
       const updated: EscalaProState = {
         ...deduped,
-        lastUpdated: new Date().toISOString(),
+        lastUpdated: deduped.lastUpdated || new Date().toISOString(),
       };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
     } catch (e) {
@@ -1124,6 +1163,7 @@ export const storageService = {
       }
 
       // Cria estado inicial exclusivamente com os dados escolhidos pelo usuário no cadastro
+      // Usa timestamp 0 para nunca vencer estados já salvos na nuvem em outros dispositivos
       const initial = createBlankInitialState();
       const userUnits =
         user.units && user.units.length > 0
@@ -1148,7 +1188,7 @@ export const storageService = {
           onboardingCompleted: hasCompleteSetup,
         },
         units: userUnits,
-        lastUpdated: new Date().toISOString(),
+        lastUpdated: new Date(0).toISOString(),
       });
       localStorage.setItem(userKey, JSON.stringify(initializedState));
       return initializedState;
@@ -1163,7 +1203,7 @@ export const storageService = {
       const deduped = deduplicateEscalaProState(state);
       const updated: EscalaProState = {
         ...deduped,
-        lastUpdated: new Date().toISOString(),
+        lastUpdated: deduped.lastUpdated || new Date().toISOString(),
       };
       localStorage.setItem(`${USER_STATE_PREFIX}${userId}`, JSON.stringify(updated));
     } catch (e) {

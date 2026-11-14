@@ -1248,6 +1248,36 @@ function deduplicateWorkspaceOnServer(rawState: Record<string, unknown>): Record
           finalUnits.find((u) => String(u.id) === String(existing.unitId))?.name
         ) !== 'unidade principal';
 
+      const resolveServerHourBank = (
+        priEmp: Record<string, unknown>,
+        secEmp: Record<string, unknown>
+      ): number => {
+        const priBal = Math.round((Number(priEmp.hourBankBalance) || 0) * 100) / 100;
+        const secBal = Math.round((Number(secEmp.hourBankBalance) || 0) * 100) / 100;
+        if (priBal === secBal) return priBal;
+        const getHbTs = (empObj: Record<string, unknown>): number => {
+          const hist = Array.isArray(empObj.history)
+            ? (empObj.history as Array<Record<string, unknown>>)
+            : [];
+          let maxTs = 0;
+          for (const h of hist) {
+            if (!h) continue;
+            const t = String(h.type || '');
+            const eh = Number(h.extraHours || 0);
+            if (t === 'HORA_EXTRA' || t === 'BANCO_HORAS' || t === 'DECLARACAO_HORAS' || eh !== 0) {
+              const ts = new Date(String(h.createdAt || h.startDate || 0)).getTime();
+              if (Number.isFinite(ts) && ts > maxTs) maxTs = ts;
+            }
+          }
+          return maxTs;
+        };
+        const priTs = getHbTs(priEmp);
+        const secTs = getHbTs(secEmp);
+        if (priBal !== 0 && secBal === 0) return secTs > priTs ? 0 : priBal;
+        if (priBal === 0 && secBal !== 0) return priTs > secTs ? 0 : secBal;
+        return secTs > priTs ? secBal : priBal;
+      };
+
       const mergedEmp: Record<string, unknown> = {
         ...existing,
         ...remappedEmp,
@@ -1256,6 +1286,7 @@ function deduplicateWorkspaceOnServer(rawState: Record<string, unknown>): Record
         unitId: existingCustomUnit ? existing.unitId : remappedEmp.unitId,
         registrationNumber: remappedEmp.registrationNumber || existing.registrationNumber || '',
         avatarBase64: remappedEmp.avatarBase64 || existing.avatarBase64 || '',
+        hourBankBalance: resolveServerHourBank(remappedEmp, existing),
         history: Array.from(histMap.values()),
       };
       canonicalEmpByName.set(nameKey, mergedEmp);
@@ -1288,7 +1319,7 @@ function deduplicateWorkspaceOnServer(rawState: Record<string, unknown>): Record
           cleanedSchedules[ym][targetEmpId][dayKey] = remappedCell;
         } else {
           const isSpecial = (st: unknown) =>
-            st === 'F' || st === 'FA' || st === 'AT' || st === 'FE';
+            st === 'F' || st === 'BH' || st === 'FA' || st === 'AT' || st === 'FE' || st === 'TR';
           if (
             (isSpecial(remappedCell.status) && !isSpecial(existingCell.status)) ||
             remappedCell.unitOverrideId ||
@@ -1334,17 +1365,20 @@ function mergeWorkspacesOnServer(
   };
   const inc = deduplicateWorkspaceOnServer(incomingStateRaw) as typeof ex;
 
-  const exTime = new Date(String(ex.lastUpdated || 0)).getTime();
-  const incTime = new Date(String(inc.lastUpdated || 0)).getTime();
+  const rawExTime = new Date(String(ex.lastUpdated || 0)).getTime();
+  const rawIncTime = new Date(String(inc.lastUpdated || 0)).getTime();
+  const exTime = Number.isFinite(rawExTime) ? rawExTime : 0;
+  const incTime = Number.isFinite(rawIncTime) ? rawIncTime : 0;
   const exEmpCount = Array.isArray(ex.employees) ? ex.employees.length : 0;
   const incEmpCount = Array.isArray(inc.employees) ? inc.employees.length : 0;
 
-  // Quando o aparelho envia um push (/api/cloud-sync/push), ele é a ação ativa do usuário.
-  // Só preservamos o servidor se o cliente enviou um estado inicial vazio sem onboarding enquanto o servidor já possui funcionários.
+  // Só aceita o incoming como prioritário se ele estiver populado e for tão recente quanto (ou mais novo que) o servidor
   const preferIncoming =
     exEmpCount > 0 && incEmpCount === 0 && !inc.manager?.onboardingCompleted
       ? false
-      : true;
+      : incEmpCount > 0 && exEmpCount === 0
+      ? true
+      : incTime >= exTime;
 
   const primaryMgr = (preferIncoming ? inc.manager : ex.manager) || {};
   const secondaryMgr = (preferIncoming ? ex.manager : inc.manager) || {};
@@ -1370,7 +1404,7 @@ function mergeWorkspacesOnServer(
     ),
   };
 
-  // Unidades: respeita integralmente a lista enviada pelo aparelho ativo
+  // Unidades: respeita integralmente a lista enviada pelo aparelho mais recente
   const exUnits = Array.isArray(ex.units) ? ex.units : [];
   const incUnits = Array.isArray(inc.units) ? inc.units : [];
   const primaryUnits = preferIncoming ? incUnits : exUnits;
@@ -1391,12 +1425,37 @@ function mergeWorkspacesOnServer(
       ? primaryUnits
       : secondaryUnits;
 
-  // Colaboradores: quando preferIncoming é true, respeita integralmente os dados e saldos de banco de horas enviados pelo aparelho ativo
+  // Colaboradores: respeita o estado mais recente, mas preserva saldos de Banco de Horas não zerados do outro lado caso não haja registro mais novo zerando
   const exEmps = Array.isArray(ex.employees) ? ex.employees : [];
   const incEmps = Array.isArray(inc.employees) ? inc.employees : [];
-  const chosenEmployees = preferIncoming ? incEmps : exEmps;
+  const primaryEmps = preferIncoming ? incEmps : exEmps;
+  const secondaryEmps = preferIncoming ? exEmps : incEmps;
+  const secById = new Map(secondaryEmps.map((e) => [String(e.id || ''), e]));
+  const secByName = new Map(secondaryEmps.map((e) => [normalizeServerKey(e.name), e]));
 
-  // Escalas: quando preferIncoming é true, usa exatamente a escala enviada pelo aparelho ativo para os meses presentes
+  const chosenEmployees = primaryEmps.map((emp) => {
+    const priBal = Math.round((Number(emp.hourBankBalance) || 0) * 100) / 100;
+    if (priBal !== 0) return emp;
+    const sibling = secById.get(String(emp.id || '')) || secByName.get(normalizeServerKey(emp.name));
+    if (!sibling) return emp;
+    const secBal = Math.round((Number(sibling.hourBankBalance) || 0) * 100) / 100;
+    if (secBal === 0) return emp;
+
+    const hasNewerPriHbLog =
+      Array.isArray(emp.history) &&
+      (emp.history as Array<Record<string, unknown>>).some((h) => {
+        const t = String(h?.type || '');
+        return t === 'HORA_EXTRA' || t === 'BANCO_HORAS' || t === 'DECLARACAO_HORAS';
+      });
+    if (hasNewerPriHbLog) return emp;
+
+    return {
+      ...emp,
+      hourBankBalance: secBal,
+    };
+  });
+
+  // Escalas: respeita o lado mais recente
   const exSched = ex.schedules && typeof ex.schedules === 'object' ? ex.schedules : {};
   const incSched = inc.schedules && typeof inc.schedules === 'object' ? inc.schedules : {};
   const mergedSchedules = preferIncoming
@@ -1408,6 +1467,8 @@ function mergeWorkspacesOnServer(
     ...(Array.isArray(inc.customRoles) ? inc.customRoles : []),
   ]);
 
+  const finalTimestamp = Math.max(exTime, incTime);
+
   return deduplicateWorkspaceOnServer({
     ...(preferIncoming ? inc : ex),
     manager: mergedManager,
@@ -1415,7 +1476,7 @@ function mergeWorkspacesOnServer(
     customRoles: Array.from(customRolesSet),
     employees: chosenEmployees,
     schedules: mergedSchedules,
-    lastUpdated: new Date().toISOString(),
+    lastUpdated: new Date(finalTimestamp > 0 ? finalTimestamp : Date.now()).toISOString(),
   });
 }
 
