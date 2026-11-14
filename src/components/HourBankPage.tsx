@@ -874,7 +874,10 @@ export const HourBankPage: React.FC<HourBankPageProps> = ({
 
               const recentHourLogs: AbsenceRecord[] = (emp.history || [])
                 .filter(
-                  (h) => h.type === 'HORA_EXTRA' || h.type === 'DECLARACAO_HORAS'
+                  (h) =>
+                    h.type === 'HORA_EXTRA' ||
+                    h.type === 'DECLARACAO_HORAS' ||
+                    h.type === 'BANCO_HORAS'
                 )
                 .slice(0, 2);
 

@@ -551,7 +551,8 @@ export default function App() {
       // Atualiza histórico e saldo de banco de horas do colaborador
       const nextEmployees = prev.employees.map((emp) => {
         if (emp.id !== employeeId) return emp;
-        const newBalance = emp.hourBankBalance + (extraOptions?.extraHoursDelta || 0);
+        const newBalance =
+          Math.round((emp.hourBankBalance + (extraOptions?.extraHoursDelta || 0)) * 100) / 100;
         const newHistory = extraOptions?.historyRecord
           ? [extraOptions.historyRecord, ...emp.history]
           : emp.history;

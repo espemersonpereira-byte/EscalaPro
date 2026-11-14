@@ -1222,7 +1222,7 @@ export const EmployeeModal: React.FC<EmployeeModalProps> = ({
                 <div className="space-y-2.5">
                   {employee.history.map((rec) => {
                     const badgeStyle =
-                      rec.type === 'FOLGA'
+                      rec.type === 'FOLGA' || rec.type === 'BANCO_HORAS'
                         ? 'bg-emerald-600 text-white'
                         : rec.type === 'FALTA'
                         ? 'bg-red-600 text-white'
@@ -1234,6 +1234,9 @@ export const EmployeeModal: React.FC<EmployeeModalProps> = ({
                         ? 'bg-violet-600 text-white'
                         : 'bg-teal-600 text-white';
 
+                    const badgeLabel =
+                      rec.type === 'BANCO_HORAS' ? 'BANCO DE HORAS (BH)' : rec.type;
+
                     return (
                       <div
                         key={rec.id}
@@ -1244,7 +1247,7 @@ export const EmployeeModal: React.FC<EmployeeModalProps> = ({
                             <span
                               className={`px-2 py-0.5 rounded text-[10px] font-bold ${badgeStyle}`}
                             >
-                              {rec.type}
+                              {badgeLabel}
                             </span>
                             <span className="text-xs font-bold text-slate-900 tabular-nums">
                               Início: {formatDateWithWeekdayPtBr(rec.startDate)} ({rec.daysCount}{' '}

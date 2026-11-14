@@ -570,6 +570,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
               .filter(
                 (item) =>
                   item.status === 'F' ||
+                  item.status === 'BH' ||
                   item.status === 'AT' ||
                   item.status === 'FA' ||
                   item.status === 'FE'
@@ -1077,6 +1078,9 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                           <option value="TR">Permuta (TR)</option>
                           {redirectModal.shiftStatus === 'F' && (
                             <option value="F">Folga (F)</option>
+                          )}
+                          {redirectModal.shiftStatus === 'BH' && (
+                            <option value="BH">Banco de Horas (BH)</option>
                           )}
                         </select>
                       </div>

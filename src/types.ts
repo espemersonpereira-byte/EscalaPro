@@ -6,7 +6,7 @@ export type PageId =
   | 'importar'
   | 'configuracoes';
 
-export type ShiftStatus = 'D' | 'N' | 'F' | 'AT' | 'FA' | 'FE' | 'TR';
+export type ShiftStatus = 'D' | 'N' | 'F' | 'BH' | 'AT' | 'FA' | 'FE' | 'TR';
 
 export type ScheduleRegime = '12x36_ODD' | '12x36_EVEN' | '5x2' | '6x1';
 
@@ -50,7 +50,15 @@ export interface LocalRegisteredAccount extends UserAccount {
 export interface AbsenceRecord {
   id: string;
   employeeId: string;
-  type: 'FOLGA' | 'FALTA' | 'ATESTADO' | 'FERIAS' | 'TROCA' | 'HORA_EXTRA' | 'DECLARACAO_HORAS';
+  type:
+    | 'FOLGA'
+    | 'FALTA'
+    | 'ATESTADO'
+    | 'FERIAS'
+    | 'TROCA'
+    | 'HORA_EXTRA'
+    | 'DECLARACAO_HORAS'
+    | 'BANCO_HORAS';
   startDate: string; // YYYY-MM-DD
   endDate?: string; // YYYY-MM-DD
   nextShiftDate?: string; // YYYY-MM-DD (próximo plantão calculado mediante a escala)
@@ -283,6 +291,14 @@ export const SHIFT_STATUS_META: Record<
     bgClass: 'bg-slate-100',
     textClass: 'text-slate-600',
     borderClass: 'border-slate-200',
+  },
+  BH: {
+    code: 'BH',
+    label: 'Banco de Horas (Folga BH)',
+    shortLabel: 'Banco Horas',
+    bgClass: 'bg-emerald-600',
+    textClass: 'text-white',
+    borderClass: 'border-emerald-700',
   },
   AT: {
     code: 'AT',

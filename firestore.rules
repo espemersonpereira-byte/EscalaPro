@@ -226,7 +226,7 @@ service cloud.firestore {
         isValidId(data.employeeId) &&
         data.day is int && data.day >= 1 && data.day <= 31 &&
         data.status is string && data.status.size() >= 1 && data.status.size() <= 5 &&
-        (data.status == 'D' || data.status == 'N' || data.status == 'F' || data.status == 'AT' || data.status == 'FA' || data.status == 'FE' || data.status == 'TR') &&
+        (data.status == 'D' || data.status == 'N' || data.status == 'F' || data.status == 'BH' || data.status == 'AT' || data.status == 'FA' || data.status == 'FE' || data.status == 'TR') &&
         data.note is string && data.note.size() <= 300 &&
         data.extraHours is number && data.extraHours >= -24 && data.extraHours <= 24 &&
         (!('unitOverrideId' in data) || (data.unitOverrideId is string && data.unitOverrideId.size() <= 128 && (data.unitOverrideId == '' || isValidId(data.unitOverrideId)))) &&

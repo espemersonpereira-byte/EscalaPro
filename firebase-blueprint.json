@@ -346,8 +346,8 @@
         },
         "status": {
           "type": "string",
-          "description": "Código do plantão (D, N, F, AT, FA, FE, TR).",
-          "enum": ["D", "N", "F", "AT", "FA", "FE", "TR"],
+          "description": "Código do plantão (D, N, F, BH, AT, FA, FE, TR).",
+          "enum": ["D", "N", "F", "BH", "AT", "FA", "FE", "TR"],
           "minLength": 1,
           "maxLength": 5
         },

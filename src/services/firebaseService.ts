@@ -553,7 +553,10 @@ export async function loadWorkspaceFromFirestore(
         d.type === 'PERMUTA'
           ? 'TROCA'
           : d.type === 'BANCO_HORAS'
-          ? 'HORA_EXTRA'
+          ? String(d.reason || '').toLowerCase().includes('folga bh') ||
+            String(d.reason || '').toLowerCase().includes('descont')
+            ? 'BANCO_HORAS'
+            : 'HORA_EXTRA'
           : (d.type as AbsenceRecord['type']) || 'ATESTADO';
 
       const rec: AbsenceRecord = {
@@ -624,7 +627,10 @@ export async function loadWorkspaceFromFirestore(
       const cell: ScheduleCellData = {
         status: (d.status as ShiftStatus) || 'D',
         note: d.note ? String(d.note) : undefined,
-        extraHours: d.extraHours ? Number(d.extraHours) : undefined,
+        extraHours:
+          d.extraHours !== undefined && d.extraHours !== null && Number(d.extraHours) !== 0
+            ? Number(d.extraHours)
+            : undefined,
         unitOverrideId: rawUnitOverride.length > 0 ? rawUnitOverride : undefined,
       };
       schedules[ym][empId][dayNum] = cell;
@@ -899,6 +905,7 @@ export async function syncWorkspaceToFirestore(
         const defaultRegimeStatus = computeRegimeShiftForDay(empObj, yNum, m0, dayNum);
         if (
           cell.status !== defaultRegimeStatus ||
+          cell.status === 'BH' ||
           cell.status === 'AT' ||
           cell.status === 'FA' ||
           cell.status === 'FE' ||

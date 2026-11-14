@@ -293,6 +293,10 @@ export function reapplyEmployeeHistoryToSchedules(
           ? 'AT'
           : rec.type === 'FERIAS'
           ? 'FE'
+          : rec.type === 'BANCO_HORAS' &&
+            ((typeof rec.extraHours === 'number' && rec.extraHours < 0) ||
+              rec.reason.toLowerCase().includes('folga bh'))
+          ? 'BH'
           : null;
       if (!statusToApply || !rec.startDate) continue;
 

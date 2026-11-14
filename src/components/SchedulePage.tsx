@@ -89,6 +89,21 @@ const MONTH_SHORT = [
 
 const WEEKDAY_SHORT = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
 
+function inferDefaultShiftHours(emp: Employee): number {
+  const match = emp.workHours?.match(/(\d{1,2}):(\d{2})\s*(?:às|a|-)\s*(\d{1,2}):(\d{2})/i);
+  if (match) {
+    const startMin = Number(match[1]) * 60 + Number(match[2]);
+    let endMin = Number(match[3]) * 60 + Number(match[4]);
+    if (endMin <= startMin) endMin += 24 * 60;
+    const diffHours = Math.round((endMin - startMin) / 60);
+    if (diffHours >= 4 && diffHours <= 24) {
+      if (diffHours === 9 && emp.regime === '5x2') return 8;
+      return diffHours;
+    }
+  }
+  return emp.regime === '12x36_ODD' || emp.regime === '12x36_EVEN' ? 12 : 8;
+}
+
 export const SchedulePage: React.FC<SchedulePageProps> = ({
   state,
   navContext,
@@ -118,6 +133,8 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
   const [swapPartnerId, setSwapPartnerId] = useState<string>('');
   const [swapReturnDate, setSwapReturnDate] = useState<string>('');
   const [extraHoursInput, setExtraHoursInput] = useState<number>(6);
+  const [bhDeductHoursInput, setBhDeductHoursInput] = useState<number>(12);
+  const [hourTabMode, setHourTabMode] = useState<'CREDITO' | 'DESCONTO_BH'>('CREDITO');
 
   // Modal de Radar de Cobertura Mínima (sugere folguistas para cobrir um dia com déficit)
   const [coverageSlotModal, setCoverageSlotModal] = useState<ScheduleCycleSlot | null>(null);
@@ -323,63 +340,129 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
           nextDateObj.getDate()
         )
     );
-    setExtraHoursInput(cell.extraHours || 6);
+    setExtraHoursInput(
+      cell.extraHours && cell.extraHours > 0 ? cell.extraHours : 6
+    );
+    const defaultDeduct =
+      cell.status === 'BH' && cell.extraHours && cell.extraHours < 0
+        ? Math.abs(cell.extraHours)
+        : inferDefaultShiftHours(emp);
+    setBhDeductHoursInput(defaultDeduct);
+    setHourTabMode(cell.status === 'BH' ? 'DESCONTO_BH' : 'CREDITO');
   };
 
   const handleSaveCellAction = (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingCell) return;
 
-    const { employee, slot } = editingCell;
+    const { employee, slot, currentCell } = editingCell;
     const dateIso = slot.isoDate;
+    const prevBhDelta =
+      currentCell.status === 'BH' && (currentCell.extraHours || 0) < 0
+        ? Number(currentCell.extraHours)
+        : 0;
 
     if (modalTab === 'STATUS') {
-      const defaultRegimeStatus = computeRegimeShiftForDay(
-        employee,
-        slot.year,
-        slot.monthIndex0,
-        slot.day
-      );
-      const isManualFolga = cellStatus === 'F' && defaultRegimeStatus !== 'F';
-      const effectiveNote =
-        cellNote.trim() ||
-        `${SHIFT_STATUS_META[cellStatus].label} marcado manualmente na escala (${slot.shortDateLabel})`;
+      if (cellStatus === 'BH') {
+        const deduct = Math.max(
+          0.5,
+          Math.min(24, Number(bhDeductHoursInput) || inferDefaultShiftHours(employee))
+        );
+        const newBhDelta = -deduct;
+        const netDelta = Math.round((newBhDelta - prevBhDelta) * 100) / 100;
+        const effectiveNote =
+          cellNote.trim() ||
+          `Folga BH concedida na escala (-${deduct}h do Banco de Horas em ${slot.shortDateLabel})`;
 
-      const historyRecord: AbsenceRecord | undefined =
-        isManualFolga || cellStatus === 'FA' || cellStatus === 'AT' || cellStatus === 'FE'
+        const shouldCreateHistory =
+          currentCell.status !== 'BH' || prevBhDelta !== newBhDelta;
+
+        const historyRecord: AbsenceRecord | undefined = shouldCreateHistory
           ? {
-              id: `abs-${Date.now()}`,
+              id: `bh-day-${Date.now()}`,
               employeeId: employee.id,
-              type: isManualFolga
-                ? 'FOLGA'
-                : cellStatus === 'FA'
-                ? 'FALTA'
-                : cellStatus === 'AT'
-                ? 'ATESTADO'
-                : 'FERIAS',
+              type: 'BANCO_HORAS',
               startDate: dateIso,
               endDate: dateIso,
               daysCount: 1,
               shift: employee.defaultShift,
-              reason:
-                cellNote.trim() ||
-                `${SHIFT_STATUS_META[cellStatus].label} lançado diretamente na grade da escala (${slot.shortDateLabel}).`,
+              extraHours: newBhDelta,
+              reason: effectiveNote,
               createdAt: new Date().toISOString(),
             }
           : undefined;
 
-      onUpdateScheduleCell(
-        slot.year,
-        slot.monthIndex0,
-        employee.id,
-        slot.day,
-        {
-          status: cellStatus,
-          unitOverrideId: cellUnitId && cellUnitId !== employee.unitId ? cellUnitId : '',
-          note: effectiveNote,
-        },
-        { historyRecord }
-      );
+        onUpdateScheduleCell(
+          slot.year,
+          slot.monthIndex0,
+          employee.id,
+          slot.day,
+          {
+            status: 'BH',
+            extraHours: newBhDelta,
+            unitOverrideId: cellUnitId && cellUnitId !== employee.unitId ? cellUnitId : '',
+            note: effectiveNote,
+          },
+          {
+            extraHoursDelta: netDelta,
+            historyRecord,
+          }
+        );
+      } else {
+        const defaultRegimeStatus = computeRegimeShiftForDay(
+          employee,
+          slot.year,
+          slot.monthIndex0,
+          slot.day
+        );
+        const isManualFolga = cellStatus === 'F' && defaultRegimeStatus !== 'F';
+        const effectiveNote =
+          cellNote.trim() ||
+          `${SHIFT_STATUS_META[cellStatus].label} marcado manualmente na escala (${slot.shortDateLabel})`;
+
+        const historyRecord: AbsenceRecord | undefined =
+          isManualFolga || cellStatus === 'FA' || cellStatus === 'AT' || cellStatus === 'FE'
+            ? {
+                id: `abs-${Date.now()}`,
+                employeeId: employee.id,
+                type: isManualFolga
+                  ? 'FOLGA'
+                  : cellStatus === 'FA'
+                  ? 'FALTA'
+                  : cellStatus === 'AT'
+                  ? 'ATESTADO'
+                  : 'FERIAS',
+                startDate: dateIso,
+                endDate: dateIso,
+                daysCount: 1,
+                shift: employee.defaultShift,
+                reason:
+                  cellNote.trim() ||
+                  `${SHIFT_STATUS_META[cellStatus].label} lançado diretamente na grade da escala (${slot.shortDateLabel}).`,
+                createdAt: new Date().toISOString(),
+              }
+            : undefined;
+
+        // Se o dia estava marcado como BH e foi alterado para outro status, estorna as horas anteriormente descontadas
+        const revertDelta = prevBhDelta < 0 ? Math.round(-prevBhDelta * 100) / 100 : 0;
+
+        onUpdateScheduleCell(
+          slot.year,
+          slot.monthIndex0,
+          employee.id,
+          slot.day,
+          {
+            status: cellStatus,
+            extraHours: 0,
+            unitOverrideId: cellUnitId && cellUnitId !== employee.unitId ? cellUnitId : '',
+            note: effectiveNote,
+          },
+          {
+            extraHoursDelta: revertDelta,
+            historyRecord,
+          }
+        );
+      }
     } else if (modalTab === 'PERMUTA') {
       const partner = state.employees.find((e) => e.id === swapPartnerId);
       if (!partner) return;
@@ -398,6 +481,8 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
         createdAt: new Date().toISOString(),
       };
 
+      const revertDelta = prevBhDelta < 0 ? Math.round(-prevBhDelta * 100) / 100 : 0;
+
       onUpdateScheduleCell(
         slot.year,
         slot.monthIndex0,
@@ -405,6 +490,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
         slot.day,
         {
           status: 'TR',
+          extraHours: 0,
           swapWithEmployeeId: partner.id,
           swapWithEmployeeName: partner.name,
           swapReturnDate,
@@ -413,40 +499,89 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
         {
           swapPartnerId: partner.id,
           swapReturnDate,
+          extraHoursDelta: revertDelta,
           historyRecord,
         }
       );
     } else if (modalTab === 'HORA_EXTRA') {
-      const hours = Number(extraHoursInput) || 0;
-      const historyRecord: AbsenceRecord = {
-        id: `he-${Date.now()}`,
-        employeeId: employee.id,
-        type: 'HORA_EXTRA',
-        startDate: dateIso,
-        daysCount: 1,
-        shift: employee.defaultShift,
-        extraHours: hours,
-        reason:
-          cellNote.trim() || `Dobra / Hora Extra (+${hours}h) creditada no Banco de Horas.`,
-        createdAt: new Date().toISOString(),
-      };
+      if (hourTabMode === 'DESCONTO_BH') {
+        const deduct = Math.max(
+          0.5,
+          Math.min(24, Number(bhDeductHoursInput) || inferDefaultShiftHours(employee))
+        );
+        const newBhDelta = -deduct;
+        const netDelta = Math.round((newBhDelta - prevBhDelta) * 100) / 100;
+        const effectiveNote =
+          cellNote.trim() ||
+          `Folga BH concedida na escala (-${deduct}h do Banco de Horas em ${slot.shortDateLabel})`;
 
-      onUpdateScheduleCell(
-        slot.year,
-        slot.monthIndex0,
-        employee.id,
-        slot.day,
-        {
-          ...editingCell.currentCell,
-          status: employee.defaultShift === 'Noturno' ? 'N' : 'D',
+        const shouldCreateHistory =
+          currentCell.status !== 'BH' || prevBhDelta !== newBhDelta;
+
+        const historyRecord: AbsenceRecord | undefined = shouldCreateHistory
+          ? {
+              id: `bh-day-${Date.now()}`,
+              employeeId: employee.id,
+              type: 'BANCO_HORAS',
+              startDate: dateIso,
+              endDate: dateIso,
+              daysCount: 1,
+              shift: employee.defaultShift,
+              extraHours: newBhDelta,
+              reason: effectiveNote,
+              createdAt: new Date().toISOString(),
+            }
+          : undefined;
+
+        onUpdateScheduleCell(
+          slot.year,
+          slot.monthIndex0,
+          employee.id,
+          slot.day,
+          {
+            status: 'BH',
+            extraHours: newBhDelta,
+            unitOverrideId: cellUnitId && cellUnitId !== employee.unitId ? cellUnitId : '',
+            note: effectiveNote,
+          },
+          {
+            extraHoursDelta: netDelta,
+            historyRecord,
+          }
+        );
+      } else {
+        const hours = Number(extraHoursInput) || 0;
+        const revertDelta = prevBhDelta < 0 ? Math.round(-prevBhDelta * 100) / 100 : 0;
+        const historyRecord: AbsenceRecord = {
+          id: `he-${Date.now()}`,
+          employeeId: employee.id,
+          type: 'HORA_EXTRA',
+          startDate: dateIso,
+          daysCount: 1,
+          shift: employee.defaultShift,
           extraHours: hours,
-          note: `Dobra / +${hours}h no Banco de Horas`,
-        },
-        {
-          extraHoursDelta: hours,
-          historyRecord,
-        }
-      );
+          reason:
+            cellNote.trim() || `Dobra / Hora Extra (+${hours}h) creditada no Banco de Horas.`,
+          createdAt: new Date().toISOString(),
+        };
+
+        onUpdateScheduleCell(
+          slot.year,
+          slot.monthIndex0,
+          employee.id,
+          slot.day,
+          {
+            ...editingCell.currentCell,
+            status: employee.defaultShift === 'Noturno' ? 'N' : 'D',
+            extraHours: hours,
+            note: `Dobra / +${hours}h no Banco de Horas`,
+          },
+          {
+            extraHoursDelta: hours + revertDelta,
+            historyRecord,
+          }
+        );
+      }
     }
 
     setEditingCell(null);
@@ -1227,11 +1362,11 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                     : 'text-slate-600 hover:text-slate-900'
                 }`}
               >
-                Hora Extra / Dobra
+                Hora Extra / Banco
               </button>
             </div>
 
-            <form onSubmit={handleSaveCellAction} className="p-6 space-y-4">
+            <form onSubmit={handleSaveCellAction} className="p-6 space-y-4 max-h-[75vh] overflow-y-auto">
               {modalTab === 'STATUS' && (
                 <>
                   <div>
@@ -1239,7 +1374,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                       Selecione o Status na Escala ({editingCell.slot.shortDateLabel})
                     </label>
                     <div className="grid grid-cols-2 gap-2.5">
-                      {(['D', 'N', 'F', 'FA', 'AT', 'FE'] as ShiftStatus[]).map((st) => {
+                      {(['D', 'N', 'F', 'BH', 'FA', 'AT', 'FE'] as ShiftStatus[]).map((st) => {
                         const meta = SHIFT_STATUS_META[st];
                         const isSelected = cellStatus === st;
                         return (
@@ -1258,7 +1393,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                             >
                               {meta.code}
                             </span>
-                            <span className="text-xs font-bold text-slate-800">
+                            <span className="text-xs font-bold text-slate-800 leading-tight">
                               {meta.label}
                             </span>
                           </button>
@@ -1266,6 +1401,81 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                       })}
                     </div>
                   </div>
+
+                  {cellStatus === 'BH' && (() => {
+                    const prevBhDelta =
+                      editingCell.currentCell.status === 'BH' &&
+                      (editingCell.currentCell.extraHours || 0) < 0
+                        ? Number(editingCell.currentCell.extraHours)
+                        : 0;
+                    const deductVal = Math.max(0.5, Number(bhDeductHoursInput) || 0);
+                    const projectedBalance =
+                      Math.round(
+                        (editingCell.employee.hourBankBalance + (-deductVal - prevBhDelta)) * 100
+                      ) / 100;
+
+                    return (
+                      <div className="p-4 rounded-2xl bg-emerald-50 border border-emerald-200 space-y-3">
+                        <div className="flex items-start gap-2.5 text-xs text-emerald-950">
+                          <Clock className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
+                          <div>
+                            <p className="font-bold">
+                              Folga por Banco de Horas (BH) — Colaborador não vem neste dia
+                            </p>
+                            <p className="text-[11px] text-emerald-800 mt-0.5">
+                              Saldo atual:{' '}
+                              <strong>
+                                {editingCell.employee.hourBankBalance > 0 ? '+' : ''}
+                                {editingCell.employee.hourBankBalance}h
+                              </strong>{' '}
+                              → Saldo após desconto (-{deductVal}h):{' '}
+                              <strong
+                                className={
+                                  projectedBalance < 0 ? 'text-red-700' : 'text-emerald-900'
+                                }
+                              >
+                                {projectedBalance > 0 ? '+' : ''}
+                                {projectedBalance}h
+                              </strong>
+                            </p>
+                          </div>
+                        </div>
+
+                        <div>
+                          <label className="block text-xs font-bold text-emerald-900 mb-1.5">
+                            Horas a descontar do Banco de Horas (-)
+                          </label>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <input
+                              type="number"
+                              min={0.5}
+                              max={24}
+                              step={0.5}
+                              value={bhDeductHoursInput}
+                              onChange={(e) => setBhDeductHoursInput(Number(e.target.value))}
+                              className="w-28 px-3 py-2 rounded-xl border border-emerald-300 bg-white text-base font-bold text-slate-900 tabular-nums"
+                            />
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              {[4, 6, 8, 12].map((preset) => (
+                                <button
+                                  key={preset}
+                                  type="button"
+                                  onClick={() => setBhDeductHoursInput(preset)}
+                                  className={`px-2.5 py-1.5 rounded-lg text-xs font-bold border cursor-pointer ${
+                                    bhDeductHoursInput === preset
+                                      ? 'bg-emerald-600 text-white border-emerald-700'
+                                      : 'bg-white text-emerald-900 border-emerald-200 hover:bg-emerald-100'
+                                  }`}
+                                >
+                                  -{preset}h
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })()}
 
                   {state.units.length > 1 && (
                     <div>
@@ -1347,42 +1557,130 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
 
               {modalTab === 'HORA_EXTRA' && (
                 <div className="space-y-4">
-                  <div className="p-3.5 rounded-xl bg-teal-50 border border-teal-200 text-xs text-teal-900 flex items-start gap-2.5">
-                    <Clock className="w-4 h-4 text-teal-700 shrink-0 mt-0.5" />
-                    <span>
-                      As horas extras ou dobras registradas aqui são somadas automaticamente ao{' '}
-                      <strong>Banco de Horas</strong> de {editingCell.employee.name} (Saldo
-                      atual: {editingCell.employee.hourBankBalance >= 0 ? '+' : ''}
-                      {editingCell.employee.hourBankBalance}h).
-                    </span>
+                  <div className="grid grid-cols-2 gap-2 p-1 rounded-xl bg-slate-100 border border-slate-200">
+                    <button
+                      type="button"
+                      onClick={() => setHourTabMode('CREDITO')}
+                      className={`py-2 px-3 rounded-lg text-xs font-bold transition-colors cursor-pointer ${
+                        hourTabMode === 'CREDITO'
+                          ? 'bg-teal-600 text-white shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      + Hora Extra / Dobra
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setHourTabMode('DESCONTO_BH')}
+                      className={`py-2 px-3 rounded-lg text-xs font-bold transition-colors cursor-pointer ${
+                        hourTabMode === 'DESCONTO_BH'
+                          ? 'bg-emerald-600 text-white shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      - Conceder Folga (BH)
+                    </button>
                   </div>
 
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">
-                      Quantidade de Horas Extras a Somar (+)
-                    </label>
-                    <input
-                      type="number"
-                      min={1}
-                      max={24}
-                      value={extraHoursInput}
-                      onChange={(e) => setExtraHoursInput(Number(e.target.value))}
-                      className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900 tabular-nums"
-                    />
-                  </div>
+                  {hourTabMode === 'CREDITO' ? (
+                    <>
+                      <div className="p-3.5 rounded-xl bg-teal-50 border border-teal-200 text-xs text-teal-900 flex items-start gap-2.5">
+                        <Clock className="w-4 h-4 text-teal-700 shrink-0 mt-0.5" />
+                        <span>
+                          As horas extras ou dobras registradas aqui são somadas automaticamente ao{' '}
+                          <strong>Banco de Horas</strong> de {editingCell.employee.name} (Saldo
+                          atual: {editingCell.employee.hourBankBalance >= 0 ? '+' : ''}
+                          {editingCell.employee.hourBankBalance}h).
+                        </span>
+                      </div>
 
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">
-                      Motivo da Dobra / Hora Extra
-                    </label>
-                    <input
-                      type="text"
-                      value={cellNote}
-                      onChange={(e) => setCellNote(e.target.value)}
-                      placeholder="Ex: Dobra para cobrir atestado na unidade"
-                      className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900"
-                    />
-                  </div>
+                      <div>
+                        <label className="block text-xs font-bold text-slate-700 mb-1">
+                          Quantidade de Horas Extras a Somar (+)
+                        </label>
+                        <input
+                          type="number"
+                          min={0.5}
+                          max={24}
+                          step={0.5}
+                          value={extraHoursInput}
+                          onChange={(e) => setExtraHoursInput(Number(e.target.value))}
+                          className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900 tabular-nums"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-bold text-slate-700 mb-1">
+                          Motivo da Dobra / Hora Extra
+                        </label>
+                        <input
+                          type="text"
+                          value={cellNote}
+                          onChange={(e) => setCellNote(e.target.value)}
+                          placeholder="Ex: Dobra para cobrir atestado na unidade"
+                          className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900"
+                        />
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-950 flex items-start gap-2.5">
+                        <Clock className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
+                        <span>
+                          Marca o dia na escala como <strong>BH (Banco de Horas)</strong> indicando que o colaborador foi dispensado e desconta automaticamente do saldo (Saldo atual:{' '}
+                          <strong>
+                            {editingCell.employee.hourBankBalance >= 0 ? '+' : ''}
+                            {editingCell.employee.hourBankBalance}h
+                          </strong>
+                          ).
+                        </span>
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-bold text-slate-700 mb-1.5">
+                          Horas a Descontar do Banco de Horas (-)
+                        </label>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <input
+                            type="number"
+                            min={0.5}
+                            max={24}
+                            step={0.5}
+                            value={bhDeductHoursInput}
+                            onChange={(e) => setBhDeductHoursInput(Number(e.target.value))}
+                            className="w-28 px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base font-bold text-slate-900 tabular-nums"
+                          />
+                          {[4, 6, 8, 12].map((preset) => (
+                            <button
+                              key={preset}
+                              type="button"
+                              onClick={() => setBhDeductHoursInput(preset)}
+                              className={`px-3 py-2 rounded-xl text-xs font-bold border cursor-pointer ${
+                                bhDeductHoursInput === preset
+                                  ? 'bg-emerald-600 text-white border-emerald-700'
+                                  : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                              }`}
+                            >
+                              -{preset}h
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-bold text-slate-700 mb-1">
+                          Observação (opcional)
+                        </label>
+                        <input
+                          type="text"
+                          value={cellNote}
+                          onChange={(e) => setCellNote(e.target.value)}
+                          placeholder="Ex: Folga BH concedida pela supervisão"
+                          className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900"
+                        />
+                      </div>
+                    </>
+                  )}
                 </div>
               )}
 
