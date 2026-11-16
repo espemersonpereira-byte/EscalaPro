@@ -192,6 +192,19 @@ export interface ExtractedHourBankEntry {
   notes?: string;
 }
 
+export interface ExtractedScheduleRow {
+  name: string;
+  roleHint?: string;
+  unitHint?: string;
+  shiftHint?: 'Diurno' | 'Noturno';
+  workHoursHint?: string;
+  scheduleRegimeHint?: ScheduleRegime;
+  registrationNumber?: string;
+  notes?: string;
+  /** Mapa de chave do slot (ex: "16/11", "01/12", "2026-11-16", "1:16", "2:1" ou "16") para ShiftStatus */
+  dayShifts: Record<string, ShiftStatus>;
+}
+
 export const PRE_REGISTERED_MANAGER_ROLES: string[] = [
   'Supervisor de Farmácia',
   'Supervisor de Almoxarifado e Recebimento',

@@ -14,6 +14,8 @@ import {
   PageId,
   PushNotificationConfig,
   ScheduleCellData,
+  ScheduleRegime,
+  ShiftStatus,
   UserAccount,
   MonthlyScheduleMap,
 } from './types';
@@ -884,6 +886,86 @@ export default function App() {
     });
   };
 
+  // Aplica escala importada diretamente na página de Escalas (copiando dia a dia cada plantão/folga do arquivo)
+  const handleApplyImportedSchedule = (
+    items: {
+      employeeId?: string;
+      newEmployee?: Employee;
+      updatedRegime?: ScheduleRegime;
+      updatedShift?: 'Diurno' | 'Noturno';
+      updatedWorkHours?: string;
+      hourBankDelta?: number;
+      cells: { ymKey: string; day: number; status: ShiftStatus; note?: string }[];
+    }[]
+  ) => {
+    commitUserMutation((prev) => {
+      let nextEmployees = [...prev.employees];
+      const nextSchedules: MonthlyScheduleMap = { ...prev.schedules };
+
+      // Clona profundamente os meses que serão afetados
+      const touchedMonths = new Set<string>();
+      for (const item of items) {
+        for (const c of item.cells) {
+          touchedMonths.add(c.ymKey);
+        }
+      }
+      for (const ym of touchedMonths) {
+        nextSchedules[ym] = { ...(nextSchedules[ym] || {}) };
+      }
+
+      for (const item of items) {
+        let targetEmpId = item.employeeId || '';
+
+        if (targetEmpId) {
+          nextEmployees = nextEmployees.map((emp) => {
+            if (emp.id !== targetEmpId) return emp;
+            const currentBal = Number(emp.hourBankBalance) || 0;
+            const delta = Number(item.hourBankDelta) || 0;
+            return {
+              ...emp,
+              regime: item.updatedRegime || emp.regime,
+              defaultShift: item.updatedShift || emp.defaultShift,
+              workHours: item.updatedWorkHours || emp.workHours,
+              hourBankBalance: Math.round((currentBal + delta) * 100) / 100,
+            };
+          });
+        } else if (item.newEmployee) {
+          targetEmpId = item.newEmployee.id;
+          nextEmployees.push(item.newEmployee);
+        }
+
+        if (!targetEmpId) continue;
+
+        for (const cell of item.cells) {
+          if (!nextSchedules[cell.ymKey]) {
+            nextSchedules[cell.ymKey] = {};
+          }
+          if (!nextSchedules[cell.ymKey][targetEmpId]) {
+            nextSchedules[cell.ymKey][targetEmpId] = {};
+          } else {
+            nextSchedules[cell.ymKey][targetEmpId] = {
+              ...nextSchedules[cell.ymKey][targetEmpId],
+            };
+          }
+
+          const existingCell = nextSchedules[cell.ymKey][targetEmpId][cell.day];
+          nextSchedules[cell.ymKey][targetEmpId][cell.day] = {
+            ...(existingCell || {}),
+            status: cell.status,
+            note: cell.note || existingCell?.note || 'Importado da escala',
+          };
+        }
+      }
+
+      return deduplicateEscalaProState({
+        ...prev,
+        employees: nextEmployees,
+        schedules: nextSchedules,
+        lastUpdated: new Date().toISOString(),
+      });
+    });
+  };
+
   // Aplica lote de saldos do Importador Inteligente de Banco de Horas (vinculando pelo nome aos colaboradores existentes)
   const handleApplyHourBankBatch = (
     updates: {
@@ -1298,6 +1380,7 @@ export default function App() {
               onUpdateNav={updateNav}
               onGenerateAutoSchedule={handleGenerateAutoSchedule}
               onUpdateScheduleCell={handleUpdateScheduleCell}
+              onApplyImportedSchedule={handleApplyImportedSchedule}
               onOpenEmployeeModal={(empId) => {
                 setNewEmployeeUnitId(null);
                 setModalEmployeeTarget(empId);

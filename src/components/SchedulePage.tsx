@@ -3,12 +3,14 @@ import {
   AbsenceRecord,
   Employee,
   EscalaProState,
+  ExtractedScheduleRow,
   NATIVE_HOSPITAL_ROLES,
   NavigationContext,
   REGIME_LABELS,
   ScheduleCellData,
   ScheduleCycleSlot,
   SchedulePeriodViewMode,
+  ScheduleRegime,
   SHIFT_STATUS_META,
   ShiftStatus,
 } from '../types';
@@ -19,8 +21,10 @@ import {
   getDaysInMonth,
   getNextYearMonth,
   getYearMonthKey,
+  matchEmployeeByName,
 } from '../services/storageService';
 import {
+  AlertCircle,
   ArrowLeftRight,
   Calendar,
   Check,
@@ -29,12 +33,29 @@ import {
   Clock,
   Copy,
   Download,
+  FileUp,
   Filter,
+  Loader2,
   Printer,
   Sparkles,
   UserPlus,
   X,
 } from 'lucide-react';
+
+interface ScheduleImportCandidate {
+  id: string;
+  selected: boolean;
+  rawName: string;
+  matchedEmployeeId: string; // ID de colaborador existente ou '__CREATE_NEW__'
+  role: string;
+  unitId: string;
+  shift: 'Diurno' | 'Noturno';
+  regime: ScheduleRegime;
+  workHours: string;
+  dayShifts: Record<string, ShiftStatus>; // Chave: shortDateLabel ("16/11", "01/12", etc.)
+}
+
+const VALID_IMPORT_SHIFT_ORDER: ShiftStatus[] = ['D', 'N', 'F', 'BH', 'FE', 'AT', 'FA', 'TR'];
 
 interface SchedulePageProps {
   state: EscalaProState;
@@ -53,6 +74,17 @@ interface SchedulePageProps {
       extraHoursDelta?: number;
       historyRecord?: AbsenceRecord;
     }
+  ) => void;
+  onApplyImportedSchedule: (
+    items: {
+      employeeId?: string;
+      newEmployee?: Employee;
+      updatedRegime?: ScheduleRegime;
+      updatedShift?: 'Diurno' | 'Noturno';
+      updatedWorkHours?: string;
+      hourBankDelta?: number;
+      cells: { ymKey: string; day: number; status: ShiftStatus; note?: string }[];
+    }[]
   ) => void;
   onOpenEmployeeModal: (employeeId: string) => void;
 }
@@ -110,6 +142,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
   onUpdateNav,
   onGenerateAutoSchedule,
   onUpdateScheduleCell,
+  onApplyImportedSchedule,
   onOpenEmployeeModal,
 }) => {
   const now = new Date();
@@ -139,6 +172,14 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
   // Modal de Radar de Cobertura Mínima (sugere folguistas para cobrir um dia com déficit)
   const [coverageSlotModal, setCoverageSlotModal] = useState<ScheduleCycleSlot | null>(null);
 
+  // Modal de Importação Direta de Escala (Arquivo Excel, Word, PDF ou Foto)
+  const [isImportModalOpen, setIsImportModalOpen] = useState<boolean>(false);
+  const [isAnalyzingScheduleFile, setIsAnalyzingScheduleFile] = useState<boolean>(false);
+  const [importError, setImportError] = useState<string | null>(null);
+  const [importedFileName, setImportedFileName] = useState<string | null>(null);
+  const [importCandidates, setImportCandidates] = useState<ScheduleImportCandidate[]>([]);
+  const [deductBhOnImport, setDeductBhOnImport] = useState<boolean>(false);
+
   // Feedback de cópia do resumo para WhatsApp
   const [whatsappFeedback, setWhatsappFeedback] = useState<string | null>(null);
   const [autoGenBanner, setAutoGenBanner] = useState<string | null>(null);
@@ -159,6 +200,12 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
   const allCycleSlots = useMemo(
     () => buildFortnightCycleSlots(selectedYear, selectedMonth0, periodViewMode),
     [selectedYear, selectedMonth0, periodViewMode]
+  );
+
+  // Todos os slots da quinzena completa (16..fim + 01..15) para importação de arquivo completo
+  const fullFortnightSlots = useMemo(
+    () => buildFortnightCycleSlots(selectedYear, selectedMonth0, 'CYCLE_16_15_FULL'),
+    [selectedYear, selectedMonth0]
   );
 
   const allRoles = useMemo(() => {
@@ -815,6 +862,18 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
 
           {/* Botões de Ação Principal */}
           <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                setImportError(null);
+                setIsImportModalOpen(true);
+              }}
+              className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold transition-colors cursor-pointer whitespace-nowrap shadow-xs"
+            >
+              <FileUp className="w-4 h-4" />
+              <span>Importar Escala</span>
+            </button>
+
             <button
               type="button"
               onClick={() => {
@@ -1810,6 +1869,566 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                   </div>
                 );
               })()}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL DE IMPORTAÇÃO DIRETA DE ESCALA (COPIA A ESCALA DO ARQUIVO PARA O APLICATIVO) */}
+      {isImportModalOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-3 md:p-6 overflow-y-auto">
+          <div className="bg-white rounded-3xl max-w-6xl w-full border border-slate-200 shadow-2xl overflow-hidden my-auto flex flex-col max-h-[92vh]">
+            {/* Cabeçalho do Modal */}
+            <div className="bg-[#0f172a] text-white px-5 py-4 flex items-center justify-between gap-3 shrink-0">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-indigo-500/20 border border-indigo-400/30 flex items-center justify-center text-indigo-300 shrink-0">
+                  <FileUp className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm md:text-base font-bold">
+                    Importar Escala Pronta para o Aplicativo
+                  </h3>
+                  <p className="text-xs text-slate-300">
+                    Envie sua planilha Excel, Word, PDF ou Foto da escala e o sistema copiará os plantões e folgas dia a dia para{' '}
+                    <strong className="text-teal-300">
+                      {MONTH_NAMES[selectedMonth0]} / {MONTH_NAMES[nextYm.monthIndex0]} ({fullCycleRangeLabel})
+                    </strong>
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsImportModalOpen(false)}
+                className="p-2 rounded-xl bg-slate-800 text-slate-300 hover:text-white cursor-pointer shrink-0"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Corpo do Modal */}
+            <div className="p-5 overflow-y-auto space-y-5 flex-1">
+              {/* Seletor de Ciclo Quinzenal de Destino + Upload de Arquivo */}
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
+                <div className="lg:col-span-5 bg-slate-50 rounded-2xl border border-slate-200 p-4 flex flex-col justify-between space-y-3">
+                  <div>
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500 block">
+                      1. Quinzena de Destino no Sistema
+                    </span>
+                    <p className="text-xs text-slate-600 mt-0.5">
+                      Confirme em qual ciclo quinzenal (16 a 15) a escala do arquivo será aplicada:
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <select
+                      value={selectedMonth0}
+                      onChange={(e) => setSelectedMonth0(Number(e.target.value))}
+                      className="flex-1 bg-white border border-slate-300 rounded-xl px-3 py-2 text-base font-bold text-slate-900 cursor-pointer"
+                    >
+                      {MONTH_NAMES.map((mName, idx) => {
+                        const nxtIdx = (idx + 1) % 12;
+                        return (
+                          <option key={mName} value={idx}>
+                            {mName} / {MONTH_NAMES[nxtIdx]} (16/{MONTH_SHORT[idx]} a 15/
+                            {MONTH_SHORT[nxtIdx]})
+                          </option>
+                        );
+                      })}
+                    </select>
+
+                    <select
+                      value={selectedYear}
+                      onChange={(e) => setSelectedYear(Number(e.target.value))}
+                      className="bg-white border border-slate-300 rounded-xl px-3 py-2 text-base font-bold text-slate-900 cursor-pointer"
+                    >
+                      {availableYears.map((yr) => (
+                        <option key={yr} value={yr}>
+                          {yr}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="text-[11px] text-slate-500 bg-white rounded-xl p-2.5 border border-slate-200">
+                    O sistema identifica automaticamente os nomes dos seus colaboradores já cadastrados (preservando o saldo de Banco de Horas) e copia cada dia da sua escala exatamente como está no arquivo.
+                  </div>
+                </div>
+
+                {/* Área de Upload do Arquivo da Escala */}
+                <div className="lg:col-span-7">
+                  <label className="h-full min-h-[150px] border-2 border-dashed border-indigo-300 hover:border-indigo-500 bg-indigo-50/40 hover:bg-indigo-50/80 transition-colors rounded-2xl p-5 flex flex-col items-center justify-center text-center cursor-pointer">
+                    <input
+                      type="file"
+                      accept=".xlsx,.xls,.csv,.ods,.docx,.doc,.pdf,image/*"
+                      className="hidden"
+                      disabled={isAnalyzingScheduleFile}
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        e.target.value = '';
+                        if (!file) return;
+
+                        setImportError(null);
+                        setImportedFileName(file.name);
+                        setIsAnalyzingScheduleFile(true);
+
+                        try {
+                          const base64File = await new Promise<string>((resolve, reject) => {
+                            const reader = new FileReader();
+                            reader.onload = () => {
+                              const res = String(reader.result || '');
+                              const commaIdx = res.indexOf(',');
+                              resolve(commaIdx >= 0 ? res.slice(commaIdx + 1) : res);
+                            };
+                            reader.onerror = () => reject(new Error('Falha ao ler arquivo local.'));
+                            reader.readAsDataURL(file);
+                          });
+
+                          const response = await fetch('/api/extract-schedule', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                              base64File,
+                              fileName: file.name,
+                              mimeType: file.type || 'application/octet-stream',
+                              cycleSlots: fullFortnightSlots.map((s) => ({
+                                ymKey: s.ymKey,
+                                day: s.day,
+                                shortDateLabel: s.shortDateLabel,
+                              })),
+                              availableUnits: state.units.map((u) => u.name),
+                              availableRoles: allRoles,
+                            }),
+                          });
+
+                          const data = await response.json();
+                          if (!response.ok) {
+                            throw new Error(
+                              data?.error || 'Não foi possível extrair a escala deste arquivo.'
+                            );
+                          }
+
+                          const extractedRows: ExtractedScheduleRow[] = Array.isArray(data?.rows)
+                            ? data.rows
+                            : [];
+
+                          if (extractedRows.length === 0) {
+                            throw new Error(
+                              'Nenhum colaborador ou linha de escala foi encontrado no arquivo enviado.'
+                            );
+                          }
+
+                          const defaultUnitId =
+                            navContext.selectedUnitFilter !== 'TODAS'
+                              ? navContext.selectedUnitFilter
+                              : state.units[0]?.id || 'unit-default-1';
+
+                          const mappedCandidates: ScheduleImportCandidate[] = extractedRows.map(
+                            (row, idx) => {
+                              const matchedEmp = matchEmployeeByName(row.name, state.employees);
+                              const matchedUnit = row.unitHint
+                                ? state.units.find(
+                                    (u) =>
+                                      u.name.trim().toLowerCase() ===
+                                        row.unitHint!.trim().toLowerCase() ||
+                                      u.name
+                                        .trim()
+                                        .toLowerCase()
+                                        .includes(row.unitHint!.trim().toLowerCase())
+                                  )
+                                : undefined;
+
+                              const shift: 'Diurno' | 'Noturno' =
+                                row.shiftHint === 'Noturno'
+                                  ? 'Noturno'
+                                  : row.shiftHint === 'Diurno'
+                                  ? 'Diurno'
+                                  : matchedEmp?.defaultShift || 'Diurno';
+
+                              const regime: ScheduleRegime =
+                                (row.scheduleRegimeHint as ScheduleRegime) ||
+                                matchedEmp?.regime ||
+                                '12x36_ODD';
+
+                              const tempEmpForFallback: Employee = matchedEmp || {
+                                id: `temp-${idx}`,
+                                name: row.name,
+                                role: row.roleHint || allRoles[0] || 'Técnico de Enfermagem',
+                                registrationNumber: row.registrationNumber || '',
+                                unitId: matchedUnit?.id || defaultUnitId,
+                                regime,
+                                defaultShift: shift,
+                                workHours:
+                                  row.workHoursHint ||
+                                  (shift === 'Noturno' ? '19:00 às 07:00' : '07:00 às 19:00'),
+                                hourBankBalance: 0,
+                                active: true,
+                                history: [],
+                              };
+
+                              const resolvedDayShifts: Record<string, ShiftStatus> = {};
+                              const rawDayMap = row.dayShifts || {};
+
+                              for (const slot of fullFortnightSlots) {
+                                const dayPadded = String(slot.day).padStart(2, '0');
+                                const directStatus =
+                                  rawDayMap[slot.shortDateLabel] ||
+                                  rawDayMap[String(slot.day)] ||
+                                  rawDayMap[dayPadded];
+
+                                if (
+                                  directStatus &&
+                                  VALID_IMPORT_SHIFT_ORDER.includes(directStatus as ShiftStatus)
+                                ) {
+                                  resolvedDayShifts[slot.shortDateLabel] =
+                                    directStatus as ShiftStatus;
+                                } else {
+                                  resolvedDayShifts[slot.shortDateLabel] =
+                                    computeRegimeShiftForDay(
+                                      tempEmpForFallback,
+                                      slot.year,
+                                      slot.monthIndex0,
+                                      slot.day
+                                    );
+                                }
+                              }
+
+                              return {
+                                id: `sched-imp-${Date.now()}-${idx}`,
+                                selected: true,
+                                rawName: row.name,
+                                matchedEmployeeId: matchedEmp ? matchedEmp.id : '__CREATE_NEW__',
+                                role:
+                                  matchedEmp?.role ||
+                                  row.roleHint ||
+                                  allRoles[0] ||
+                                  'Técnico de Enfermagem',
+                                unitId: matchedEmp?.unitId || matchedUnit?.id || defaultUnitId,
+                                shift,
+                                regime,
+                                workHours:
+                                  matchedEmp?.workHours ||
+                                  row.workHoursHint ||
+                                  (shift === 'Noturno' ? '19:00 às 07:00' : '07:00 às 19:00'),
+                                dayShifts: resolvedDayShifts,
+                              };
+                            }
+                          );
+
+                          setImportCandidates(mappedCandidates);
+                        } catch (err: any) {
+                          setImportError(
+                            err?.message || 'Erro ao processar o arquivo de escala.'
+                          );
+                        } finally {
+                          setIsAnalyzingScheduleFile(false);
+                        }
+                      }}
+                    />
+
+                    {isAnalyzingScheduleFile ? (
+                      <div className="flex flex-col items-center gap-2 py-3">
+                        <Loader2 className="w-8 h-8 text-indigo-600 animate-spin" />
+                        <p className="text-sm font-bold text-indigo-950">
+                          Lendo e copiando sua escala ({importedFileName})...
+                        </p>
+                        <p className="text-xs text-slate-600">
+                          Identificando colaboradores e os plantões/folgas de cada dia (16 a 15)
+                        </p>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="w-11 h-11 rounded-2xl bg-indigo-600 text-white flex items-center justify-center mb-2 shadow-xs">
+                          <FileUp className="w-5 h-5" />
+                        </div>
+                        <p className="text-sm font-bold text-slate-900">
+                          {importedFileName
+                            ? `Arquivo carregado: ${importedFileName} (Clique para trocar)`
+                            : '2. Clique aqui para escolher o arquivo da sua Escala'}
+                        </p>
+                        <p className="text-xs text-slate-600 mt-1">
+                          Suporta Planilhas Excel (<strong>.xlsx, .xls, .csv</strong>), Word (
+                          <strong>.docx</strong>), <strong>PDF</strong> ou <strong>Foto da Escala</strong>
+                        </p>
+                      </>
+                    )}
+                  </label>
+                </div>
+              </div>
+
+              {importError && (
+                <div className="p-4 rounded-2xl bg-red-50 border border-red-200 text-red-900 text-xs font-semibold flex items-center gap-2.5">
+                  <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+                  <span>{importError}</span>
+                </div>
+              )}
+
+              {/* Pré-visualização Interativa da Escala Extraída */}
+              {importCandidates.length > 0 && (
+                <div className="space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-indigo-50/70 border border-indigo-200 rounded-2xl p-3.5">
+                    <div>
+                      <p className="text-xs font-bold text-indigo-950">
+                        Escala identificada com {importCandidates.length} colaborador(es)!
+                      </p>
+                      <p className="text-[11px] text-slate-600">
+                        Confira abaixo os dias extraídos. Você pode clicar em qualquer dia na tabela abaixo para ajustar o status (D, N, F, BH, FE, AT, FA) antes de aplicar.
+                      </p>
+                    </div>
+
+                    <label className="inline-flex items-center gap-2 text-xs font-semibold text-slate-800 bg-white px-3 py-2 rounded-xl border border-slate-200 cursor-pointer shrink-0">
+                      <input
+                        type="checkbox"
+                        checked={deductBhOnImport}
+                        onChange={(e) => setDeductBhOnImport(e.target.checked)}
+                        className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                      />
+                      <span>Descontar dias com "BH" do saldo do Banco de Horas</span>
+                    </label>
+                  </div>
+
+                  <div className="border border-slate-200 rounded-2xl overflow-x-auto max-h-[380px]">
+                    <table className="w-full border-collapse text-left">
+                      <thead className="sticky top-0 z-20 bg-slate-900 text-white text-[11px]">
+                        <tr>
+                          <th className="p-2.5 border-r border-slate-800 w-9 text-center">
+                            <input
+                              type="checkbox"
+                              checked={importCandidates.every((c) => c.selected)}
+                              onChange={(e) => {
+                                const checked = e.target.checked;
+                                setImportCandidates((prev) =>
+                                  prev.map((c) => ({ ...c, selected: checked }))
+                                );
+                              }}
+                              className="rounded border-slate-600"
+                            />
+                          </th>
+                          <th className="p-2.5 border-r border-slate-800 min-w-[230px]">
+                            Colaborador no Arquivo / Vínculo no Sistema
+                          </th>
+                          {fullFortnightSlots.map((slot) => (
+                            <th
+                              key={slot.isoDate}
+                              className={`px-1.5 py-2 text-center border-r border-slate-800 min-w-[34px] ${
+                                slot.fortnightPart === 1 ? 'bg-slate-900' : 'bg-teal-950'
+                              }`}
+                              title={`${slot.shortDateLabel}/${slot.year}`}
+                            >
+                              <div className="font-bold text-[11px] leading-none">
+                                {String(slot.day).padStart(2, '0')}
+                              </div>
+                              <div className="text-[9px] text-slate-400 mt-0.5">
+                                {WEEKDAY_SHORT[new Date(slot.year, slot.monthIndex0, slot.day).getDay()]}
+                              </div>
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-200 text-xs bg-white">
+                        {importCandidates.map((cand) => (
+                          <tr
+                            key={cand.id}
+                            className={!cand.selected ? 'opacity-45 bg-slate-50' : 'hover:bg-slate-50/80'}
+                          >
+                            <td className="p-2 border-r border-slate-200 text-center">
+                              <input
+                                type="checkbox"
+                                checked={cand.selected}
+                                onChange={(e) => {
+                                  const checked = e.target.checked;
+                                  setImportCandidates((prev) =>
+                                    prev.map((item) =>
+                                      item.id === cand.id ? { ...item, selected: checked } : item
+                                    )
+                                  );
+                                }}
+                                className="rounded border-slate-300"
+                              />
+                            </td>
+                            <td className="p-2 border-r border-slate-200">
+                              <div className="font-bold text-slate-900 truncate max-w-[220px]">
+                                {cand.rawName}
+                              </div>
+                              <div className="mt-1 flex items-center gap-1.5">
+                                <select
+                                  value={cand.matchedEmployeeId}
+                                  onChange={(e) => {
+                                    const val = e.target.value;
+                                    const foundEmp = state.employees.find((emp) => emp.id === val);
+                                    setImportCandidates((prev) =>
+                                      prev.map((item) =>
+                                        item.id === cand.id
+                                          ? {
+                                              ...item,
+                                              matchedEmployeeId: val,
+                                              unitId: foundEmp?.unitId || item.unitId,
+                                              role: foundEmp?.role || item.role,
+                                            }
+                                          : item
+                                      )
+                                    );
+                                  }}
+                                  className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2 py-1 text-base md:text-xs font-semibold text-slate-700"
+                                >
+                                  <option value="__CREATE_NEW__">
+                                    + Cadastrar como novo ({cand.role})
+                                  </option>
+                                  {state.employees.map((emp) => (
+                                    <option key={emp.id} value={emp.id}>
+                                      Vincular: {emp.name} ({getUnitName(emp.unitId)})
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                            </td>
+
+                            {fullFortnightSlots.map((slot) => {
+                              const st: ShiftStatus =
+                                cand.dayShifts[slot.shortDateLabel] || 'F';
+                              const meta = SHIFT_STATUS_META[st] || SHIFT_STATUS_META.F;
+                              return (
+                                <td
+                                  key={slot.isoDate}
+                                  onClick={() => {
+                                    const nextIdx =
+                                      (VALID_IMPORT_SHIFT_ORDER.indexOf(st) + 1) %
+                                      VALID_IMPORT_SHIFT_ORDER.length;
+                                    const nextSt = VALID_IMPORT_SHIFT_ORDER[nextIdx];
+                                    setImportCandidates((prev) =>
+                                      prev.map((item) =>
+                                        item.id === cand.id
+                                          ? {
+                                              ...item,
+                                              dayShifts: {
+                                                ...item.dayShifts,
+                                                [slot.shortDateLabel]: nextSt,
+                                              },
+                                            }
+                                          : item
+                                      )
+                                    );
+                                  }}
+                                  title={`Dia ${slot.shortDateLabel}: ${meta.label} (Clique para alterar)`}
+                                  className="p-1 border-r border-slate-100 text-center cursor-pointer select-none"
+                                >
+                                  <span
+                                    className={`inline-flex items-center justify-center w-6 h-6 rounded-md text-[10px] font-extrabold border ${meta.bgClass} ${meta.textClass} ${meta.borderClass}`}
+                                  >
+                                    {st}
+                                  </span>
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Rodapé de Confirmação */}
+            <div className="bg-slate-50 border-t border-slate-200 px-5 py-3.5 flex flex-wrap items-center justify-between gap-3 shrink-0">
+              <div className="text-xs text-slate-600">
+                {importCandidates.filter((c) => c.selected).length} colaborador(es) selecionado(s) para aplicar na escala de{' '}
+                <strong>
+                  {MONTH_NAMES[selectedMonth0]} / {MONTH_NAMES[nextYm.monthIndex0]}
+                </strong>
+              </div>
+
+              <div className="flex items-center gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => setIsImportModalOpen(false)}
+                  className="px-4 py-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 text-xs font-bold cursor-pointer"
+                >
+                  Cancelar
+                </button>
+
+                <button
+                  type="button"
+                  disabled={
+                    isAnalyzingScheduleFile ||
+                    importCandidates.filter((c) => c.selected).length === 0
+                  }
+                  onClick={() => {
+                    const selectedList = importCandidates.filter((c) => c.selected);
+                    if (selectedList.length === 0) return;
+
+                    const batchPayload = selectedList.map((cand, idx) => {
+                      const isExisting =
+                        cand.matchedEmployeeId &&
+                        cand.matchedEmployeeId !== '__CREATE_NEW__';
+                      const existingEmp = isExisting
+                        ? state.employees.find((e) => e.id === cand.matchedEmployeeId)
+                        : undefined;
+
+                      const newEmp: Employee | undefined = !existingEmp
+                        ? {
+                            id: `emp-sched-${Date.now()}-${idx}`,
+                            name: cand.rawName,
+                            role: cand.role,
+                            registrationNumber: '',
+                            unitId: cand.unitId,
+                            regime: cand.regime,
+                            defaultShift: cand.shift,
+                            workHours: cand.workHours,
+                            hourBankBalance: 0,
+                            active: true,
+                            history: [],
+                          }
+                        : undefined;
+
+                      const targetEmpForHours = existingEmp || newEmp!;
+                      const shiftHours = inferDefaultShiftHours(targetEmpForHours);
+
+                      let bhDaysCount = 0;
+                      const cells = fullFortnightSlots.map((slot) => {
+                        const status: ShiftStatus =
+                          cand.dayShifts[slot.shortDateLabel] || 'F';
+                        if (status === 'BH') {
+                          bhDaysCount += 1;
+                        }
+                        return {
+                          ymKey: slot.ymKey,
+                          day: slot.day,
+                          status,
+                          note: `Importado da escala (${importedFileName || 'arquivo'})`,
+                        };
+                      });
+
+                      const hourBankDelta =
+                        deductBhOnImport && bhDaysCount > 0
+                          ? -(bhDaysCount * shiftHours)
+                          : 0;
+
+                      return {
+                        employeeId: existingEmp?.id,
+                        newEmployee: newEmp,
+                        updatedRegime: cand.regime,
+                        updatedShift: cand.shift,
+                        updatedWorkHours: cand.workHours,
+                        hourBankDelta,
+                        cells,
+                      };
+                    });
+
+                    onApplyImportedSchedule(batchPayload);
+                    setIsImportModalOpen(false);
+                    setImportCandidates([]);
+                    setImportedFileName(null);
+                    setAutoGenBanner(
+                      `Escala importada com sucesso! ${batchPayload.length} colaborador(es) tiveram seus plantões e folgas copiados dia a dia para ${MONTH_NAMES[selectedMonth0]} / ${MONTH_NAMES[nextYm.monthIndex0]}.`
+                    );
+                    setTimeout(() => setAutoGenBanner(null), 7000);
+                  }}
+                  className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white text-xs font-bold transition-colors cursor-pointer shadow-xs"
+                >
+                  <Check className="w-4 h-4" />
+                  <span>Copiar e Aplicar Escala no Sistema</span>
+                </button>
+              </div>
             </div>
           </div>
         </div>

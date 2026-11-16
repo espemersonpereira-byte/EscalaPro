@@ -1046,6 +1046,549 @@ function extractHourBankDeterministically(
   return results;
 }
 
+type ServerShiftStatus = 'D' | 'N' | 'F' | 'BH' | 'AT' | 'FA' | 'FE' | 'TR';
+
+interface ExtractedScheduleRowServer {
+  name: string;
+  roleHint: string;
+  unitHint: string;
+  shiftHint: 'Diurno' | 'Noturno';
+  workHoursHint: string;
+  scheduleRegimeHint: '12x36_ODD' | '12x36_EVEN' | '5x2' | '6x1';
+  registrationNumber: string;
+  notes: string;
+  dayShifts: Record<string, ServerShiftStatus>;
+}
+
+interface CycleSlotDescriptor {
+  day: number;
+  monthIndex0: number;
+  year: number;
+  shortDateLabel: string;
+  fortnightPart: 1 | 2;
+}
+
+function parseCellToShiftCode(
+  rawCell: string,
+  defaultShift: 'Diurno' | 'Noturno'
+): ServerShiftStatus | null {
+  const cleaned = String(rawCell ?? '').trim();
+  if (!cleaned) return null;
+  const upper = cleaned
+    .toUpperCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+  // Códigos exatos ou siglas hospitalares comuns
+  if (
+    upper === 'D' ||
+    upper === 'SD' ||
+    upper === 'M' ||
+    upper === 'T' ||
+    upper === 'MT' ||
+    upper === 'D1' ||
+    upper === 'D2' ||
+    upper === 'DIURNO' ||
+    upper === 'MANHA' ||
+    upper === 'TARDE'
+  ) {
+    return 'D';
+  }
+  if (
+    upper === 'N' ||
+    upper === 'SN' ||
+    upper === 'N1' ||
+    upper === 'N2' ||
+    upper === 'NOTURNO' ||
+    upper === 'NOITE'
+  ) {
+    return 'N';
+  }
+  if (
+    upper === 'F' ||
+    upper === 'FG' ||
+    upper === 'FOLGA' ||
+    upper === 'DSR' ||
+    upper === 'FR' ||
+    upper === 'FS' ||
+    upper === 'FD' ||
+    upper === 'FF' ||
+    upper === 'OFF' ||
+    upper === '-' ||
+    upper === '—' ||
+    upper === 'L'
+  ) {
+    return 'F';
+  }
+  if (
+    upper === 'BH' ||
+    upper === 'FBH' ||
+    upper === 'BANCO' ||
+    upper === 'BANCO DE HORAS' ||
+    upper === 'COMP' ||
+    upper === 'FC'
+  ) {
+    return 'BH';
+  }
+  if (
+    upper === 'AT' ||
+    upper === 'ATM' ||
+    upper === 'ATESTADO' ||
+    upper === 'LM' ||
+    upper === 'LIC' ||
+    upper === 'AF' ||
+    upper === 'AFASTADO' ||
+    upper === 'INSS'
+  ) {
+    return 'AT';
+  }
+  if (upper === 'FA' || upper === 'FJ' || upper === 'FI' || upper === 'FALTA') {
+    return 'FA';
+  }
+  if (upper === 'FE' || upper === 'FER' || upper === 'FERIAS') {
+    return 'FE';
+  }
+  if (
+    upper === 'TR' ||
+    upper === 'PR' ||
+    upper === 'PERM' ||
+    upper === 'PERMUTA' ||
+    upper === 'TROCA'
+  ) {
+    return 'TR';
+  }
+
+  // Marcadores genéricos de dia trabalhado na grade ("P", "X", "12", "12H", "8H", "PLANTÃO")
+  if (
+    upper === 'P' ||
+    upper === 'PL' ||
+    upper === 'PLANTAO' ||
+    upper === 'X' ||
+    upper === '12' ||
+    upper === '12H' ||
+    upper === '8' ||
+    upper === '8H' ||
+    upper === '6' ||
+    upper === '6H' ||
+    upper === 'OK' ||
+    upper === '1'
+  ) {
+    return defaultShift === 'Noturno' ? 'N' : 'D';
+  }
+
+  // Horários curtos dentro da célula do dia (ex: "07-19", "7/19", "19-07", "07:00")
+  if (/^(?:18|19|20|21|22)[:h/-]/.test(cleaned)) {
+    return 'N';
+  }
+  if (/^(?:0?6|0?7|0?8|0?9|12|13|14)[:h/-]/.test(cleaned)) {
+    return 'D';
+  }
+
+  return null;
+}
+
+function parseHeaderDayToken(rawCell: unknown): { day: number; month?: number } | null {
+  if (rawCell === null || rawCell === undefined) return null;
+
+  // Verifica se é número serial de data do Excel (ex: 46342)
+  if (typeof rawCell === 'number' && rawCell >= 35000 && rawCell <= 65000) {
+    try {
+      const parsedDate = XLSX.SSF.parse_date_code(rawCell);
+      if (parsedDate && parsedDate.d >= 1 && parsedDate.d <= 31) {
+        return { day: parsedDate.d, month: parsedDate.m };
+      }
+    } catch {
+      // ignora
+    }
+  }
+
+  const str = String(rawCell).trim();
+  if (!str) return null;
+
+  // Formato DD/MM ou DD/MM/YYYY ou DD-MM
+  const dmMatch = str.match(/^(?:[a-zA-ZÀ-ÿ]{3}\s*)?(\d{1,2})[/-](\d{1,2})(?:[/-]\d{2,4})?$/);
+  if (dmMatch) {
+    const a = Number(dmMatch[1]);
+    const b = Number(dmMatch[2]);
+    // Trata tanto DD/MM quanto MM/DD caso exportado pelo Excel em inglês
+    if (a >= 1 && a <= 31 && b >= 1 && b <= 12) {
+      return { day: a, month: b };
+    }
+    if (b >= 1 && b <= 31 && a >= 1 && a <= 12) {
+      return { day: b, month: a };
+    }
+  }
+
+  // Formato ISO YYYY-MM-DD
+  const isoMatch = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (isoMatch) {
+    const m = Number(isoMatch[2]);
+    const d = Number(isoMatch[3]);
+    if (d >= 1 && d <= 31 && m >= 1 && m <= 12) {
+      return { day: d, month: m };
+    }
+  }
+
+  // Formato "Dia 16", "Seg 16", "16 Seg", ou número puro "16", "01"
+  const numMatch = str.match(
+    /^(?:(?:dia|dom|seg|ter|qua|qui|sex|s[aá]b)[.\s-]*)?(\d{1,2})(?:[.\s-]*(?:dom|seg|ter|qua|qui|sex|s[aá]b))?$/i
+  );
+  if (numMatch) {
+    const d = Number(numMatch[1]);
+    if (d >= 1 && d <= 31) {
+      return { day: d };
+    }
+  }
+
+  return null;
+}
+
+function mapHeaderColToSlotKey(
+  token: { day: number; month?: number },
+  seenPart1HigherDays: boolean,
+  cycleSlots: CycleSlotDescriptor[]
+): string {
+  if (token.month !== undefined) {
+    const exact = cycleSlots.find(
+      (s) => s.day === token.day && s.monthIndex0 + 1 === token.month
+    );
+    if (exact) return exact.shortDateLabel;
+    return `${String(token.day).padStart(2, '0')}/${String(token.month).padStart(2, '0')}`;
+  }
+
+  // Se o dia é >= 16, pertence à 1ª metade do ciclo quinzenal (2ª quinzena do mês inicial: 16..31)
+  if (token.day >= 16) {
+    const slot1 = cycleSlots.find((s) => s.fortnightPart === 1 && s.day === token.day);
+    if (slot1) return slot1.shortDateLabel;
+  } else {
+    // Dia 1..15: pertence à 2ª metade do ciclo quinzenal (1ª quinzena do mês seguinte: 01..15)
+    const slot2 = cycleSlots.find((s) => s.fortnightPart === 2 && s.day === token.day);
+    if (slot2 && (seenPart1HigherDays || cycleSlots.some((s) => s.fortnightPart === 2))) {
+      return slot2.shortDateLabel;
+    }
+  }
+
+  const anySlot = cycleSlots.find((s) => s.day === token.day);
+  return anySlot ? anySlot.shortDateLabel : String(token.day);
+}
+
+function extractScheduleDeterministically(
+  fileBuffer: Buffer,
+  extractedText: string,
+  cycleSlots: CycleSlotDescriptor[],
+  availableUnits: string[],
+  availableRoles: string[]
+): ExtractedScheduleRowServer[] {
+  const byNameMap = new Map<string, ExtractedScheduleRowServer>();
+
+  const upsertEmployeeRow = (
+    rawName: string,
+    attrs: Omit<ExtractedEmployeeItem, 'name'>,
+    dayMap: Record<string, ServerShiftStatus>
+  ) => {
+    const cleanName = toTitleCasePtBr(
+      rawName
+        .replace(/^\d+[\s.\-)]+/, '')
+        .replace(/\([^)]*\)/g, '')
+        .trim()
+    );
+    if (!cleanName || cleanName.length < 3 || !isLikelyPersonName(cleanName)) return;
+    const key = normalizeServerKey(cleanName);
+    if (!key) return;
+
+    const existing = byNameMap.get(key);
+    if (!existing) {
+      byNameMap.set(key, {
+        name: cleanName,
+        ...attrs,
+        dayShifts: { ...dayMap },
+      });
+    } else {
+      // Mescla caso a planilha tenha a 2ª quinzena (16..30) em um bloco/aba e a 1ª quinzena (01..15) em outro bloco/aba!
+      existing.dayShifts = {
+        ...existing.dayShifts,
+        ...dayMap,
+      };
+      if (!existing.registrationNumber && attrs.registrationNumber) {
+        existing.registrationNumber = attrs.registrationNumber;
+      }
+      if (
+        (!existing.unitHint || existing.unitHint === 'Unidade Principal') &&
+        attrs.unitHint &&
+        attrs.unitHint !== 'Unidade Principal'
+      ) {
+        existing.unitHint = attrs.unitHint;
+      }
+    }
+  };
+
+  // 1. Leitura direta estruturada de planilhas Excel / CSV / ODS
+  try {
+    const workbook = XLSX.read(fileBuffer, { type: 'buffer' });
+    for (const sheetName of workbook.SheetNames) {
+      const sheet = workbook.Sheets[sheetName];
+      if (!sheet) continue;
+
+      const rawRows = XLSX.utils.sheet_to_json<unknown[]>(sheet, {
+        header: 1,
+        defval: '',
+        blankrows: false,
+      });
+
+      let nameColIdx = -1;
+      let activeColToSlotKey = new Map<number, string>();
+      let firstScheduleDayNumber = 16;
+      let currentSectionUnit =
+        availableUnits.find((u) => sheetName.toLowerCase().includes(u.toLowerCase())) || '';
+      const currentSectionRole = '';
+
+      for (const rawRow of rawRows) {
+        if (!Array.isArray(rawRow)) continue;
+        const cells = rawRow.map((c) => String(c ?? '').trim());
+        const nonEmpty = cells.filter(Boolean);
+        if (nonEmpty.length === 0) continue;
+
+        // Verifica se esta linha é um cabeçalho de dias da escala (pelo menos 5 colunas com números de dias 1..31)
+        const candidateDayCols: { colIdx: number; token: { day: number; month?: number } }[] = [];
+        rawRow.forEach((rawCell, colIdx) => {
+          const tok = parseHeaderDayToken(rawCell);
+          if (tok) {
+            candidateDayCols.push({ colIdx, token: tok });
+          }
+        });
+
+        // Verifica se a linha tem nomes de pessoas; se não tiver nome de pessoa e tiver >= 5 dias, é cabeçalho de datas!
+        const hasLikelyPersonInFirstCols = cells
+          .slice(0, 4)
+          .some((c) => c && isLikelyPersonName(c));
+
+        if (candidateDayCols.length >= 5 && !hasLikelyPersonInFirstCols) {
+          const newColMap = new Map<number, string>();
+          let seenHigherDay = false;
+          for (const item of candidateDayCols) {
+            if (item.token.day >= 16) seenHigherDay = true;
+            const slotKey = mapHeaderColToSlotKey(item.token, seenHigherDay, cycleSlots);
+            newColMap.set(item.colIdx, slotKey);
+          }
+          activeColToSlotKey = newColMap;
+          if (candidateDayCols[0]) {
+            firstScheduleDayNumber = candidateDayCols[0].token.day;
+          }
+
+          const headerNameIdx = cells.findIndex((c) =>
+            /^(nome|colaborador|colaboradores|funcion[aá]rio|funcion[aá]rios|profissional|servidor|plantonista)$/i.test(
+              c.trim()
+            )
+          );
+          if (headerNameIdx >= 0) {
+            nameColIdx = headerNameIdx;
+          }
+          continue;
+        }
+
+        // Detecta coluna explícita de Nome caso esteja em linha separada
+        const detectedHeaderIdx = cells.findIndex((c) =>
+          /^(nome|colaborador|colaboradores|funcion[aá]rio|funcion[aá]rios|profissional|servidor|plantonista)$/i.test(
+            c.trim()
+          )
+        );
+        if (detectedHeaderIdx >= 0 && candidateDayCols.length === 0) {
+          nameColIdx = detectedHeaderIdx;
+          continue;
+        }
+
+        // Linha de título de seção/unidade
+        if (nonEmpty.length === 1) {
+          const singleVal = nonEmpty[0];
+          const matchedUnit = availableUnits.find((u) =>
+            singleVal.toLowerCase().includes(u.toLowerCase())
+          );
+          if (matchedUnit) {
+            currentSectionUnit = matchedUnit;
+            continue;
+          }
+        }
+
+        // Identifica o nome do colaborador na linha
+        let foundName = '';
+        let foundNameCol = -1;
+        if (nameColIdx >= 0 && cells[nameColIdx] && isLikelyPersonName(cells[nameColIdx])) {
+          foundName = cells[nameColIdx];
+          foundNameCol = nameColIdx;
+        } else {
+          for (let col = 0; col < Math.min(5, cells.length); col++) {
+            if (cells[col] && isLikelyPersonName(cells[col])) {
+              foundName = cells[col];
+              foundNameCol = col;
+              break;
+            }
+          }
+        }
+
+        if (!foundName) continue;
+
+        const otherCells = cells.filter((_, idx) => idx !== foundNameCol);
+        const attrs = inferAttributesFromRowCells(
+          otherCells,
+          availableUnits,
+          availableRoles,
+          currentSectionUnit,
+          currentSectionRole,
+          firstScheduleDayNumber
+        );
+
+        const rowHasVacationKeyword = /\bf[eé]rias\b/i.test(cells.join(' '));
+        const dayShifts: Record<string, ServerShiftStatus> = {};
+
+        if (activeColToSlotKey.size > 0) {
+          let workCount = 0;
+          let offCount = 0;
+          const blankSlotKeys: string[] = [];
+
+          for (const [colIdx, slotKey] of activeColToSlotKey.entries()) {
+            if (colIdx === foundNameCol) continue;
+            const rawVal = cells[colIdx] || '';
+            const parsedStatus = parseCellToShiftCode(rawVal, attrs.shiftHint);
+            if (parsedStatus) {
+              dayShifts[slotKey] = parsedStatus;
+              if (parsedStatus === 'D' || parsedStatus === 'N' || parsedStatus === 'TR') {
+                workCount++;
+              } else {
+                offCount++;
+              }
+            } else if (!rawVal.trim()) {
+              blankSlotKeys.push(slotKey);
+            }
+          }
+
+          // Se a planilha preenche apenas os dias de plantão (D/N/X) e deixa as folgas em branco, preenche os dias em branco como Folga ('F')
+          if (blankSlotKeys.length > 0 && (workCount > 0 || offCount > 0)) {
+            const fillStatus: ServerShiftStatus =
+              rowHasVacationKeyword && workCount === 0
+                ? 'FE'
+                : workCount > 0
+                ? 'F'
+                : attrs.shiftHint === 'Noturno'
+                ? 'N'
+                : 'D';
+            for (const bKey of blankSlotKeys) {
+              dayShifts[bKey] = fillStatus;
+            }
+          } else if (blankSlotKeys.length > 0 && rowHasVacationKeyword) {
+            for (const bKey of blankSlotKeys) {
+              dayShifts[bKey] = 'FE';
+            }
+          }
+        } else {
+          // Caso a planilha não tenha linha de cabeçalho de dias explícita, coleta a sequência de códigos de plantão da linha na ordem dos slots do ciclo
+          const sequentialStatuses: ServerShiftStatus[] = [];
+          for (let col = foundNameCol + 1; col < cells.length; col++) {
+            const st = parseCellToShiftCode(cells[col], attrs.shiftHint);
+            if (st) {
+              sequentialStatuses.push(st);
+            }
+          }
+          if (sequentialStatuses.length >= 4) {
+            sequentialStatuses.forEach((st, idx) => {
+              const targetSlot = cycleSlots[idx];
+              if (targetSlot) {
+                dayShifts[targetSlot.shortDateLabel] = st;
+              }
+            });
+          }
+        }
+
+        // Ajusta turno/regime inferido com base nos próprios códigos D/N extraídos da grade
+        const statusValues = Object.values(dayShifts);
+        const nTotal = statusValues.filter((s) => s === 'N').length;
+        const dTotal = statusValues.filter((s) => s === 'D').length;
+        if (nTotal > dTotal) {
+          attrs.shiftHint = 'Noturno';
+          if (attrs.workHoursHint === '07:00 às 19:00') {
+            attrs.workHoursHint = '19:00 às 07:00';
+          }
+        }
+
+        upsertEmployeeRow(foundName, attrs, dayShifts);
+      }
+    }
+  } catch {
+    // Continua para fallback de texto
+  }
+
+  if (byNameMap.size > 0) {
+    return Array.from(byNameMap.values());
+  }
+
+  // 2. Fallback para tabelas em texto (Word .docx, CSV/TXT ou PDF)
+  const lines = (extractedText || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  let activeHeaderSlotKeys: string[] = [];
+
+  for (const line of lines) {
+    if (line.startsWith('===')) continue;
+    const parts = line
+      .split(/[;\t|]+|\s{2,}|,/)
+      .map((p) => p.trim())
+      .filter(Boolean);
+    if (parts.length === 0) continue;
+
+    const dayTokens = parts.map((p) => parseHeaderDayToken(p)).filter(Boolean) as {
+      day: number;
+      month?: number;
+    }[];
+    const hasNameInFirst = parts.slice(0, 3).some((p) => isLikelyPersonName(p));
+
+    if (dayTokens.length >= 5 && !hasNameInFirst) {
+      let seenHigher = false;
+      activeHeaderSlotKeys = dayTokens.map((tok) => {
+        if (tok.day >= 16) seenHigher = true;
+        return mapHeaderColToSlotKey(tok, seenHigher, cycleSlots);
+      });
+      continue;
+    }
+
+    let nameIdx = -1;
+    for (let i = 0; i < Math.min(3, parts.length); i++) {
+      if (isLikelyPersonName(parts[i])) {
+        nameIdx = i;
+        break;
+      }
+    }
+    if (nameIdx < 0) continue;
+
+    const foundName = parts[nameIdx];
+    const afterName = parts.slice(nameIdx + 1);
+    const attrs = inferAttributesFromRowCells(afterName, availableUnits, availableRoles, '', '');
+    const shiftCodes: ServerShiftStatus[] = [];
+
+    for (const token of afterName) {
+      const st = parseCellToShiftCode(token, attrs.shiftHint);
+      if (st) {
+        shiftCodes.push(st);
+      }
+    }
+
+    const dayShifts: Record<string, ServerShiftStatus> = {};
+    if (shiftCodes.length >= 3) {
+      shiftCodes.forEach((st, idx) => {
+        const key =
+          activeHeaderSlotKeys[idx] ||
+          cycleSlots[idx]?.shortDateLabel ||
+          String(idx + 1);
+        dayShifts[key] = st;
+      });
+    }
+
+    upsertEmployeeRow(foundName, attrs, dayShifts);
+  }
+
+  return Array.from(byNameMap.values());
+}
+
 // Chama o Gemini com retry e fallback automático de modelos para evitar falhas 503 UNAVAILABLE
 async function callGeminiWithFallback<T = ExtractedEmployeeItem>(
   ai: GoogleGenAI,
@@ -1861,6 +2404,261 @@ Regras de conversão:
       console.error('Erro em /api/extract-hour-bank:', err);
       res.status(500).json({
         error: 'Não foi possível processar o arquivo de Banco de Horas. Verifique se o documento possui nomes legíveis.',
+      });
+    }
+  });
+
+  // Endpoint inteligente para importar uma Escala Completa dia a dia (Excel, CSV, Word, PDF ou Foto) diretamente na página de Escalas
+  app.post('/api/extract-schedule', async (req, res) => {
+    try {
+      const {
+        base64File,
+        fileName,
+        mimeType,
+        cycleSlots,
+        availableUnits,
+        availableRoles,
+      } = req.body as {
+        base64File?: string;
+        fileName?: string;
+        mimeType?: string;
+        cycleSlots?: CycleSlotDescriptor[];
+        availableUnits?: string[];
+        availableRoles?: string[];
+      };
+
+      if (!base64File) {
+        res.status(400).json({ error: 'Arquivo da escala não fornecido.' });
+        return;
+      }
+
+      const dataUrlMatch = base64File.match(/^data:([^;]+);base64,(.+)$/s);
+      const detectedMime = dataUrlMatch ? dataUrlMatch[1].trim() : mimeType || '';
+      const cleanBase64 = (
+        dataUrlMatch ? dataUrlMatch[2] : base64File.replace(/^data:.*?,/, '')
+      ).trim();
+
+      const fileBuffer = Buffer.from(cleanBase64, 'base64');
+      const safeUnits = Array.isArray(availableUnits) ? availableUnits : [];
+      const safeRoles = Array.isArray(availableRoles) ? availableRoles : [];
+      const safeSlots: CycleSlotDescriptor[] = Array.isArray(cycleSlots) ? cycleSlots : [];
+
+      const parsedSource = await extractTextOrInlinePart(
+        fileBuffer,
+        fileName || '',
+        detectedMime
+      );
+
+      // 1. Extração determinística direta das células da planilha/documento
+      const deterministicRows = extractScheduleDeterministically(
+        fileBuffer,
+        parsedSource.extractedText || '',
+        safeSlots,
+        safeUnits,
+        safeRoles
+      );
+
+      const rowsWithExplicitDays = deterministicRows.filter(
+        (r) => Object.keys(r.dayShifts || {}).length >= 4
+      );
+
+      // Se a planilha Excel/CSV já forneceu os colaboradores com os dias da escala mapeados célula por célula, retorna imediatamente com fidelidade 100%!
+      if (rowsWithExplicitDays.length > 0 && parsedSource.mode === 'EXTRACTED_TEXT') {
+        res.json({
+          success: true,
+          rows: deterministicRows,
+        });
+        return;
+      }
+
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        res.json({
+          success: true,
+          rows: deterministicRows,
+        });
+        return;
+      }
+
+      const ai = new GoogleGenAI({
+        apiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          },
+        },
+      });
+
+      const slotLabelsList = safeSlots.map((s) => s.shortDateLabel).join(', ');
+      const promptText = `Você é um especialista em leitura fiel de escalas hospitalares (quinzenais de 16 a 15 ou mensais).
+Analise o arquivo de escala enviado (${fileName || 'escala'}) e copie EXATAMENTE a escala de cada colaborador dia por dia do jeitinho que está no documento.
+
+As datas da escala atual no sistema são: [${slotLabelsList}].
+Para cada colaborador encontrado no arquivo, retorne:
+- name: Nome completo do colaborador.
+- roleHint: Cargo/função (ex: ${safeRoles.join(', ') || 'Farmacêutico, Auxiliar de Farmácia'}).
+- unitHint: Setor/Unidade (ex: ${safeUnits.join(', ') || 'Unidade Principal'}).
+- shiftHint: "Diurno" ou "Noturno".
+- workHoursHint: Horário de trabalho (ex: "07:00 às 19:00", "19:00 às 07:00", "08:00 às 17:00").
+- scheduleRegimeHint: "12x36_EVEN" (se trabalha nos dias pares como 16, 18, 20...), "12x36_ODD" (se trabalha nos dias ímpares como 17, 19, 21...), "5x2" ou "6x1".
+- dayEntries: Lista com a marcação de cada dia da escala para este colaborador:
+  * dateKey: Use o formato "DD/MM" correspondente à lista [${slotLabelsList}] (por exemplo "16/11", "17/11"... "01/12", "15/12"). Se no documento aparecer apenas o número do dia (ex: 16, 17... 30, 01, 02... 15), associe os dias 16..31 à 1ª metade da quinzena e os dias 01..15 à 2ª metade da quinzena na lista acima.
+  * status: Código exato do dia:
+    - "D" = Plantão Diurno (inclui D, SD, M, T, P diurno, X diurno, horário diurno)
+    - "N" = Plantão Noturno (inclui N, SN, P noturno, X noturno, horário noturno)
+    - "F" = Folga (inclui F, FG, FOLGA, DSR, traço "-" ou célula em branco de folga)
+    - "BH" = Banco de Horas / Folga BH
+    - "AT" = Atestado Médico / Licença
+    - "FA" = Falta
+    - "FE" = Férias
+    - "TR" = Troca / Permuta`;
+
+      const responseSchema = {
+        type: Type.ARRAY,
+        description: 'Linhas da escala hospitalar extraídas fielmente com os plantões e folgas de cada dia.',
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            name: { type: Type.STRING },
+            roleHint: { type: Type.STRING },
+            unitHint: { type: Type.STRING },
+            shiftHint: { type: Type.STRING },
+            workHoursHint: { type: Type.STRING },
+            scheduleRegimeHint: { type: Type.STRING },
+            registrationNumber: { type: Type.STRING },
+            notes: { type: Type.STRING },
+            dayEntries: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  dateKey: { type: Type.STRING },
+                  status: { type: Type.STRING },
+                },
+                required: ['dateKey', 'status'],
+              },
+            },
+          },
+          required: ['name', 'dayEntries'],
+        },
+      };
+
+      const contentParts =
+        parsedSource.mode === 'INLINE_MEDIA' && parsedSource.inlineMimeType
+          ? [
+              {
+                inlineData: {
+                  mimeType: parsedSource.inlineMimeType,
+                  data: cleanBase64,
+                },
+              },
+              { text: promptText },
+            ]
+          : [
+              {
+                text: `${promptText}\n\n=== CONTEÚDO EXTRAÍDO DO ARQUIVO (${
+                  fileName || 'escala'
+                }) ===\n${(parsedSource.extractedText || '').slice(0, 90000)}`,
+              },
+            ];
+
+      try {
+        interface AiScheduleRowRaw {
+          name: string;
+          roleHint?: string;
+          unitHint?: string;
+          shiftHint?: string;
+          workHoursHint?: string;
+          scheduleRegimeHint?: string;
+          registrationNumber?: string;
+          notes?: string;
+          dayEntries?: { dateKey: string; status: string }[];
+        }
+
+        const aiRows = await callGeminiWithFallback<AiScheduleRowRaw>(
+          ai,
+          contentParts,
+          responseSchema
+        );
+
+        if (Array.isArray(aiRows) && aiRows.length > 0) {
+          const validCodes = new Set(['D', 'N', 'F', 'BH', 'AT', 'FA', 'FE', 'TR']);
+          const normalizedRows: ExtractedScheduleRowServer[] = aiRows
+            .filter((r) => r && r.name && String(r.name).trim().length >= 2)
+            .map((r) => {
+              const shiftHint: 'Diurno' | 'Noturno' =
+                String(r.shiftHint || '').toLowerCase().includes('noturno') ? 'Noturno' : 'Diurno';
+              const dayShifts: Record<string, ServerShiftStatus> = {};
+              let seenHighDay = false;
+
+              for (const entry of r.dayEntries || []) {
+                if (!entry || !entry.dateKey) continue;
+                const tok = parseHeaderDayToken(entry.dateKey);
+                const mappedKey = tok
+                  ? (() => {
+                      if (tok.day >= 16) seenHighDay = true;
+                      return mapHeaderColToSlotKey(tok, seenHighDay, safeSlots);
+                    })()
+                  : String(entry.dateKey).trim();
+
+                const rawSt = String(entry.status || '').trim().toUpperCase();
+                const st: ServerShiftStatus = validCodes.has(rawSt)
+                  ? (rawSt as ServerShiftStatus)
+                  : parseCellToShiftCode(rawSt, shiftHint) || 'F';
+                dayShifts[mappedKey] = st;
+              }
+
+              // Mescla com qualquer dado determinístico já lido para o mesmo colaborador
+              const detMatch = deterministicRows.find(
+                (d) => normalizeServerKey(d.name) === normalizeServerKey(r.name)
+              );
+
+              return {
+                name: toTitleCasePtBr(r.name),
+                roleHint: r.roleHint || detMatch?.roleHint || safeRoles[0] || 'Auxiliar de Farmácia',
+                unitHint: r.unitHint || detMatch?.unitHint || safeUnits[0] || 'Unidade Principal',
+                shiftHint,
+                workHoursHint:
+                  r.workHoursHint ||
+                  detMatch?.workHoursHint ||
+                  (shiftHint === 'Noturno' ? '19:00 às 07:00' : '07:00 às 19:00'),
+                scheduleRegimeHint:
+                  (r.scheduleRegimeHint as ExtractedScheduleRowServer['scheduleRegimeHint']) ||
+                  detMatch?.scheduleRegimeHint ||
+                  '12x36_EVEN',
+                registrationNumber: r.registrationNumber || detMatch?.registrationNumber || '',
+                notes: r.notes || detMatch?.notes || '',
+                dayShifts: {
+                  ...(detMatch?.dayShifts || {}),
+                  ...dayShifts,
+                },
+              };
+            });
+
+          if (normalizedRows.length > 0) {
+            res.json({
+              success: true,
+              rows: normalizedRows,
+            });
+            return;
+          }
+        }
+      } catch (aiErr) {
+        console.warn(
+          'Aviso na leitura IA de escala, utilizando extração nativa de planilha:',
+          aiErr instanceof Error ? aiErr.message : aiErr
+        );
+      }
+
+      res.json({
+        success: true,
+        rows: deterministicRows,
+      });
+    } catch (err) {
+      console.error('Erro em /api/extract-schedule:', err);
+      res.status(500).json({
+        error:
+          'Não foi possível processar o arquivo da escala. Verifique se o documento possui os nomes e dias legíveis.',
       });
     }
   });
