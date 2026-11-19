@@ -47,6 +47,15 @@ export interface LocalRegisteredAccount extends UserAccount {
   passwordHash: string;
 }
 
+export type TimeTrackingSubType =
+  | 'FICOU_MAIS_TARDE'
+  | 'ENTROU_MAIS_TARDE_DECLARACAO'
+  | 'SAIU_MAIS_CEDO_DECLARACAO'
+  | 'ATRASO_DESCONTO_BH'
+  | 'SAIDA_ANTECIPADA_BH'
+  | 'HORA_EXTRA_DOBRA'
+  | 'FOLGA_BH';
+
 export interface AbsenceRecord {
   id: string;
   employeeId: string;
@@ -73,6 +82,14 @@ export interface AbsenceRecord {
   swapPartnerName?: string;
   swapReturnDate?: string;
   extraHours?: number;
+  timeTrackingSubType?: TimeTrackingSubType;
+  plannedStartTime?: string; // ex: "07:00"
+  plannedEndTime?: string; // ex: "19:00"
+  actualStartTime?: string; // ex: "09:30"
+  actualEndTime?: string; // ex: "20:30"
+  declarationDelivered?: boolean; // true = entregou declaração de horas, false = pendente
+  hoursDuration?: number; // quantidade de horas do evento (mesmo quando abonado = 0 no BH)
+  abonedHours?: number; // quantidade de horas abonadas via declaração de horas
   createdAt: string;
 }
 
@@ -120,6 +137,13 @@ export interface ScheduleCellData {
   swapReturnDate?: string;
   extraHours?: number;
   unitOverrideId?: string;
+  timeTrackingSubType?: TimeTrackingSubType;
+  plannedStartTime?: string;
+  plannedEndTime?: string;
+  actualStartTime?: string;
+  actualEndTime?: string;
+  declarationDelivered?: boolean;
+  abonedHours?: number;
 }
 
 // Mapa: "YYYY-MM" -> employeeId -> dayNumber (1..31) -> ScheduleCellData

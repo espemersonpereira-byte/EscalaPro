@@ -1,15 +1,19 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AbsenceRecord,
   Employee,
   EscalaProState,
   REGIME_LABELS,
   SHIFT_STATUS_META,
+  TimeTrackingSubType,
 } from '../types';
 import {
   calculateLeaveAndNextShift,
+  computeHoursDiffBetweenTimes,
   formatDateWithWeekdayPtBr,
+  formatDecimalHoursPtBr,
   formatIsoDate,
+  parseEmployeeWorkHours,
 } from '../services/storageService';
 import {
   ArrowRight,
@@ -82,11 +86,19 @@ export const QuickLeaveWizardModal: React.FC<QuickLeaveWizardModalProps> = ({
       : 3
   );
 
-  // Campos para Declaração de Horas / Banco de Horas
+  // Campos para Controle de Horários / Declaração de Horas / Hora Extra
+  const [timeSubType, setTimeSubType] = useState<TimeTrackingSubType>(
+    'ENTROU_MAIS_TARDE_DECLARACAO'
+  );
   const [hoursMode, setHoursMode] = useState<'ABONO_COMPARECIMENTO' | 'CREDITO_EXTRA' | 'DEBITO_HORAS'>(
     'ABONO_COMPARECIMENTO'
   );
-  const [hoursAmount, setHoursAmount] = useState<number>(4);
+  const [hoursAmount, setHoursAmount] = useState<number>(2);
+  const [plannedStartTime, setPlannedStartTime] = useState<string>('07:00');
+  const [plannedEndTime, setPlannedEndTime] = useState<string>('19:00');
+  const [actualStartTime, setActualStartTime] = useState<string>('09:00');
+  const [actualEndTime, setActualEndTime] = useState<string>('19:00');
+  const [declarationDelivered, setDeclarationDelivered] = useState<boolean>(true);
 
   // Campos complementares manuais (sem exigir arquivo)
   const [cidCode, setCidCode] = useState<string>('');
@@ -108,6 +120,47 @@ export const QuickLeaveWizardModal: React.FC<QuickLeaveWizardModalProps> = ({
     () => activeEmployees.find((e) => e.id === selectedEmployeeId) || activeEmployees[0],
     [activeEmployees, selectedEmployeeId]
   );
+
+  // Atualiza horários previstos ao trocar de colaborador ou modalidade de horário
+  useEffect(() => {
+    if (!selectedEmployee) return;
+    const { plannedStart, plannedEnd } = parseEmployeeWorkHours(
+      selectedEmployee.workHours,
+      selectedEmployee.defaultShift
+    );
+    setPlannedStartTime(plannedStart);
+    setPlannedEndTime(plannedEnd);
+
+    const addHoursToTime = (base: string, deltaH: number) => {
+      const [h, m] = base.split(':').map(Number);
+      const totalM = ((h || 0) * 60 + (m || 0) + Math.round(deltaH * 60) + 24 * 60) % (24 * 60);
+      const nh = String(Math.floor(totalM / 60)).padStart(2, '0');
+      const nm = String(totalM % 60).padStart(2, '0');
+      return `${nh}:${nm}`;
+    };
+
+    if (timeSubType === 'FICOU_MAIS_TARDE') {
+      setActualStartTime(plannedStart);
+      setActualEndTime(addHoursToTime(plannedEnd, 2));
+      setHoursAmount(2);
+      setHoursMode('CREDITO_EXTRA');
+    } else if (timeSubType === 'ENTROU_MAIS_TARDE_DECLARACAO') {
+      setActualStartTime(addHoursToTime(plannedStart, 2));
+      setActualEndTime(plannedEnd);
+      setHoursAmount(2);
+      setHoursMode('ABONO_COMPARECIMENTO');
+    } else if (timeSubType === 'SAIU_MAIS_CEDO_DECLARACAO') {
+      setActualStartTime(plannedStart);
+      setActualEndTime(addHoursToTime(plannedEnd, -2));
+      setHoursAmount(2);
+      setHoursMode('ABONO_COMPARECIMENTO');
+    } else {
+      setActualStartTime(addHoursToTime(plannedStart, 1.5));
+      setActualEndTime(plannedEnd);
+      setHoursAmount(1.5);
+      setHoursMode('DEBITO_HORAS');
+    }
+  }, [selectedEmployee, timeSubType]);
 
   // Cálculo automático em tempo real do término do atestado e do próximo plantão mediante a escala
   const calculation = useMemo(() => {
@@ -184,7 +237,8 @@ export const QuickLeaveWizardModal: React.FC<QuickLeaveWizardModalProps> = ({
         nextShiftLabel: calculation.nextShiftLabel,
       });
     } else if (occurrenceType === 'DECLARACAO_HORAS') {
-      const hrs = Math.max(1, Number(hoursAmount) || 1);
+      const hrs = Math.max(0.25, Math.round((Number(hoursAmount) || 1) * 100) / 100);
+      const formattedHrs = formatDecimalHoursPtBr(hrs, false);
       const delta =
         hoursMode === 'CREDITO_EXTRA'
           ? hrs
@@ -192,26 +246,48 @@ export const QuickLeaveWizardModal: React.FC<QuickLeaveWizardModalProps> = ({
           ? -hrs
           : 0;
 
-      const modeDesc =
+      const scheduleWindowDesc = `Previsto: ${plannedStartTime} às ${plannedEndTime} · Realizado: ${actualStartTime} às ${actualEndTime}`;
+      const declarationTag =
+        timeSubType === 'ENTROU_MAIS_TARDE_DECLARACAO' ||
+        timeSubType === 'SAIU_MAIS_CEDO_DECLARACAO' ||
         hoursMode === 'ABONO_COMPARECIMENTO'
-          ? `Declaração de Comparecimento Médico (${hrs}h abonadas no dia ${formatDateWithWeekdayPtBr(
-              startDateIso
-            )})`
-          : hoursMode === 'CREDITO_EXTRA'
-          ? `Crédito de +${hrs}h no Banco de Horas`
-          : `Desconto/Compensação de -${hrs}h no Banco de Horas`;
+          ? declarationDelivered
+            ? ' · Declaração Entregue'
+            : ' · Pendente entregar declaração'
+          : '';
+
+      const subTypeLabel =
+        timeSubType === 'FICOU_MAIS_TARDE'
+          ? `Ficou até mais tarde (+${formattedHrs} no Banco de Horas · ${scheduleWindowDesc})`
+          : timeSubType === 'ENTROU_MAIS_TARDE_DECLARACAO'
+          ? `Entrou mais tarde às ${actualStartTime} com Declaração de Horas (${formattedHrs} abonadas · ${scheduleWindowDesc}${declarationTag})`
+          : timeSubType === 'SAIU_MAIS_CEDO_DECLARACAO'
+          ? `Saiu mais cedo às ${actualEndTime} com Declaração de Horas (${formattedHrs} abonadas · ${scheduleWindowDesc}${declarationTag})`
+          : `Atraso / Saída antecipada sem declaração (-${formattedHrs} no Banco de Horas · ${scheduleWindowDesc})`;
 
       const record: AbsenceRecord = {
         id: `horas-${Date.now()}`,
         employeeId: selectedEmployee.id,
-        type: 'DECLARACAO_HORAS',
+        type: timeSubType === 'FICOU_MAIS_TARDE' ? 'HORA_EXTRA' : 'DECLARACAO_HORAS',
         startDate: startDateIso,
         endDate: startDateIso,
         nextShiftDate: calculation.nextShiftDateIso,
         daysCount: 1,
         shift: selectedEmployee.defaultShift,
         extraHours: delta,
-        reason: reasonText.trim() ? `${modeDesc} — ${reasonText.trim()}` : modeDesc,
+        hoursDuration: hrs,
+        timeTrackingSubType: timeSubType,
+        plannedStartTime,
+        plannedEndTime,
+        actualStartTime,
+        actualEndTime,
+        declarationDelivered:
+          timeSubType === 'ENTROU_MAIS_TARDE_DECLARACAO' ||
+          timeSubType === 'SAIU_MAIS_CEDO_DECLARACAO' ||
+          hoursMode === 'ABONO_COMPARECIMENTO'
+            ? declarationDelivered
+            : undefined,
+        reason: reasonText.trim() ? `${subTypeLabel} — ${reasonText.trim()}` : subTypeLabel,
         attachmentName: attachmentName || undefined,
         attachmentBase64: attachmentBase64 || undefined,
         attachmentMimeType: attachmentMimeType || undefined,
@@ -226,7 +302,7 @@ export const QuickLeaveWizardModal: React.FC<QuickLeaveWizardModalProps> = ({
 
       setSavedSummary({
         employeeName: selectedEmployee.name,
-        title: modeDesc,
+        title: subTypeLabel,
         endDateFormatted: formatDateWithWeekdayPtBr(startDateIso),
         nextShiftFormatted: calculation.nextShiftDateFormatted,
         nextShiftLabel: calculation.nextShiftLabel,
@@ -549,59 +625,276 @@ export const QuickLeaveWizardModal: React.FC<QuickLeaveWizardModalProps> = ({
               </div>
             </div>
 
-            {/* PERGUNTA 3: QUANDO COMEÇOU E QUANTOS DIAS SÃO? */}
+            {/* PERGUNTA 3: CONTROLE DE HORÁRIOS DO DIA OU PERÍODO DE AFASTAMENTO */}
             {occurrenceType === 'DECLARACAO_HORAS' ? (
               <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 space-y-4">
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-bold text-slate-800 mb-2">
+                    3. O que aconteceu no horário de {selectedEmployee?.name.split(' ')[0]}?
+                  </label>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    <button
+                      type="button"
+                      onClick={() => setTimeSubType('FICOU_MAIS_TARDE')}
+                      className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
+                        timeSubType === 'FICOU_MAIS_TARDE'
+                          ? 'bg-emerald-700 text-white border-emerald-800 shadow-xs'
+                          : 'bg-white text-slate-800 border-slate-300 hover:bg-slate-100'
+                      }`}
+                    >
+                      <div className="text-xs font-bold">
+                        Ficou até mais tarde (Hora Extra +BH)
+                      </div>
+                      <div
+                        className={`text-[11px] mt-0.5 ${
+                          timeSubType === 'FICOU_MAIS_TARDE'
+                            ? 'text-emerald-100'
+                            : 'text-slate-500'
+                        }`}
+                      >
+                        Passou do horário de saída e soma no Banco de Horas
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setTimeSubType('ENTROU_MAIS_TARDE_DECLARACAO')}
+                      className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
+                        timeSubType === 'ENTROU_MAIS_TARDE_DECLARACAO'
+                          ? 'bg-teal-700 text-white border-teal-800 shadow-xs'
+                          : 'bg-white text-slate-800 border-slate-300 hover:bg-slate-100'
+                      }`}
+                    >
+                      <div className="text-xs font-bold">
+                        Entrou mais tarde + Declaração de Horas
+                      </div>
+                      <div
+                        className={`text-[11px] mt-0.5 ${
+                          timeSubType === 'ENTROU_MAIS_TARDE_DECLARACAO'
+                            ? 'text-teal-100'
+                            : 'text-slate-500'
+                        }`}
+                      >
+                        Chegou depois por consulta/exame e entregou declaração
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setTimeSubType('SAIU_MAIS_CEDO_DECLARACAO')}
+                      className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
+                        timeSubType === 'SAIU_MAIS_CEDO_DECLARACAO'
+                          ? 'bg-teal-700 text-white border-teal-800 shadow-xs'
+                          : 'bg-white text-slate-800 border-slate-300 hover:bg-slate-100'
+                      }`}
+                    >
+                      <div className="text-xs font-bold">
+                        Saiu mais cedo + Declaração de Horas
+                      </div>
+                      <div
+                        className={`text-[11px] mt-0.5 ${
+                          timeSubType === 'SAIU_MAIS_CEDO_DECLARACAO'
+                            ? 'text-teal-100'
+                            : 'text-slate-500'
+                        }`}
+                      >
+                        Precisou sair antes com comprovante de comparecimento
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setTimeSubType('ATRASO_DESCONTO_BH')}
+                      className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
+                        timeSubType === 'ATRASO_DESCONTO_BH'
+                          ? 'bg-red-600 text-white border-red-700 shadow-xs'
+                          : 'bg-white text-slate-800 border-slate-300 hover:bg-slate-100'
+                      }`}
+                    >
+                      <div className="text-xs font-bold">
+                        Entrou mais tarde / Saiu cedo SEM Declaração (-BH)
+                      </div>
+                      <div
+                        className={`text-[11px] mt-0.5 ${
+                          timeSubType === 'ATRASO_DESCONTO_BH'
+                            ? 'text-red-100'
+                            : 'text-slate-500'
+                        }`}
+                      >
+                        Desconta as horas de atraso ou saída do Banco de Horas
+                      </div>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Data e Horários Previsto x Realizado */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 bg-white p-3.5 rounded-xl border border-slate-200">
                   <div>
-                    <label className="block text-xs font-bold text-slate-800 mb-1">
-                      3. Dia da Declaração / Ocorrência de Horas
+                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                      Data do Plantão
                     </label>
                     <input
                       type="date"
                       required
                       value={startDateIso}
                       onChange={(e) => setStartDateIso(e.target.value)}
-                      className="w-full px-3.5 py-2 rounded-xl border border-slate-300 bg-white text-base text-slate-900"
+                      className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white text-base font-semibold text-slate-900"
                     />
                   </div>
 
                   <div>
-                    <label className="block text-xs font-bold text-slate-800 mb-1">
-                      Quantidade de Horas
+                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                      {timeSubType === 'FICOU_MAIS_TARDE' ||
+                      timeSubType === 'SAIU_MAIS_CEDO_DECLARACAO'
+                        ? 'Horário Previsto de Saída'
+                        : 'Horário Previsto de Entrada'}
                     </label>
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="number"
-                        min={1}
-                        max={24}
-                        value={hoursAmount}
-                        onChange={(e) => setHoursAmount(Number(e.target.value))}
-                        className="w-24 px-3.5 py-2 rounded-xl border border-slate-300 bg-white text-base font-bold text-slate-900 tabular-nums"
-                      />
-                      <div className="flex flex-wrap gap-1">
-                        {[2, 4, 6, 12].map((h) => (
-                          <button
-                            key={h}
-                            type="button"
-                            onClick={() => setHoursAmount(h)}
-                            className={`px-2.5 py-1.5 rounded-lg text-xs font-bold border cursor-pointer ${
-                              hoursAmount === h
-                                ? 'bg-teal-600 text-white border-teal-700'
-                                : 'bg-white text-slate-700 border-slate-300'
-                            }`}
-                          >
-                            {h}h
-                          </button>
-                        ))}
-                      </div>
-                    </div>
+                    <input
+                      type="time"
+                      value={
+                        timeSubType === 'FICOU_MAIS_TARDE' ||
+                        timeSubType === 'SAIU_MAIS_CEDO_DECLARACAO'
+                          ? plannedEndTime
+                          : plannedStartTime
+                      }
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        if (
+                          timeSubType === 'FICOU_MAIS_TARDE' ||
+                          timeSubType === 'SAIU_MAIS_CEDO_DECLARACAO'
+                        ) {
+                          setPlannedEndTime(val);
+                          const diff =
+                            timeSubType === 'FICOU_MAIS_TARDE'
+                              ? computeHoursDiffBetweenTimes(val, actualEndTime)
+                              : computeHoursDiffBetweenTimes(actualEndTime, val);
+                          if (diff > 0) setHoursAmount(diff);
+                        } else {
+                          setPlannedStartTime(val);
+                          const diff = computeHoursDiffBetweenTimes(val, actualStartTime);
+                          if (diff > 0) setHoursAmount(diff);
+                        }
+                      }}
+                      className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-slate-50 text-base font-bold text-slate-900 tabular-nums"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-bold text-teal-800 mb-1">
+                      {timeSubType === 'FICOU_MAIS_TARDE'
+                        ? 'Horário que Saiu (Mais Tarde)'
+                        : timeSubType === 'SAIU_MAIS_CEDO_DECLARACAO'
+                        ? 'Horário que Saiu (Mais Cedo)'
+                        : 'Horário Real que Entrou'}
+                    </label>
+                    <input
+                      type="time"
+                      value={
+                        timeSubType === 'FICOU_MAIS_TARDE' ||
+                        timeSubType === 'SAIU_MAIS_CEDO_DECLARACAO'
+                          ? actualEndTime
+                          : actualStartTime
+                      }
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        if (timeSubType === 'FICOU_MAIS_TARDE') {
+                          setActualEndTime(val);
+                          const diff = computeHoursDiffBetweenTimes(plannedEndTime, val);
+                          if (diff > 0) setHoursAmount(diff);
+                        } else if (timeSubType === 'SAIU_MAIS_CEDO_DECLARACAO') {
+                          setActualEndTime(val);
+                          const diff = computeHoursDiffBetweenTimes(val, plannedEndTime);
+                          if (diff > 0) setHoursAmount(diff);
+                        } else {
+                          setActualStartTime(val);
+                          const diff = computeHoursDiffBetweenTimes(plannedStartTime, val);
+                          if (diff > 0) setHoursAmount(diff);
+                        }
+                      }}
+                      className="w-full px-3 py-2 rounded-xl border-2 border-teal-600 bg-white text-base font-bold text-slate-900 tabular-nums"
+                    />
                   </div>
                 </div>
 
+                {/* Quantidade de Horas Calculada + Atalhos Rápidos */}
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white p-3.5 rounded-xl border border-slate-200">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-800">
+                      Total de Horas Calculado ({formatDecimalHoursPtBr(hoursAmount, false)})
+                    </label>
+                    <p className="text-[11px] text-slate-500">
+                      Calculado automaticamente pelos horários acima (ou ajuste ao lado):
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <input
+                      type="number"
+                      min={0.25}
+                      max={24}
+                      step={0.25}
+                      value={hoursAmount}
+                      onChange={(e) => setHoursAmount(Number(e.target.value))}
+                      className="w-20 px-2.5 py-1.5 rounded-xl border border-slate-300 bg-white text-base font-bold text-slate-900 tabular-nums"
+                    />
+                    {[0.5, 1, 1.5, 2, 3, 4, 6].map((h) => (
+                      <button
+                        key={h}
+                        type="button"
+                        onClick={() => setHoursAmount(h)}
+                        className={`px-2 py-1.5 rounded-lg text-xs font-bold border cursor-pointer tabular-nums ${
+                          hoursAmount === h
+                            ? 'bg-teal-600 text-white border-teal-700'
+                            : 'bg-slate-50 text-slate-700 border-slate-300 hover:bg-slate-100'
+                        }`}
+                      >
+                        {formatDecimalHoursPtBr(h)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Controle de Entrega da Declaração de Horas (Quando aplicável) */}
+                {(timeSubType === 'ENTROU_MAIS_TARDE_DECLARACAO' ||
+                  timeSubType === 'SAIU_MAIS_CEDO_DECLARACAO') && (
+                  <div className="bg-teal-50/80 border border-teal-200 rounded-xl p-3.5 space-y-2">
+                    <span className="block text-xs font-bold text-teal-950">
+                      Controle da Declaração de Horas / Comparecimento:
+                    </span>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setDeclarationDelivered(true)}
+                        className={`p-2.5 rounded-xl border text-left text-xs font-bold cursor-pointer flex items-center gap-2 ${
+                          declarationDelivered
+                            ? 'bg-teal-700 text-white border-teal-800'
+                            : 'bg-white text-slate-700 border-slate-300'
+                        }`}
+                      >
+                        <CheckCircle2 className="w-4 h-4 shrink-0" />
+                        <span>Já entregou a Declaração de Horas (Validada)</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setDeclarationDelivered(false)}
+                        className={`p-2.5 rounded-xl border text-left text-xs font-bold cursor-pointer flex items-center gap-2 ${
+                          !declarationDelivered
+                            ? 'bg-amber-600 text-white border-amber-700'
+                            : 'bg-white text-slate-700 border-slate-300'
+                        }`}
+                      >
+                        <Clock className="w-4 h-4 shrink-0" />
+                        <span>Avisou · Pendente entregar o papel depois</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Como aplicar no Banco de Horas */}
                 <div>
                   <label className="block text-xs font-bold text-slate-800 mb-1.5">
-                    Como aplicar essas horas?
+                    Reflexo no Banco de Horas de {selectedEmployee?.name.split(' ')[0]}:
                   </label>
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                     <button
@@ -613,7 +906,7 @@ export const QuickLeaveWizardModal: React.FC<QuickLeaveWizardModalProps> = ({
                           : 'bg-white text-slate-700 border-slate-300'
                       }`}
                     >
-                      Atestado de Comparecimento (Apenas registrar abono)
+                      Abonar com Declaração (0h · Não desconta do BH)
                     </button>
                     <button
                       type="button"
@@ -624,7 +917,7 @@ export const QuickLeaveWizardModal: React.FC<QuickLeaveWizardModalProps> = ({
                           : 'bg-white text-slate-700 border-slate-300'
                       }`}
                     >
-                      Somar (+{hoursAmount}h) no Banco de Horas
+                      Somar (+{formatDecimalHoursPtBr(hoursAmount)}) no Banco de Horas
                     </button>
                     <button
                       type="button"
@@ -635,7 +928,7 @@ export const QuickLeaveWizardModal: React.FC<QuickLeaveWizardModalProps> = ({
                           : 'bg-white text-slate-700 border-slate-300'
                       }`}
                     >
-                      Descontar (-{hoursAmount}h) do Banco de Horas
+                      Descontar (-{formatDecimalHoursPtBr(hoursAmount)}) do Banco de Horas
                     </button>
                   </div>
                 </div>

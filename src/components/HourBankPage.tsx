@@ -5,21 +5,32 @@ import {
   EscalaProState,
   ExtractedHourBankEntry,
   NATIVE_HOSPITAL_ROLES,
+  TimeTrackingSubType,
 } from '../types';
-import { matchEmployeeByName } from '../services/storageService';
 import {
+  computeHoursDiffBetweenTimes,
+  formatDateWithWeekdayPtBr,
+  formatDecimalHoursPtBr,
+  formatIsoDate,
+  hydrateTimeTrackingRecord,
+  matchEmployeeByName,
+  parseEmployeeWorkHours,
+} from '../services/storageService';
+import {
+  AlertCircle,
+  CalendarClock,
   CheckCircle2,
   Clock,
   Download,
-  FileSpreadsheet,
+  FileCheck2,
   FileUp,
   Loader2,
-  Minus,
   Plus,
   Printer,
   RotateCcw,
   Search,
   Sparkles,
+  Trash2,
   TrendingDown,
   TrendingUp,
   UserCheck,
@@ -44,6 +55,13 @@ interface HourBankPageProps {
     deltaHours: number,
     reason: string
   ) => void;
+  onApplyLeaveOrOccurrence?: (params: {
+    employeeId: string;
+    record: AbsenceRecord;
+    hourBankDelta?: number;
+  }) => void;
+  onToggleDeclarationDelivered?: (recordId: string, employeeId: string) => void;
+  onDeleteTimeRecord?: (recordId: string, employeeId: string) => void;
 }
 
 interface HourBankImportCandidate {
@@ -74,6 +92,9 @@ export const HourBankPage: React.FC<HourBankPageProps> = ({
   state,
   onApplyHourBankBatch,
   onUpdateSingleEmployeeHourBank,
+  onApplyLeaveOrOccurrence,
+  onToggleDeclarationDelivered,
+  onDeleteTimeRecord,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [unitFilter, setUnitFilter] = useState<string>('TODAS');
@@ -98,6 +119,232 @@ export const HourBankPage: React.FC<HourBankPageProps> = ({
   const activeEmployees = useMemo(
     () => state.employees.filter((e) => e.active),
     [state.employees]
+  );
+
+  // Estado do Painel de Controle de Horários do Dia (Prorrogação, Atraso, Declaração de Horas)
+  const [showNewTimeForm, setShowNewTimeForm] = useState<boolean>(true);
+  const [timeEmpId, setTimeEmpId] = useState<string>(() => activeEmployees[0]?.id || '');
+  const [timeDate, setTimeDate] = useState<string>(() => {
+    const now = new Date();
+    return formatIsoDate(now.getFullYear(), now.getMonth(), now.getDate());
+  });
+  const [timeScenario, setTimeScenario] = useState<TimeTrackingSubType>('FICOU_MAIS_TARDE');
+  const [plannedStart, setPlannedStart] = useState<string>('07:00');
+  const [plannedEnd, setPlannedEnd] = useState<string>('19:00');
+  const [actualStart, setActualStart] = useState<string>('07:00');
+  const [actualEnd, setActualEnd] = useState<string>('21:00');
+  const [declDelivered, setDeclDelivered] = useState<boolean>(true);
+  const [timeReason, setTimeReason] = useState<string>('');
+  const [timeLogFilter, setTimeLogFilter] = useState<
+    'TODOS' | 'FICOU_MAIS_TARDE' | 'DECLARACOES' | 'DECLARACOES_PENDENTES' | 'DESCONTOS_BH'
+  >('TODOS');
+
+  const selectedTimeEmp = useMemo(
+    () => activeEmployees.find((e) => e.id === timeEmpId) || activeEmployees[0] || null,
+    [activeEmployees, timeEmpId]
+  );
+
+  // Atualiza horários base ao trocar de colaborador ou cenário no formulário rápido
+  const handleSelectTimeEmployee = (empId: string) => {
+    setTimeEmpId(empId);
+    const emp = activeEmployees.find((e) => e.id === empId);
+    if (emp) {
+      const parsed = parseEmployeeWorkHours(emp.workHours);
+      setPlannedStart(parsed.plannedStart);
+      setPlannedEnd(parsed.plannedEnd);
+      applyTimeScenarioPreset(timeScenario, parsed.plannedStart, parsed.plannedEnd);
+    }
+  };
+
+  const applyTimeScenarioPreset = (
+    scenario: TimeTrackingSubType,
+    baseStart = plannedStart,
+    baseEnd = plannedEnd
+  ) => {
+    setTimeScenario(scenario);
+    const addMins = (hhmm: string, delta: number) => {
+      const [h, m] = hhmm.split(':').map(Number);
+      const total = (((h || 0) * 60 + (m || 0) + delta) % 1440 + 1440) % 1440;
+      const nh = Math.floor(total / 60);
+      const nm = total % 60;
+      return `${String(nh).padStart(2, '0')}:${String(nm).padStart(2, '0')}`;
+    };
+
+    if (scenario === 'FICOU_MAIS_TARDE') {
+      setActualStart(baseStart);
+      setActualEnd(addMins(baseEnd, 120));
+    } else if (
+      scenario === 'ENTROU_MAIS_TARDE_DECLARACAO' ||
+      scenario === 'ATRASO_DESCONTO_BH'
+    ) {
+      setActualStart(addMins(baseStart, 120));
+      setActualEnd(baseEnd);
+      if (scenario === 'ENTROU_MAIS_TARDE_DECLARACAO') setDeclDelivered(true);
+    } else if (
+      scenario === 'SAIU_MAIS_CEDO_DECLARACAO' ||
+      scenario === 'SAIDA_ANTECIPADA_BH'
+    ) {
+      setActualStart(baseStart);
+      setActualEnd(addMins(baseEnd, -120));
+      if (scenario === 'SAIU_MAIS_CEDO_DECLARACAO') setDeclDelivered(true);
+    }
+  };
+
+  // Cálculo automático da diferença entre horário previsto e realizado
+  const calculatedFormDiffHours = useMemo(() => {
+    if (timeScenario === 'FICOU_MAIS_TARDE') {
+      return computeHoursDiffBetweenTimes(plannedEnd, actualEnd);
+    }
+    if (
+      timeScenario === 'ENTROU_MAIS_TARDE_DECLARACAO' ||
+      timeScenario === 'ATRASO_DESCONTO_BH'
+    ) {
+      return computeHoursDiffBetweenTimes(plannedStart, actualStart);
+    }
+    if (
+      timeScenario === 'SAIU_MAIS_CEDO_DECLARACAO' ||
+      timeScenario === 'SAIDA_ANTECIPADA_BH'
+    ) {
+      return computeHoursDiffBetweenTimes(actualEnd, plannedEnd);
+    }
+    return 0;
+  }, [timeScenario, plannedStart, plannedEnd, actualStart, actualEnd]);
+
+  const handleSaveTimeControlRecord = () => {
+    if (!selectedTimeEmp || !onApplyLeaveOrOccurrence) return;
+    const duration = Math.max(0.25, calculatedFormDiffHours || 1);
+
+    let recordType: AbsenceRecord['type'] = 'HORA_EXTRA';
+    let bhDelta = 0;
+    let aboned = 0;
+    let labelPrefix = '';
+
+    if (timeScenario === 'FICOU_MAIS_TARDE') {
+      recordType = 'HORA_EXTRA';
+      bhDelta = duration;
+      labelPrefix = `Ficou até mais tarde (+${formatDecimalHoursPtBr(duration)})`;
+    } else if (timeScenario === 'ENTROU_MAIS_TARDE_DECLARACAO') {
+      recordType = 'DECLARACAO_HORAS';
+      bhDelta = 0;
+      aboned = duration;
+      labelPrefix = `Entrou mais tarde c/ Declaração (${formatDecimalHoursPtBr(duration)} abonadas)`;
+    } else if (timeScenario === 'SAIU_MAIS_CEDO_DECLARACAO') {
+      recordType = 'DECLARACAO_HORAS';
+      bhDelta = 0;
+      aboned = duration;
+      labelPrefix = `Saiu mais cedo c/ Declaração (${formatDecimalHoursPtBr(duration)} abonadas)`;
+    } else if (timeScenario === 'ATRASO_DESCONTO_BH') {
+      recordType = 'BANCO_HORAS';
+      bhDelta = -duration;
+      labelPrefix = `Entrou mais tarde sem declaração (-${formatDecimalHoursPtBr(duration)} no BH)`;
+    } else if (timeScenario === 'SAIDA_ANTECIPADA_BH') {
+      recordType = 'BANCO_HORAS';
+      bhDelta = -duration;
+      labelPrefix = `Saiu mais cedo sem declaração (-${formatDecimalHoursPtBr(duration)} no BH)`;
+    }
+
+    const scheduleWindow = `Previsto: ${plannedStart} às ${plannedEnd} · Realizado: ${actualStart} às ${actualEnd}`;
+    const declText =
+      recordType === 'DECLARACAO_HORAS'
+        ? declDelivered
+          ? ' · Declaração Entregue'
+          : ' · Pendente Entregar Declaração'
+        : '';
+    const customNote = timeReason.trim() ? ` — ${timeReason.trim()}` : '';
+    const finalReason = `${labelPrefix} [${scheduleWindow}${declText}]${customNote}`;
+
+    const newRecord: AbsenceRecord = {
+      id: `abs-time-${Date.now()}`,
+      employeeId: selectedTimeEmp.id,
+      type: recordType,
+      timeTrackingSubType: timeScenario,
+      startDate: timeDate,
+      endDate: timeDate,
+      daysCount: 1,
+      reason: finalReason,
+      plannedStartTime: plannedStart,
+      plannedEndTime: plannedEnd,
+      actualStartTime: actualStart,
+      actualEndTime: actualEnd,
+      hoursDuration: bhDelta !== 0 ? bhDelta : aboned,
+      abonedHours: aboned > 0 ? aboned : undefined,
+      declarationDelivered: recordType === 'DECLARACAO_HORAS' ? declDelivered : undefined,
+      createdAt: new Date().toISOString(),
+    };
+
+    onApplyLeaveOrOccurrence({
+      employeeId: selectedTimeEmp.id,
+      record: newRecord,
+      hourBankDelta: bhDelta,
+    });
+
+    setTimeReason('');
+    setFeedbackMsg(
+      `Horário de ${selectedTimeEmp.name} registrado com sucesso (${scheduleWindow})!`
+    );
+    setTimeout(() => setFeedbackMsg(null), 5000);
+  };
+
+  // Lista unificada de todos os registros de controle de horário e declarações de todos os colaboradores
+  const allTimeTrackingLogs = useMemo(() => {
+    const list: {
+      emp: Employee;
+      unitName: string;
+      record: AbsenceRecord;
+    }[] = [];
+
+    for (const emp of activeEmployees) {
+      const uName =
+        state.units.find((u) => u.id === emp.unitId)?.name || 'Unidade Principal';
+      for (const rawRec of emp.history || []) {
+        if (
+          rawRec.type === 'HORA_EXTRA' ||
+          rawRec.type === 'DECLARACAO_HORAS' ||
+          rawRec.type === 'BANCO_HORAS'
+        ) {
+          const rec = hydrateTimeTrackingRecord(rawRec);
+          list.push({ emp, unitName: uName, record: rec });
+        }
+      }
+    }
+
+    return list.sort((a, b) => {
+      const dateCmp = (b.record.startDate || '').localeCompare(a.record.startDate || '');
+      if (dateCmp !== 0) return dateCmp;
+      return (b.record.createdAt || '').localeCompare(a.record.createdAt || '');
+    });
+  }, [activeEmployees, state.units]);
+
+  const filteredTimeLogs = useMemo(() => {
+    return allTimeTrackingLogs.filter(({ emp, record }) => {
+      if (unitFilter !== 'TODAS' && emp.unitId !== unitFilter) return false;
+      if (timeLogFilter === 'FICOU_MAIS_TARDE') {
+        return (
+          record.type === 'HORA_EXTRA' ||
+          record.timeTrackingSubType === 'FICOU_MAIS_TARDE' ||
+          (record.hoursDuration || 0) > 0
+        );
+      }
+      if (timeLogFilter === 'DECLARACOES') {
+        return record.type === 'DECLARACAO_HORAS';
+      }
+      if (timeLogFilter === 'DECLARACOES_PENDENTES') {
+        return record.type === 'DECLARACAO_HORAS' && record.declarationDelivered === false;
+      }
+      if (timeLogFilter === 'DESCONTOS_BH') {
+        return record.type === 'BANCO_HORAS' || (record.hoursDuration || 0) < 0;
+      }
+      return true;
+    });
+  }, [allTimeTrackingLogs, unitFilter, timeLogFilter]);
+
+  const pendingDeclarationsCount = useMemo(
+    () =>
+      allTimeTrackingLogs.filter(
+        ({ record }) =>
+          record.type === 'DECLARACAO_HORAS' && record.declarationDelivered === false
+      ).length,
+    [allTimeTrackingLogs]
   );
 
   const allRoles = useMemo(
@@ -457,12 +704,11 @@ export const HourBankPage: React.FC<HourBankPageProps> = ({
           </div>
           <div>
             <h1 className="text-lg md:text-xl font-bold text-slate-900 tracking-tight">
-              Central de Banco de Horas
+              Central de Banco de Horas &amp; Controle de Horários
             </h1>
             <p className="text-xs text-slate-600 mt-0.5 max-w-2xl">
-              Importe sua planilha de Banco de Horas ou folha de ponto: o sistema identifica
-              automaticamente os colaboradores já cadastrados pelo nome e vincula o saldo de horas
-              a cada um.
+              Controle quem ficou até mais tarde (+BH), quem entrou mais tarde ou saiu mais cedo e
+              entregou Declaração de Horas (abonado), além de importar saldos da sua planilha.
             </p>
           </div>
         </div>
@@ -489,7 +735,7 @@ export const HourBankPage: React.FC<HourBankPageProps> = ({
       </section>
 
       {/* CARDS DE RESUMO DO BANCO DE HORAS */}
-      <section className="no-print grid grid-cols-1 sm:grid-cols-3 gap-4">
+      <section className="no-print grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="bg-white rounded-2xl border border-slate-200 p-4 flex items-center justify-between">
           <div>
             <span className="text-xs font-semibold text-slate-500 block">
@@ -547,6 +793,536 @@ export const HourBankPage: React.FC<HourBankPageProps> = ({
           <div className="w-11 h-11 rounded-2xl bg-slate-100 text-slate-700 flex items-center justify-center">
             <Users className="w-5 h-5" />
           </div>
+        </div>
+
+        <div className="bg-white rounded-2xl border border-slate-200 p-4 flex items-center justify-between">
+          <div>
+            <span className="text-xs font-semibold text-slate-500 block">
+              Horários &amp; Declarações
+            </span>
+            <span className="text-2xl font-extrabold text-indigo-700 tabular-nums mt-1 block">
+              {allTimeTrackingLogs.length}
+            </span>
+            <span className="text-[11px] text-slate-500">
+              {pendingDeclarationsCount > 0 ? (
+                <span className="text-amber-700 font-bold">
+                  {pendingDeclarationsCount} declaração(ões) pendente(s)
+                </span>
+              ) : (
+                'Todas as declarações em dia'
+              )}
+            </span>
+          </div>
+          <div className="w-11 h-11 rounded-2xl bg-indigo-50 text-indigo-600 flex items-center justify-center">
+            <CalendarClock className="w-5 h-5" />
+          </div>
+        </div>
+      </section>
+
+      {/* PAINEL DE CONTROLE DE HORÁRIOS DO DIA (FICOU ATÉ MAIS TARDE / ENTROU MAIS TARDE COM DECLARAÇÃO) */}
+      <section className="no-print bg-white rounded-2xl border border-slate-200 p-5 md:p-6 space-y-5">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-slate-100 pb-4">
+          <div className="flex items-start gap-3">
+            <div className="w-10 h-10 rounded-xl bg-teal-50 text-teal-700 border border-teal-200 flex items-center justify-center shrink-0 mt-0.5">
+              <CalendarClock className="w-5 h-5" />
+            </div>
+            <div>
+              <h2 className="text-base md:text-lg font-bold text-slate-900">
+                Controle Diário de Horários, Prorrogações e Declarações de Horas
+              </h2>
+              <p className="text-xs text-slate-600 mt-0.5">
+                Registre quando um colaborador precisou ficar até mais tarde (+BH) ou quando entrou
+                mais tarde / saiu mais cedo e entregou Declaração de Horas (abonado sem descontar).
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setShowNewTimeForm((v) => !v)}
+            className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold transition-colors cursor-pointer shrink-0"
+          >
+            <Plus className="w-4 h-4 text-teal-400" />
+            <span>{showNewTimeForm ? 'Ocultar Lançamento' : 'Novo Registro de Horário'}</span>
+          </button>
+        </div>
+
+        {showNewTimeForm && selectedTimeEmp && (
+          <div className="p-4 md:p-5 rounded-2xl bg-slate-50 border border-slate-200 space-y-4">
+            {/* Seleção de Colaborador e Data */}
+            <div className="grid grid-cols-1 md:grid-cols-12 gap-3">
+              <div className="md:col-span-7">
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  1. Colaborador
+                </label>
+                <select
+                  value={selectedTimeEmp.id}
+                  onChange={(e) => handleSelectTimeEmployee(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base font-semibold text-slate-900"
+                >
+                  {activeEmployees.map((emp) => {
+                    const uName =
+                      state.units.find((u) => u.id === emp.unitId)?.name || 'Setor';
+                    return (
+                      <option key={emp.id} value={emp.id}>
+                        {emp.name} — {uName} ({emp.workHours || '07:00 às 19:00'}) · Saldo:{' '}
+                        {formatHoursDisplay(emp.hourBankBalance)}
+                      </option>
+                    );
+                  })}
+                </select>
+              </div>
+
+              <div className="md:col-span-5">
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  2. Data da Ocorrência de Horário
+                </label>
+                <input
+                  type="date"
+                  value={timeDate}
+                  onChange={(e) => setTimeDate(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base font-semibold text-slate-900"
+                />
+              </div>
+            </div>
+
+            {/* Seleção do Cenário de Horário */}
+            <div>
+              <label className="block text-xs font-bold text-slate-700 mb-2">
+                3. O que aconteceu com o horário deste colaborador?
+              </label>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => applyTimeScenarioPreset('FICOU_MAIS_TARDE')}
+                  className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
+                    timeScenario === 'FICOU_MAIS_TARDE'
+                      ? 'bg-emerald-900 text-white border-emerald-900 shadow-sm'
+                      : 'bg-white text-slate-800 border-slate-200 hover:border-emerald-300'
+                  }`}
+                >
+                  <span className="text-xs font-extrabold block">
+                    Ficou até mais tarde (+BH)
+                  </span>
+                  <span
+                    className={`text-[11px] mt-0.5 block ${
+                      timeScenario === 'FICOU_MAIS_TARDE'
+                        ? 'text-emerald-200'
+                        : 'text-slate-500'
+                    }`}
+                  >
+                    Prorrogou a saída e soma horas no Banco
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => applyTimeScenarioPreset('ENTROU_MAIS_TARDE_DECLARACAO')}
+                  className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
+                    timeScenario === 'ENTROU_MAIS_TARDE_DECLARACAO'
+                      ? 'bg-sky-900 text-white border-sky-900 shadow-sm'
+                      : 'bg-white text-slate-800 border-slate-200 hover:border-sky-300'
+                  }`}
+                >
+                  <span className="text-xs font-extrabold block">
+                    Entrou mais tarde + Declaração
+                  </span>
+                  <span
+                    className={`text-[11px] mt-0.5 block ${
+                      timeScenario === 'ENTROU_MAIS_TARDE_DECLARACAO'
+                        ? 'text-sky-200'
+                        : 'text-slate-500'
+                    }`}
+                  >
+                    Entregou declaração de horas (Abonado 0h)
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => applyTimeScenarioPreset('SAIU_MAIS_CEDO_DECLARACAO')}
+                  className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
+                    timeScenario === 'SAIU_MAIS_CEDO_DECLARACAO'
+                      ? 'bg-sky-900 text-white border-sky-900 shadow-sm'
+                      : 'bg-white text-slate-800 border-slate-200 hover:border-sky-300'
+                  }`}
+                >
+                  <span className="text-xs font-extrabold block">
+                    Saiu mais cedo + Declaração
+                  </span>
+                  <span
+                    className={`text-[11px] mt-0.5 block ${
+                      timeScenario === 'SAIU_MAIS_CEDO_DECLARACAO'
+                        ? 'text-sky-200'
+                        : 'text-slate-500'
+                    }`}
+                  >
+                    Consulta/exame com declaração (Abonado 0h)
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => applyTimeScenarioPreset('ATRASO_DESCONTO_BH')}
+                  className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
+                    timeScenario === 'ATRASO_DESCONTO_BH' ||
+                    timeScenario === 'SAIDA_ANTECIPADA_BH'
+                      ? 'bg-amber-900 text-white border-amber-900 shadow-sm'
+                      : 'bg-white text-slate-800 border-slate-200 hover:border-amber-300'
+                  }`}
+                >
+                  <span className="text-xs font-extrabold block">
+                    Atraso / Saída sem Declaração (-BH)
+                  </span>
+                  <span
+                    className={`text-[11px] mt-0.5 block ${
+                      timeScenario === 'ATRASO_DESCONTO_BH' ||
+                      timeScenario === 'SAIDA_ANTECIPADA_BH'
+                        ? 'text-amber-200'
+                        : 'text-slate-500'
+                    }`}
+                  >
+                    Desconta as horas não trabalhadas do BH
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            {/* Horário Previsto vs Realizado */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-center bg-white p-3.5 rounded-xl border border-slate-200">
+              <div className="lg:col-span-4 grid grid-cols-2 gap-2.5">
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-500 mb-1">
+                    Entrada Prevista
+                  </label>
+                  <input
+                    type="time"
+                    value={plannedStart}
+                    onChange={(e) => setPlannedStart(e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg border border-slate-300 bg-slate-50 text-base font-bold text-slate-800 tabular-nums"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-500 mb-1">
+                    Saída Prevista
+                  </label>
+                  <input
+                    type="time"
+                    value={plannedEnd}
+                    onChange={(e) => setPlannedEnd(e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg border border-slate-300 bg-slate-50 text-base font-bold text-slate-800 tabular-nums"
+                  />
+                </div>
+              </div>
+
+              <div className="lg:col-span-4 grid grid-cols-2 gap-2.5">
+                <div>
+                  <label className="block text-[11px] font-bold text-teal-800 mb-1">
+                    Entrada Realizada
+                  </label>
+                  <input
+                    type="time"
+                    value={actualStart}
+                    onChange={(e) => setActualStart(e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg border-2 border-teal-500 bg-teal-50/30 text-base font-extrabold text-slate-900 tabular-nums"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-teal-800 mb-1">
+                    Saída Realizada
+                  </label>
+                  <input
+                    type="time"
+                    value={actualEnd}
+                    onChange={(e) => setActualEnd(e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg border-2 border-teal-500 bg-teal-50/30 text-base font-extrabold text-slate-900 tabular-nums"
+                  />
+                </div>
+              </div>
+
+              {/* Resumo Automático do Cálculo */}
+              <div className="lg:col-span-4 p-3 rounded-xl bg-slate-900 text-white flex items-center justify-between">
+                <div>
+                  <span className="text-[10px] uppercase tracking-wider text-slate-400 font-bold block">
+                    Cálculo Automático
+                  </span>
+                  <span className="text-xs font-bold text-slate-200 block mt-0.5">
+                    {timeScenario === 'FICOU_MAIS_TARDE'
+                      ? 'Crédito no Banco de Horas:'
+                      : timeScenario === 'ENTROU_MAIS_TARDE_DECLARACAO' ||
+                        timeScenario === 'SAIU_MAIS_CEDO_DECLARACAO'
+                      ? 'Horas Abonadas c/ Declaração:'
+                      : 'Desconto no Banco de Horas:'}
+                  </span>
+                </div>
+                <span
+                  className={`text-lg font-extrabold tabular-nums px-2.5 py-1 rounded-lg ${
+                    timeScenario === 'FICOU_MAIS_TARDE'
+                      ? 'bg-emerald-500/20 text-emerald-300'
+                      : timeScenario === 'ENTROU_MAIS_TARDE_DECLARACAO' ||
+                        timeScenario === 'SAIU_MAIS_CEDO_DECLARACAO'
+                      ? 'bg-sky-500/20 text-sky-300'
+                      : 'bg-amber-500/20 text-amber-300'
+                  }`}
+                >
+                  {timeScenario === 'FICOU_MAIS_TARDE'
+                    ? `+${formatDecimalHoursPtBr(Math.max(0.25, calculatedFormDiffHours))}`
+                    : timeScenario === 'ENTROU_MAIS_TARDE_DECLARACAO' ||
+                      timeScenario === 'SAIU_MAIS_CEDO_DECLARACAO'
+                    ? `${formatDecimalHoursPtBr(Math.max(0.25, calculatedFormDiffHours))} (0h BH)`
+                    : `-${formatDecimalHoursPtBr(Math.max(0.25, calculatedFormDiffHours))}`}
+                </span>
+              </div>
+            </div>
+
+            {/* Controle de Entrega da Declaração + Observação */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-end">
+              {(timeScenario === 'ENTROU_MAIS_TARDE_DECLARACAO' ||
+                timeScenario === 'SAIU_MAIS_CEDO_DECLARACAO') && (
+                <div className="lg:col-span-5">
+                  <label className="block text-xs font-bold text-slate-700 mb-1">
+                    Situação do Comprovante / Declaração de Horas
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setDeclDelivered(true)}
+                      className={`px-3 py-2.5 rounded-xl border text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer ${
+                        declDelivered
+                          ? 'bg-emerald-600 text-white border-emerald-600'
+                          : 'bg-white text-slate-700 border-slate-300'
+                      }`}
+                    >
+                      <FileCheck2 className="w-4 h-4" />
+                      <span>Já Entregou Papel</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDeclDelivered(false)}
+                      className={`px-3 py-2.5 rounded-xl border text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer ${
+                        !declDelivered
+                          ? 'bg-amber-600 text-white border-amber-600'
+                          : 'bg-white text-slate-700 border-slate-300'
+                      }`}
+                    >
+                      <AlertCircle className="w-4 h-4" />
+                      <span>Pendente Entregar</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div
+                className={
+                  timeScenario === 'ENTROU_MAIS_TARDE_DECLARACAO' ||
+                  timeScenario === 'SAIU_MAIS_CEDO_DECLARACAO'
+                    ? 'lg:col-span-4'
+                    : 'lg:col-span-9'
+                }
+              >
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  Motivo / Observação (Opcional)
+                </label>
+                <input
+                  type="text"
+                  value={timeReason}
+                  onChange={(e) => setTimeReason(e.target.value)}
+                  placeholder={
+                    timeScenario === 'FICOU_MAIS_TARDE'
+                      ? 'Ex: Cobriu atraso de colega / movimento intenso na farmácia...'
+                      : 'Ex: Consulta médica / exames laboratoriais pela manhã...'
+                  }
+                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900"
+                />
+              </div>
+
+              <div className="lg:col-span-3">
+                <button
+                  type="button"
+                  onClick={handleSaveTimeControlRecord}
+                  className="w-full px-4 py-3 rounded-xl bg-[#0d9488] hover:bg-teal-700 text-white text-xs md:text-sm font-bold shadow-sm transition-colors cursor-pointer flex items-center justify-center gap-2"
+                >
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>Registrar Horário</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* HISTÓRICO E CONTROLE DE DECLARAÇÕES E PRORROGAÇÕES DA EQUIPE */}
+        <div className="space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <h3 className="text-sm font-bold text-slate-900">
+              Histórico de Horários, Prorrogações e Declarações ({filteredTimeLogs.length})
+            </h3>
+
+            <div className="flex flex-wrap items-center gap-1.5">
+              {(
+                [
+                  { id: 'TODOS', label: 'Todos' },
+                  { id: 'FICOU_MAIS_TARDE', label: 'Ficou até mais tarde (+BH)' },
+                  { id: 'DECLARACOES', label: 'Declarações de Horas' },
+                  {
+                    id: 'DECLARACOES_PENDENTES',
+                    label: `Declarações Pendentes (${pendingDeclarationsCount})`,
+                  },
+                  { id: 'DESCONTOS_BH', label: 'Atrasos / Folgas (-BH)' },
+                ] as const
+              ).map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setTimeLogFilter(tab.id)}
+                  className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-colors cursor-pointer ${
+                    timeLogFilter === tab.id
+                      ? 'bg-slate-900 text-white'
+                      : 'bg-slate-100 hover:bg-slate-200 text-slate-700'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {filteredTimeLogs.length === 0 ? (
+            <div className="p-6 rounded-2xl bg-slate-50 border border-slate-200 text-center text-xs text-slate-500">
+              Nenhum registro de horário, prorrogação ou declaração encontrado para este filtro. Use
+              o painel acima ou clique em qualquer dia da Escala para registrar.
+            </div>
+          ) : (
+            <div className="space-y-2 max-h-[420px] overflow-y-auto pr-1">
+              {filteredTimeLogs.map(({ emp, unitName, record }) => {
+                const isDecl = record.type === 'DECLARACAO_HORAS';
+                const isPositive =
+                  record.type === 'HORA_EXTRA' || (record.hoursDuration || 0) > 0;
+                const isPendingDecl = isDecl && record.declarationDelivered === false;
+
+                return (
+                  <div
+                    key={record.id}
+                    className={`p-3.5 rounded-xl border flex flex-col lg:flex-row lg:items-center justify-between gap-3 ${
+                      isPendingDecl
+                        ? 'bg-amber-50/60 border-amber-200'
+                        : isDecl
+                        ? 'bg-sky-50/40 border-sky-200'
+                        : isPositive
+                        ? 'bg-emerald-50/40 border-emerald-200'
+                        : 'bg-slate-50 border-slate-200'
+                    }`}
+                  >
+                    <div className="space-y-1 min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-sm font-bold text-slate-900">
+                          {emp.name}
+                        </span>
+                        <span className="px-2 py-0.5 rounded-md bg-white border border-slate-200 text-slate-700 text-[10px] font-bold">
+                          {unitName}
+                        </span>
+                        <span className="text-xs font-bold text-slate-700">
+                          {formatDateWithWeekdayPtBr(record.startDate)}
+                        </span>
+
+                        {isDecl ? (
+                          <span className="px-2 py-0.5 rounded-md bg-sky-100 text-sky-900 text-[10px] font-extrabold">
+                            DECLARAÇÃO DE HORAS (ABONADO)
+                          </span>
+                        ) : isPositive ? (
+                          <span className="px-2 py-0.5 rounded-md bg-emerald-100 text-emerald-900 text-[10px] font-extrabold">
+                            FICOU ATÉ MAIS TARDE / HORA EXTRA
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 rounded-md bg-amber-100 text-amber-900 text-[10px] font-extrabold">
+                            DESCONTO / COMPENSAÇÃO BH
+                          </span>
+                        )}
+                      </div>
+
+                      {record.plannedStartTime && record.actualStartTime && (
+                        <div className="flex flex-wrap items-center gap-3 text-xs text-slate-700 font-semibold tabular-nums">
+                          <span>
+                            Horário Previsto:{' '}
+                            <strong className="text-slate-900">
+                              {record.plannedStartTime} às {record.plannedEndTime}
+                            </strong>
+                          </span>
+                          <span>→</span>
+                          <span>
+                            Horário Realizado:{' '}
+                            <strong className="text-teal-800">
+                              {record.actualStartTime} às {record.actualEndTime}
+                            </strong>
+                          </span>
+                        </div>
+                      )}
+
+                      <p className="text-xs text-slate-600">{record.reason}</p>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      {/* Badge de Impacto no Banco de Horas */}
+                      {isDecl ? (
+                        <span className="px-3 py-1.5 rounded-xl bg-sky-100 text-sky-900 text-xs font-extrabold tabular-nums">
+                          {record.abonedHours
+                            ? `${formatDecimalHoursPtBr(record.abonedHours)} Abonadas (0h BH)`
+                            : 'Abonado (0h BH)'}
+                        </span>
+                      ) : (
+                        <span
+                          className={`px-3 py-1.5 rounded-xl text-xs font-extrabold tabular-nums ${
+                            (record.hoursDuration || 0) >= 0
+                              ? 'bg-emerald-100 text-emerald-800'
+                              : 'bg-red-100 text-red-700'
+                          }`}
+                        >
+                          {formatHoursDisplay(record.hoursDuration || 0)} no BH
+                        </span>
+                      )}
+
+                      {/* Botão para alternar status de entrega da Declaração de Horas */}
+                      {isDecl && onToggleDeclarationDelivered && (
+                        <button
+                          type="button"
+                          onClick={() => onToggleDeclarationDelivered(record.id, emp.id)}
+                          className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer ${
+                            record.declarationDelivered !== false
+                              ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                              : 'bg-amber-500 hover:bg-amber-600 text-white'
+                          }`}
+                          title="Clique para alternar entre Declaração Entregue e Pendente"
+                        >
+                          {record.declarationDelivered !== false ? (
+                            <>
+                              <FileCheck2 className="w-3.5 h-3.5" />
+                              <span>Declaração Entregue</span>
+                            </>
+                          ) : (
+                            <>
+                              <AlertCircle className="w-3.5 h-3.5" />
+                              <span>Pendente Papel (Confirmar)</span>
+                            </>
+                          )}
+                        </button>
+                      )}
+
+                      {/* Botão para excluir / estornar lançamento */}
+                      {onDeleteTimeRecord && (
+                        <button
+                          type="button"
+                          onClick={() => onDeleteTimeRecord(record.id, emp.id)}
+                          className="p-2 rounded-xl bg-white hover:bg-red-50 text-slate-400 hover:text-red-600 border border-slate-200 transition-colors cursor-pointer"
+                          title="Excluir registro e estornar horas do saldo"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       </section>
 
@@ -879,7 +1655,8 @@ export const HourBankPage: React.FC<HourBankPageProps> = ({
                     h.type === 'DECLARACAO_HORAS' ||
                     h.type === 'BANCO_HORAS'
                 )
-                .slice(0, 2);
+                .slice(0, 3)
+                .map((h) => hydrateTimeTrackingRecord(h));
 
               return (
                 <div
@@ -896,15 +1673,28 @@ export const HourBankPage: React.FC<HourBankPageProps> = ({
                           {unitName}
                         </span>
                         <span className="text-xs text-slate-500 font-medium">
-                          {emp.role} · {emp.defaultShift}
+                          {emp.role} · {emp.defaultShift} ({emp.workHours || '07:00 às 19:00'})
                         </span>
                       </div>
 
                       {recentHourLogs.length > 0 && (
-                        <p className="text-[11px] text-slate-500 mt-1 truncate">
-                          Último registro: {recentHourLogs[0].reason} (
-                          {recentHourLogs[0].startDate})
-                        </p>
+                        <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                          {recentHourLogs.map((log) => (
+                            <span
+                              key={log.id}
+                              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold ${
+                                log.type === 'DECLARACAO_HORAS'
+                                  ? 'bg-sky-100 text-sky-900'
+                                  : log.type === 'HORA_EXTRA'
+                                  ? 'bg-emerald-100 text-emerald-900'
+                                  : 'bg-amber-100 text-amber-900'
+                              }`}
+                            >
+                              <span>{log.startDate.slice(8, 10)}/{log.startDate.slice(5, 7)}:</span>
+                              <span className="truncate max-w-[240px]">{log.reason}</span>
+                            </span>
+                          ))}
+                        </div>
                       )}
                     </div>
 

@@ -21,6 +21,7 @@ import {
 } from './types';
 import {
   applyAbsenceToSchedules,
+  computeRegimeShiftForDay,
   createDemoEscalaProState,
   deduplicateEscalaProState,
   generateAutomaticScheduleForMonth,
@@ -828,38 +829,172 @@ export default function App() {
     });
   };
 
-  // Aplica Folga, Atestado Médico, Declaração de Horas, Falta ou Férias via Assistente Manual
+  // Aplica Folga, Atestado Médico, Declaração de Horas, Controle de Horário, Falta ou Férias
   const handleApplyLeaveOrOccurrence = (params: {
     employeeId: string;
     record: AbsenceRecord;
-    scheduleStatusToApply?: 'F' | 'AT' | 'FA' | 'FE';
+    scheduleStatusToApply?: 'F' | 'AT' | 'FA' | 'FE' | 'BH';
     hourBankDelta?: number;
   }) => {
     commitUserMutation((prev) => {
+      const targetEmp = prev.employees.find((e) => e.id === params.employeeId);
       const nextEmployees = prev.employees.map((emp) => {
         if (emp.id !== params.employeeId) return emp;
+        const nextBal =
+          Math.round((emp.hourBankBalance + (params.hourBankDelta || 0)) * 100) / 100;
         return {
           ...emp,
-          hourBankBalance: emp.hourBankBalance + (params.hourBankDelta || 0),
+          hourBankBalance: nextBal,
           history: [params.record, ...emp.history],
         };
       });
 
-      const nextSchedules = params.scheduleStatusToApply
-        ? applyAbsenceToSchedules(
-            prev.schedules,
-            params.employeeId,
-            params.record.startDate,
-            params.record.daysCount,
-            params.scheduleStatusToApply,
-            params.record.reason
-          )
-        : prev.schedules;
+      let nextSchedules = prev.schedules;
+
+      if (params.scheduleStatusToApply && params.scheduleStatusToApply !== 'BH') {
+        nextSchedules = applyAbsenceToSchedules(
+          prev.schedules,
+          params.employeeId,
+          params.record.startDate,
+          params.record.daysCount,
+          params.scheduleStatusToApply,
+          params.record.reason
+        );
+      } else if (
+        targetEmp &&
+        (params.record.type === 'DECLARACAO_HORAS' ||
+          params.record.type === 'HORA_EXTRA' ||
+          params.record.type === 'BANCO_HORAS' ||
+          params.scheduleStatusToApply === 'BH')
+      ) {
+        const { year, monthIndex0, day } = parseIsoDateParts(params.record.startDate);
+        const ymKey = getYearMonthKey(year, monthIndex0);
+        const monthMap = { ...(prev.schedules[ymKey] || {}) };
+        const empMap = { ...(monthMap[params.employeeId] || {}) };
+        const existingCell = empMap[day];
+        const defaultStatus = computeRegimeShiftForDay(targetEmp, year, monthIndex0, day);
+
+        empMap[day] = {
+          ...(existingCell || {}),
+          status:
+            params.scheduleStatusToApply === 'BH'
+              ? 'BH'
+              : existingCell?.status || defaultStatus,
+          note: params.record.reason,
+          extraHours:
+            params.hourBankDelta !== undefined && params.hourBankDelta !== 0
+              ? Math.round(((existingCell?.extraHours || 0) + params.hourBankDelta) * 100) / 100
+              : existingCell?.extraHours,
+          timeTrackingSubType: params.record.timeTrackingSubType,
+          plannedStartTime: params.record.plannedStartTime,
+          plannedEndTime: params.record.plannedEndTime,
+          actualStartTime: params.record.actualStartTime,
+          actualEndTime: params.record.actualEndTime,
+          declarationDelivered: params.record.declarationDelivered,
+          abonedHours:
+            (params.hourBankDelta || 0) === 0 && params.record.hoursDuration
+              ? params.record.hoursDuration
+              : existingCell?.abonedHours,
+        };
+        monthMap[params.employeeId] = empMap;
+        nextSchedules = {
+          ...prev.schedules,
+          [ymKey]: monthMap,
+        };
+      }
 
       return {
         ...prev,
         employees: nextEmployees,
         schedules: nextSchedules,
+        lastUpdated: new Date().toISOString(),
+      };
+    });
+  };
+
+  // Alterna o status de entrega física da Declaração de Horas (Entregue <-> Pendente entregar papel)
+  const handleToggleDeclarationDelivered = (employeeId: string, recordId: string) => {
+    commitUserMutation((prev) => {
+      let updatedDateIso = '';
+      let updatedDelivered = true;
+      let updatedReason = '';
+
+      const nextEmployees = prev.employees.map((emp) => {
+        if (emp.id !== employeeId) return emp;
+        const nextHistory = (emp.history || []).map((rec) => {
+          if (rec.id !== recordId) return rec;
+          const nextDeliv = !rec.declarationDelivered;
+          updatedDateIso = rec.startDate;
+          updatedDelivered = nextDeliv;
+          let cleanReason = rec.reason
+            .replace(/·\s*Declaração Entregue/gi, '')
+            .replace(/·\s*Pendente entregar declaração/gi, '')
+            .trim();
+          cleanReason = `${cleanReason} · ${
+            nextDeliv ? 'Declaração Entregue' : 'Pendente entregar declaração'
+          }`;
+          updatedReason = cleanReason;
+          return {
+            ...rec,
+            declarationDelivered: nextDeliv,
+            reason: cleanReason,
+          };
+        });
+        return {
+          ...emp,
+          history: nextHistory,
+        };
+      });
+
+      let nextSchedules = prev.schedules;
+      if (updatedDateIso) {
+        const { year, monthIndex0, day } = parseIsoDateParts(updatedDateIso);
+        const ymKey = getYearMonthKey(year, monthIndex0);
+        const existingCell = prev.schedules[ymKey]?.[employeeId]?.[day];
+        if (existingCell) {
+          const monthMap = { ...(prev.schedules[ymKey] || {}) };
+          const empMap = { ...(monthMap[employeeId] || {}) };
+          empMap[day] = {
+            ...existingCell,
+            declarationDelivered: updatedDelivered,
+            note: updatedReason || existingCell.note,
+          };
+          monthMap[employeeId] = empMap;
+          nextSchedules = {
+            ...prev.schedules,
+            [ymKey]: monthMap,
+          };
+        }
+      }
+
+      return {
+        ...prev,
+        employees: nextEmployees,
+        schedules: nextSchedules,
+        lastUpdated: new Date().toISOString(),
+      };
+    });
+  };
+
+  // Exclui um lançamento de horário/declaração e estorna eventual impacto no Banco de Horas
+  const handleDeleteTimeRecord = (employeeId: string, recordId: string) => {
+    commitUserMutation((prev) => {
+      const nextEmployees = prev.employees.map((emp) => {
+        if (emp.id !== employeeId) return emp;
+        const targetRec = (emp.history || []).find((r) => r.id === recordId);
+        if (!targetRec) return emp;
+        const revertDelta = -(Number(targetRec.extraHours) || 0);
+        const nextBal = Math.round((emp.hourBankBalance + revertDelta) * 100) / 100;
+        return {
+          ...emp,
+          hourBankBalance: nextBal,
+          history: (emp.history || []).filter((r) => r.id !== recordId),
+        };
+      });
+
+      return {
+        ...prev,
+        employees: nextEmployees,
         lastUpdated: new Date().toISOString(),
       };
     });
@@ -1408,6 +1543,9 @@ export default function App() {
               state={state}
               onApplyHourBankBatch={handleApplyHourBankBatch}
               onUpdateSingleEmployeeHourBank={handleUpdateSingleEmployeeHourBank}
+              onApplyLeaveOrOccurrence={handleApplyLeaveOrOccurrence}
+              onToggleDeclarationDelivered={handleToggleDeclarationDelivered}
+              onDeleteTimeRecord={handleDeleteTimeRecord}
             />
           )}
 

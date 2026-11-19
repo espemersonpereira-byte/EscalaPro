@@ -43,6 +43,7 @@ import {
 import {
   computeRegimeShiftForDay,
   deduplicateEscalaProState,
+  hydrateTimeTrackingRecord,
   reapplyEmployeeHistoryToSchedules,
 } from './storageService';
 
@@ -569,7 +570,7 @@ export async function loadWorkspaceFromFirestore(
           ? d.createdAt.toDate().toISOString()
           : new Date(0).toISOString();
 
-      const rec: AbsenceRecord = {
+      const rec: AbsenceRecord = hydrateTimeTrackingRecord({
         id: docSnap.id,
         employeeId: empId,
         type: mappedType,
@@ -580,7 +581,7 @@ export async function loadWorkspaceFromFirestore(
         reason: String(d.reason || ''),
         cid: d.cid ? String(d.cid) : undefined,
         createdAt: recCreatedAt,
-      };
+      });
       if (!absencesByEmployee[empId]) {
         absencesByEmployee[empId] = [];
       }

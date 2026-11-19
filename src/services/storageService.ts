@@ -10,6 +10,7 @@ import {
   ScheduleCycleSlot,
   SchedulePeriodViewMode,
   ShiftStatus,
+  TimeTrackingSubType,
   UserAccount,
 } from '../types';
 
@@ -146,6 +147,169 @@ export function formatDateWithWeekdayPtBr(isoDate: string): string {
   });
   const weekdayPart = dObj.toLocaleDateString('pt-BR', { weekday: 'long' });
   return `${datePart} (${weekdayPart})`;
+}
+
+/**
+ * Extrai o horário de entrada e saída padrão do colaborador a partir de emp.workHours (ex: "07:00 às 19:00")
+ */
+export function parseEmployeeWorkHours(
+  workHoursStr?: string,
+  defaultShift: 'Diurno' | 'Noturno' = 'Diurno'
+): { plannedStart: string; plannedEnd: string } {
+  const match = String(workHoursStr || '').match(
+    /(\d{1,2}):(\d{2})\s*(?:às|a|-)\s*(\d{1,2}):(\d{2})/i
+  );
+  if (match) {
+    const h1 = String(Math.min(23, Math.max(0, Number(match[1])))).padStart(2, '0');
+    const m1 = String(Math.min(59, Math.max(0, Number(match[2])))).padStart(2, '0');
+    const h2 = String(Math.min(23, Math.max(0, Number(match[3])))).padStart(2, '0');
+    const m2 = String(Math.min(59, Math.max(0, Number(match[4])))).padStart(2, '0');
+    return {
+      plannedStart: `${h1}:${m1}`,
+      plannedEnd: `${h2}:${m2}`,
+    };
+  }
+  return defaultShift === 'Noturno'
+    ? { plannedStart: '19:00', plannedEnd: '07:00' }
+    : { plannedStart: '07:00', plannedEnd: '19:00' };
+}
+
+export function timeStringToMinutes(timeStr: string): number | null {
+  const match = String(timeStr || '').trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+  const h = Number(match[1]);
+  const m = Number(match[2]);
+  if (h < 0 || h > 23 || m < 0 || m > 59) return null;
+  return h * 60 + m;
+}
+
+/**
+ * Calcula a diferença positiva em horas decimais entre dois horários (ex: "17:00" até "19:30" = 2.5h)
+ */
+export function computeHoursDiffBetweenTimes(fromTime: string, toTime: string): number {
+  const m1 = timeStringToMinutes(fromTime);
+  const m2 = timeStringToMinutes(toTime);
+  if (m1 === null || m2 === null) return 0;
+  let diff = m2 - m1;
+  if (diff < 0) {
+    diff += 24 * 60;
+  }
+  if (diff > 16 * 60) {
+    return 0;
+  }
+  return Math.round((diff / 60) * 100) / 100;
+}
+
+export function formatDecimalHoursPtBr(hours: number, showPlusSign = false): string {
+  const num = Math.round((Number(hours) || 0) * 100) / 100;
+  const sign = num > 0 ? (showPlusSign ? '+' : '') : num < 0 ? '-' : '';
+  const abs = Math.abs(num);
+  const wholeHours = Math.floor(abs);
+  const mins = Math.round((abs - wholeHours) * 60);
+  if (mins === 0) {
+    return `${sign}${wholeHours}h`;
+  }
+  return `${sign}${wholeHours}h${String(mins).padStart(2, '0')}m`;
+}
+
+/**
+ * Hidrata metadados de controle de horário (ficou até mais tarde, entrou mais tarde c/ declaração, atraso, etc.)
+ * a partir do texto de `reason` caso o registro tenha vindo do Firestore.
+ */
+export function hydrateTimeTrackingRecord(rec: AbsenceRecord): AbsenceRecord {
+  const reason = String(rec.reason || '');
+  const lower = reason.toLowerCase();
+
+  let subType: TimeTrackingSubType | undefined = rec.timeTrackingSubType;
+  if (!subType) {
+    if (lower.includes('ficou até mais tarde') || lower.includes('prorrogação de horário')) {
+      subType = 'FICOU_MAIS_TARDE';
+    } else if (lower.includes('entrou mais tarde') && (lower.includes('declaração') || lower.includes('abonad'))) {
+      subType = 'ENTROU_MAIS_TARDE_DECLARACAO';
+    } else if (lower.includes('saiu mais cedo') && (lower.includes('declaração') || lower.includes('abonad'))) {
+      subType = 'SAIU_MAIS_CEDO_DECLARACAO';
+    } else if (lower.includes('entrou mais tarde') || lower.includes('atraso na entrada')) {
+      subType = 'ATRASO_DESCONTO_BH';
+    } else if (lower.includes('saiu mais cedo') || lower.includes('saída antecipada')) {
+      subType = 'SAIDA_ANTECIPADA_BH';
+    } else if (rec.type === 'DECLARACAO_HORAS' && lower.includes('declaração')) {
+      subType = 'ENTROU_MAIS_TARDE_DECLARACAO';
+    } else if (rec.type === 'BANCO_HORAS' && lower.includes('folga bh')) {
+      subType = 'FOLGA_BH';
+    } else if (rec.type === 'HORA_EXTRA') {
+      subType = 'HORA_EXTRA_DOBRA';
+    }
+  }
+
+  let plannedStart = rec.plannedStartTime;
+  let plannedEnd = rec.plannedEndTime;
+  const plannedMatch = reason.match(/Previsto:\s*(\d{2}:\d{2})\s*às\s*(\d{2}:\d{2})/i);
+  if (plannedMatch) {
+    if (!plannedStart) plannedStart = plannedMatch[1];
+    if (!plannedEnd) plannedEnd = plannedMatch[2];
+  }
+
+  let actualStart = rec.actualStartTime;
+  let actualEnd = rec.actualEndTime;
+  const actualMatch = reason.match(/Realizado:\s*(\d{2}:\d{2})\s*às\s*(\d{2}:\d{2})/i);
+  if (actualMatch) {
+    if (!actualStart) actualStart = actualMatch[1];
+    if (!actualEnd) actualEnd = actualMatch[2];
+  } else {
+    const enterMatch = reason.match(/Entrou\s*(?:às\s*)?(\d{2}:\d{2})/i);
+    if (enterMatch && !actualStart) actualStart = enterMatch[1];
+    const exitMatch = reason.match(/Saiu\s*(?:às\s*)?(\d{2}:\d{2})/i);
+    if (exitMatch && !actualEnd) actualEnd = exitMatch[1];
+  }
+
+  let declarationDelivered = rec.declarationDelivered;
+  if (declarationDelivered === undefined && (subType === 'ENTROU_MAIS_TARDE_DECLARACAO' || subType === 'SAIU_MAIS_CEDO_DECLARACAO' || rec.type === 'DECLARACAO_HORAS')) {
+    if (lower.includes('pendente entregar') || lower.includes('vai entregar')) {
+      declarationDelivered = false;
+    } else if (lower.includes('declaração entregue') || lower.includes('entregou declaração') || lower.includes('comparecimento')) {
+      declarationDelivered = true;
+    }
+  }
+
+  let extraHours = rec.extraHours;
+  let hoursDuration = rec.hoursDuration;
+
+  const plusMatch = reason.match(/\+(\d+(?:[.,]\d+)?)h(?:\d{2}m)?/);
+  const minusMatch = reason.match(/-(\d+(?:[.,]\d+)?)h(?:\d{2}m)?/);
+  const hmMatch = reason.match(/([+-]?)(\d+)h(\d{2})m/i);
+  const abonMatch = reason.match(/(\d+(?:[.,]\d+)?)h(?:\d{2}m)?\s*abonad/i);
+
+  if (hmMatch) {
+    const sign = hmMatch[1] === '-' ? -1 : 1;
+    const val = Math.round((Number(hmMatch[2]) + Number(hmMatch[3]) / 60) * 100) / 100;
+    if (hoursDuration === undefined) hoursDuration = val;
+    if (extraHours === undefined && !lower.includes('abonad')) {
+      extraHours = sign * val;
+    }
+  } else if (plusMatch && extraHours === undefined) {
+    const val = Number(plusMatch[1].replace(',', '.'));
+    extraHours = val;
+    if (hoursDuration === undefined) hoursDuration = val;
+  } else if (minusMatch && extraHours === undefined) {
+    const val = Number(minusMatch[1].replace(',', '.'));
+    extraHours = -val;
+    if (hoursDuration === undefined) hoursDuration = val;
+  } else if (abonMatch && hoursDuration === undefined) {
+    hoursDuration = Number(abonMatch[1].replace(',', '.'));
+    if (extraHours === undefined) extraHours = 0;
+  }
+
+  return {
+    ...rec,
+    timeTrackingSubType: subType,
+    plannedStartTime: plannedStart,
+    plannedEndTime: plannedEnd,
+    actualStartTime: actualStart,
+    actualEndTime: actualEnd,
+    declarationDelivered,
+    hoursDuration,
+    extraHours,
+  };
 }
 
 // Calcula o status padrão de escala de um colaborador para um dia específico

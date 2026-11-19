@@ -16,12 +16,15 @@ import {
 } from '../types';
 import {
   buildFortnightCycleSlots,
+  computeHoursDiffBetweenTimes,
   computeRegimeShiftForDay,
+  formatDecimalHoursPtBr,
   formatIsoDate,
   getDaysInMonth,
   getNextYearMonth,
   getYearMonthKey,
   matchEmployeeByName,
+  parseEmployeeWorkHours,
 } from '../services/storageService';
 import {
   AlertCircle,
@@ -165,9 +168,19 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
   const [cellNote, setCellNote] = useState<string>('');
   const [swapPartnerId, setSwapPartnerId] = useState<string>('');
   const [swapReturnDate, setSwapReturnDate] = useState<string>('');
-  const [extraHoursInput, setExtraHoursInput] = useState<number>(6);
+  const [extraHoursInput, setExtraHoursInput] = useState<number>(2);
   const [bhDeductHoursInput, setBhDeductHoursInput] = useState<number>(12);
-  const [hourTabMode, setHourTabMode] = useState<'CREDITO' | 'DESCONTO_BH'>('CREDITO');
+  const [hourTabMode, setHourTabMode] = useState<
+    'CREDITO' | 'DECLARACAO_HORAS' | 'ATRASO_BH' | 'DESCONTO_BH'
+  >('CREDITO');
+  const [cellPlannedStart, setCellPlannedStart] = useState<string>('07:00');
+  const [cellPlannedEnd, setCellPlannedEnd] = useState<string>('19:00');
+  const [cellActualStart, setCellActualStart] = useState<string>('09:00');
+  const [cellActualEnd, setCellActualEnd] = useState<string>('21:00');
+  const [cellDeclarationDelivered, setCellDeclarationDelivered] = useState<boolean>(true);
+  const [cellLateOrEarlyMode, setCellLateOrEarlyMode] = useState<
+    'ENTROU_MAIS_TARDE' | 'SAIU_MAIS_CEDO'
+  >('ENTROU_MAIS_TARDE');
 
   // Modal de Radar de Cobertura Mínima (sugere folguistas para cobrir um dia com déficit)
   const [coverageSlotModal, setCoverageSlotModal] = useState<ScheduleCycleSlot | null>(null);
@@ -387,15 +400,56 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
           nextDateObj.getDate()
         )
     );
+    const { plannedStart, plannedEnd } = parseEmployeeWorkHours(
+      emp.workHours,
+      emp.defaultShift
+    );
+    const addH = (base: string, delta: number) => {
+      const [h, m] = base.split(':').map(Number);
+      const totalM = ((h || 0) * 60 + (m || 0) + Math.round(delta * 60) + 24 * 60) % (24 * 60);
+      return `${String(Math.floor(totalM / 60)).padStart(2, '0')}:${String(totalM % 60).padStart(
+        2,
+        '0'
+      )}`;
+    };
+
+    setCellPlannedStart(cell.plannedStartTime || plannedStart);
+    setCellPlannedEnd(cell.plannedEndTime || plannedEnd);
+    setCellActualStart(cell.actualStartTime || addH(plannedStart, 2));
+    setCellActualEnd(cell.actualEndTime || addH(plannedEnd, 2));
+    setCellDeclarationDelivered(cell.declarationDelivered ?? true);
+    setCellLateOrEarlyMode(
+      cell.timeTrackingSubType === 'SAIU_MAIS_CEDO_DECLARACAO' ||
+        cell.timeTrackingSubType === 'SAIDA_ANTECIPADA_BH'
+        ? 'SAIU_MAIS_CEDO'
+        : 'ENTROU_MAIS_TARDE'
+    );
+
     setExtraHoursInput(
-      cell.extraHours && cell.extraHours > 0 ? cell.extraHours : 6
+      cell.extraHours && cell.extraHours !== 0
+        ? Math.abs(cell.extraHours)
+        : cell.abonedHours && cell.abonedHours > 0
+        ? cell.abonedHours
+        : 2
     );
     const defaultDeduct =
       cell.status === 'BH' && cell.extraHours && cell.extraHours < 0
         ? Math.abs(cell.extraHours)
         : inferDefaultShiftHours(emp);
     setBhDeductHoursInput(defaultDeduct);
-    setHourTabMode(cell.status === 'BH' ? 'DESCONTO_BH' : 'CREDITO');
+    setHourTabMode(
+      cell.status === 'BH'
+        ? 'DESCONTO_BH'
+        : cell.timeTrackingSubType === 'ENTROU_MAIS_TARDE_DECLARACAO' ||
+          cell.timeTrackingSubType === 'SAIU_MAIS_CEDO_DECLARACAO' ||
+          (cell.abonedHours && cell.abonedHours > 0)
+        ? 'DECLARACAO_HORAS'
+        : cell.timeTrackingSubType === 'ATRASO_DESCONTO_BH' ||
+          cell.timeTrackingSubType === 'SAIDA_ANTECIPADA_BH' ||
+          (cell.extraHours && cell.extraHours < 0)
+        ? 'ATRASO_BH'
+        : 'CREDITO'
+    );
   };
 
   const handleSaveCellAction = (e: React.FormEvent) => {
@@ -596,19 +650,169 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
             historyRecord,
           }
         );
+      } else if (hourTabMode === 'DECLARACAO_HORAS') {
+        const hours = Math.max(0.25, Math.round((Number(extraHoursInput) || 1) * 100) / 100);
+        const formattedHrs = formatDecimalHoursPtBr(hours, false);
+        const prevExtra = Number(currentCell.extraHours) || 0;
+        const revertDelta = prevExtra !== 0 ? Math.round(-prevExtra * 100) / 100 : 0;
+
+        const isLateEntry = cellLateOrEarlyMode === 'ENTROU_MAIS_TARDE';
+        const subType = isLateEntry
+          ? 'ENTROU_MAIS_TARDE_DECLARACAO'
+          : 'SAIU_MAIS_CEDO_DECLARACAO';
+        const effectiveActualStart = isLateEntry ? cellActualStart : cellPlannedStart;
+        const effectiveActualEnd = isLateEntry ? cellPlannedEnd : cellActualEnd;
+        const delivText = cellDeclarationDelivered
+          ? 'Declaração Entregue'
+          : 'Pendente entregar declaração';
+
+        const autoDesc = isLateEntry
+          ? `Entrou mais tarde às ${effectiveActualStart} c/ Declaração de Horas (${formattedHrs} abonadas · Previsto: ${cellPlannedStart} às ${cellPlannedEnd} · Realizado: ${effectiveActualStart} às ${effectiveActualEnd} · ${delivText})`
+          : `Saiu mais cedo às ${effectiveActualEnd} c/ Declaração de Horas (${formattedHrs} abonadas · Previsto: ${cellPlannedStart} às ${cellPlannedEnd} · Realizado: ${effectiveActualStart} às ${effectiveActualEnd} · ${delivText})`;
+
+        const effectiveNote = cellNote.trim() ? `${autoDesc} — ${cellNote.trim()}` : autoDesc;
+
+        const historyRecord: AbsenceRecord = {
+          id: `decl-${Date.now()}`,
+          employeeId: employee.id,
+          type: 'DECLARACAO_HORAS',
+          startDate: dateIso,
+          endDate: dateIso,
+          daysCount: 1,
+          shift: employee.defaultShift,
+          extraHours: 0,
+          hoursDuration: hours,
+          timeTrackingSubType: subType,
+          plannedStartTime: cellPlannedStart,
+          plannedEndTime: cellPlannedEnd,
+          actualStartTime: effectiveActualStart,
+          actualEndTime: effectiveActualEnd,
+          declarationDelivered: cellDeclarationDelivered,
+          reason: effectiveNote,
+          createdAt: new Date().toISOString(),
+        };
+
+        const activeShiftCode: ShiftStatus =
+          currentCell.status === 'D' || currentCell.status === 'N'
+            ? currentCell.status
+            : employee.defaultShift === 'Noturno'
+            ? 'N'
+            : 'D';
+
+        onUpdateScheduleCell(
+          slot.year,
+          slot.monthIndex0,
+          employee.id,
+          slot.day,
+          {
+            ...editingCell.currentCell,
+            status: activeShiftCode,
+            extraHours: 0,
+            abonedHours: hours,
+            timeTrackingSubType: subType,
+            plannedStartTime: cellPlannedStart,
+            plannedEndTime: cellPlannedEnd,
+            actualStartTime: effectiveActualStart,
+            actualEndTime: effectiveActualEnd,
+            declarationDelivered: cellDeclarationDelivered,
+            note: effectiveNote,
+          },
+          {
+            extraHoursDelta: revertDelta,
+            historyRecord,
+          }
+        );
+      } else if (hourTabMode === 'ATRASO_BH') {
+        const hours = Math.max(0.25, Math.round((Number(extraHoursInput) || 1) * 100) / 100);
+        const formattedHrs = formatDecimalHoursPtBr(hours, false);
+        const newDelta = -hours;
+        const prevExtra = Number(currentCell.extraHours) || 0;
+        const netDelta = Math.round((newDelta - prevExtra) * 100) / 100;
+
+        const isLateEntry = cellLateOrEarlyMode === 'ENTROU_MAIS_TARDE';
+        const subType = isLateEntry ? 'ATRASO_DESCONTO_BH' : 'SAIDA_ANTECIPADA_BH';
+        const effectiveActualStart = isLateEntry ? cellActualStart : cellPlannedStart;
+        const effectiveActualEnd = isLateEntry ? cellPlannedEnd : cellActualEnd;
+
+        const autoDesc = isLateEntry
+          ? `Entrou mais tarde às ${effectiveActualStart} sem declaração (-${formattedHrs} no Banco de Horas · Previsto: ${cellPlannedStart} às ${cellPlannedEnd} · Realizado: ${effectiveActualStart} às ${effectiveActualEnd})`
+          : `Saiu mais cedo às ${effectiveActualEnd} sem declaração (-${formattedHrs} no Banco de Horas · Previsto: ${cellPlannedStart} às ${cellPlannedEnd} · Realizado: ${effectiveActualStart} às ${effectiveActualEnd})`;
+
+        const effectiveNote = cellNote.trim() ? `${autoDesc} — ${cellNote.trim()}` : autoDesc;
+
+        const historyRecord: AbsenceRecord = {
+          id: `atraso-${Date.now()}`,
+          employeeId: employee.id,
+          type: 'DECLARACAO_HORAS',
+          startDate: dateIso,
+          endDate: dateIso,
+          daysCount: 1,
+          shift: employee.defaultShift,
+          extraHours: newDelta,
+          hoursDuration: hours,
+          timeTrackingSubType: subType,
+          plannedStartTime: cellPlannedStart,
+          plannedEndTime: cellPlannedEnd,
+          actualStartTime: effectiveActualStart,
+          actualEndTime: effectiveActualEnd,
+          reason: effectiveNote,
+          createdAt: new Date().toISOString(),
+        };
+
+        const activeShiftCode: ShiftStatus =
+          currentCell.status === 'D' || currentCell.status === 'N'
+            ? currentCell.status
+            : employee.defaultShift === 'Noturno'
+            ? 'N'
+            : 'D';
+
+        onUpdateScheduleCell(
+          slot.year,
+          slot.monthIndex0,
+          employee.id,
+          slot.day,
+          {
+            ...editingCell.currentCell,
+            status: activeShiftCode,
+            extraHours: newDelta,
+            abonedHours: undefined,
+            timeTrackingSubType: subType,
+            plannedStartTime: cellPlannedStart,
+            plannedEndTime: cellPlannedEnd,
+            actualStartTime: effectiveActualStart,
+            actualEndTime: effectiveActualEnd,
+            note: effectiveNote,
+          },
+          {
+            extraHoursDelta: netDelta,
+            historyRecord,
+          }
+        );
       } else {
-        const hours = Number(extraHoursInput) || 0;
-        const revertDelta = prevBhDelta < 0 ? Math.round(-prevBhDelta * 100) / 100 : 0;
+        const hours = Math.max(0.25, Math.round((Number(extraHoursInput) || 1) * 100) / 100);
+        const formattedHrs = formatDecimalHoursPtBr(hours, false);
+        const prevExtra = Number(currentCell.extraHours) || 0;
+        const netDelta = Math.round((hours - prevExtra) * 100) / 100;
+
+        const autoDesc = `Ficou até mais tarde (+${formattedHrs} no Banco de Horas · Previsto: ${cellPlannedStart} às ${cellPlannedEnd} · Realizado: ${cellPlannedStart} às ${cellActualEnd})`;
+        const effectiveNote = cellNote.trim() ? `${autoDesc} — ${cellNote.trim()}` : autoDesc;
+
         const historyRecord: AbsenceRecord = {
           id: `he-${Date.now()}`,
           employeeId: employee.id,
           type: 'HORA_EXTRA',
           startDate: dateIso,
+          endDate: dateIso,
           daysCount: 1,
           shift: employee.defaultShift,
           extraHours: hours,
-          reason:
-            cellNote.trim() || `Dobra / Hora Extra (+${hours}h) creditada no Banco de Horas.`,
+          hoursDuration: hours,
+          timeTrackingSubType: 'FICOU_MAIS_TARDE',
+          plannedStartTime: cellPlannedStart,
+          plannedEndTime: cellPlannedEnd,
+          actualStartTime: cellPlannedStart,
+          actualEndTime: cellActualEnd,
+          reason: effectiveNote,
           createdAt: new Date().toISOString(),
         };
 
@@ -619,12 +823,23 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
           slot.day,
           {
             ...editingCell.currentCell,
-            status: employee.defaultShift === 'Noturno' ? 'N' : 'D',
+            status:
+              currentCell.status === 'D' || currentCell.status === 'N'
+                ? currentCell.status
+                : employee.defaultShift === 'Noturno'
+                ? 'N'
+                : 'D',
             extraHours: hours,
-            note: `Dobra / +${hours}h no Banco de Horas`,
+            abonedHours: undefined,
+            timeTrackingSubType: 'FICOU_MAIS_TARDE',
+            plannedStartTime: cellPlannedStart,
+            plannedEndTime: cellPlannedEnd,
+            actualStartTime: cellPlannedStart,
+            actualEndTime: cellActualEnd,
+            note: effectiveNote,
           },
           {
-            extraHoursDelta: hours + revertDelta,
+            extraHoursDelta: netDelta,
             historyRecord,
           }
         );
@@ -1271,11 +1486,28 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                               <span>{meta.code}</span>
                               {cell.extraHours && cell.extraHours > 0 ? (
                                 <span className="w-1.5 h-1.5 rounded-full bg-amber-300 absolute top-0.5 right-0.5" />
+                              ) : cell.abonedHours && cell.abonedHours > 0 ? (
+                                <span className="w-1.5 h-1.5 rounded-full bg-teal-200 ring-1 ring-slate-900/30 absolute top-0.5 right-0.5" />
+                              ) : cell.extraHours && cell.extraHours < 0 && cell.status !== 'BH' ? (
+                                <span className="w-1.5 h-1.5 rounded-full bg-red-300 ring-1 ring-slate-900/30 absolute top-0.5 right-0.5" />
                               ) : null}
                               {hasUnitOverride ? (
                                 <span className="w-1.5 h-1.5 rounded-full bg-cyan-300 ring-1 ring-slate-900/40 absolute bottom-0.5 right-0.5" />
                               ) : null}
                             </button>
+                            {cell.extraHours && cell.extraHours > 0 ? (
+                              <div className="text-[9px] font-extrabold text-emerald-700 leading-none mt-0.5 tabular-nums">
+                                +{ cell.extraHours }h
+                              </div>
+                            ) : cell.abonedHours && cell.abonedHours > 0 ? (
+                              <div className="text-[8px] font-extrabold text-teal-700 leading-none mt-0.5">
+                                DECL
+                              </div>
+                            ) : cell.extraHours && cell.extraHours < 0 && cell.status !== 'BH' ? (
+                              <div className="text-[9px] font-extrabold text-red-600 leading-none mt-0.5 tabular-nums">
+                                {cell.extraHours}h
+                              </div>
+                            ) : null}
                           </td>
                         );
                       })}
@@ -1421,7 +1653,7 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
                     : 'text-slate-600 hover:text-slate-900'
                 }`}
               >
-                Hora Extra / Banco
+                Horário / Declaração
               </button>
             </div>
 
@@ -1616,77 +1848,432 @@ export const SchedulePage: React.FC<SchedulePageProps> = ({
 
               {modalTab === 'HORA_EXTRA' && (
                 <div className="space-y-4">
-                  <div className="grid grid-cols-2 gap-2 p-1 rounded-xl bg-slate-100 border border-slate-200">
+                  <div className="grid grid-cols-2 gap-2 p-1.5 rounded-xl bg-slate-100 border border-slate-200">
                     <button
                       type="button"
                       onClick={() => setHourTabMode('CREDITO')}
-                      className={`py-2 px-3 rounded-lg text-xs font-bold transition-colors cursor-pointer ${
+                      className={`py-2 px-2.5 rounded-lg text-xs font-bold transition-colors cursor-pointer text-left ${
                         hourTabMode === 'CREDITO'
-                          ? 'bg-teal-600 text-white shadow-xs'
-                          : 'text-slate-600 hover:text-slate-900'
+                          ? 'bg-emerald-700 text-white shadow-xs'
+                          : 'text-slate-700 hover:bg-white/60'
                       }`}
                     >
-                      + Hora Extra / Dobra
+                      <div>1. Ficou até mais tarde</div>
+                      <div className="text-[10px] font-normal opacity-85">
+                        Soma Hora Extra (+BH)
+                      </div>
                     </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setHourTabMode('DECLARACAO_HORAS')}
+                      className={`py-2 px-2.5 rounded-lg text-xs font-bold transition-colors cursor-pointer text-left ${
+                        hourTabMode === 'DECLARACAO_HORAS'
+                          ? 'bg-teal-700 text-white shadow-xs'
+                          : 'text-slate-700 hover:bg-white/60'
+                      }`}
+                    >
+                      <div>2. Entrou tarde c/ Declaração</div>
+                      <div className="text-[10px] font-normal opacity-85">
+                        Abona horas c/ comprovante
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setHourTabMode('ATRASO_BH')}
+                      className={`py-2 px-2.5 rounded-lg text-xs font-bold transition-colors cursor-pointer text-left ${
+                        hourTabMode === 'ATRASO_BH'
+                          ? 'bg-red-600 text-white shadow-xs'
+                          : 'text-slate-700 hover:bg-white/60'
+                      }`}
+                    >
+                      <div>3. Atraso s/ Declaração</div>
+                      <div className="text-[10px] font-normal opacity-85">
+                        Desconta horas (-BH)
+                      </div>
+                    </button>
+
                     <button
                       type="button"
                       onClick={() => setHourTabMode('DESCONTO_BH')}
-                      className={`py-2 px-3 rounded-lg text-xs font-bold transition-colors cursor-pointer ${
+                      className={`py-2 px-2.5 rounded-lg text-xs font-bold transition-colors cursor-pointer text-left ${
                         hourTabMode === 'DESCONTO_BH'
-                          ? 'bg-emerald-600 text-white shadow-xs'
-                          : 'text-slate-600 hover:text-slate-900'
+                          ? 'bg-slate-900 text-white shadow-xs'
+                          : 'text-slate-700 hover:bg-white/60'
                       }`}
                     >
-                      - Conceder Folga (BH)
+                      <div>4. Folga Dia Inteiro (BH)</div>
+                      <div className="text-[10px] font-normal opacity-85">
+                        Marca BH e desconta plantão
+                      </div>
                     </button>
                   </div>
 
-                  {hourTabMode === 'CREDITO' ? (
-                    <>
-                      <div className="p-3.5 rounded-xl bg-teal-50 border border-teal-200 text-xs text-teal-900 flex items-start gap-2.5">
-                        <Clock className="w-4 h-4 text-teal-700 shrink-0 mt-0.5" />
+                  {hourTabMode === 'CREDITO' && (
+                    <div className="space-y-3">
+                      <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-950 flex items-start gap-2.5">
+                        <Clock className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
                         <span>
-                          As horas extras ou dobras registradas aqui são somadas automaticamente ao{' '}
-                          <strong>Banco de Horas</strong> de {editingCell.employee.name} (Saldo
-                          atual: {editingCell.employee.hourBankBalance >= 0 ? '+' : ''}
-                          {editingCell.employee.hourBankBalance}h).
+                          Registre quando {editingCell.employee.name.split(' ')[0]}{' '}
+                          <strong>ficou até mais tarde</strong> ou fez hora extra. O tempo é somado automaticamente ao Banco de Horas (Saldo atual:{' '}
+                          <strong>
+                            {editingCell.employee.hourBankBalance >= 0 ? '+' : ''}
+                            {editingCell.employee.hourBankBalance}h
+                          </strong>
+                          ).
                         </span>
                       </div>
 
+                      <div className="grid grid-cols-2 gap-3 bg-slate-50 p-3 rounded-xl border border-slate-200">
+                        <div>
+                          <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                            Horário Previsto de Saída
+                          </label>
+                          <input
+                            type="time"
+                            value={cellPlannedEnd}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setCellPlannedEnd(val);
+                              const diff = computeHoursDiffBetweenTimes(val, cellActualEnd);
+                              if (diff > 0) setExtraHoursInput(diff);
+                            }}
+                            className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white text-base font-bold text-slate-900 tabular-nums"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[11px] font-bold text-emerald-800 mb-1">
+                            Horário Real que Saiu
+                          </label>
+                          <input
+                            type="time"
+                            value={cellActualEnd}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setCellActualEnd(val);
+                              const diff = computeHoursDiffBetweenTimes(cellPlannedEnd, val);
+                              if (diff > 0) setExtraHoursInput(diff);
+                            }}
+                            className="w-full px-3 py-2 rounded-xl border-2 border-emerald-600 bg-white text-base font-bold text-slate-900 tabular-nums"
+                          />
+                        </div>
+                      </div>
+
                       <div>
-                        <label className="block text-xs font-bold text-slate-700 mb-1">
-                          Quantidade de Horas Extras a Somar (+)
+                        <label className="block text-xs font-bold text-slate-700 mb-1.5">
+                          Horas a Somar no Banco de Horas (+{formatDecimalHoursPtBr(extraHoursInput)})
                         </label>
-                        <input
-                          type="number"
-                          min={0.5}
-                          max={24}
-                          step={0.5}
-                          value={extraHoursInput}
-                          onChange={(e) => setExtraHoursInput(Number(e.target.value))}
-                          className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900 tabular-nums"
-                        />
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <input
+                            type="number"
+                            min={0.25}
+                            max={24}
+                            step={0.25}
+                            value={extraHoursInput}
+                            onChange={(e) => setExtraHoursInput(Number(e.target.value))}
+                            className="w-24 px-3 py-2 rounded-xl border border-slate-300 bg-white text-base font-bold text-slate-900 tabular-nums"
+                          />
+                          {[0.5, 1, 1.5, 2, 3, 4, 6, 12].map((preset) => (
+                            <button
+                              key={preset}
+                              type="button"
+                              onClick={() => setExtraHoursInput(preset)}
+                              className={`px-2.5 py-1.5 rounded-lg text-xs font-bold border cursor-pointer tabular-nums ${
+                                extraHoursInput === preset
+                                  ? 'bg-emerald-700 text-white border-emerald-800'
+                                  : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                              }`}
+                            >
+                              +{formatDecimalHoursPtBr(preset)}
+                            </button>
+                          ))}
+                        </div>
                       </div>
 
                       <div>
                         <label className="block text-xs font-bold text-slate-700 mb-1">
-                          Motivo da Dobra / Hora Extra
+                          Motivo / Observação (opcional)
                         </label>
                         <input
                           type="text"
                           value={cellNote}
                           onChange={(e) => setCellNote(e.target.value)}
-                          placeholder="Ex: Dobra para cobrir atestado na unidade"
+                          placeholder="Ex: Ficou até mais tarde para finalizar atendimento / cobrir setor..."
                           className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900"
                         />
                       </div>
-                    </>
-                  ) : (
+                    </div>
+                  )}
+
+                  {hourTabMode === 'DECLARACAO_HORAS' && (
+                    <div className="space-y-3">
+                      <div className="p-3.5 rounded-xl bg-teal-50 border border-teal-200 text-xs text-teal-950 flex items-start gap-2.5">
+                        <Clock className="w-4 h-4 text-teal-700 shrink-0 mt-0.5" />
+                        <span>
+                          Registre quando {editingCell.employee.name.split(' ')[0]}{' '}
+                          <strong>entrou mais tarde ou saiu mais cedo e entregou Declaração de Horas</strong>. As horas ficam <strong>abonadas</strong> (não desconta do Banco de Horas) e o horário real fica salvo no prontuário e na escala.
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setCellLateOrEarlyMode('ENTROU_MAIS_TARDE')}
+                          className={`py-2 px-3 rounded-xl border text-xs font-bold cursor-pointer ${
+                            cellLateOrEarlyMode === 'ENTROU_MAIS_TARDE'
+                              ? 'bg-teal-700 text-white border-teal-800'
+                              : 'bg-white text-slate-700 border-slate-300'
+                          }`}
+                        >
+                          Entrou mais tarde
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setCellLateOrEarlyMode('SAIU_MAIS_CEDO')}
+                          className={`py-2 px-3 rounded-xl border text-xs font-bold cursor-pointer ${
+                            cellLateOrEarlyMode === 'SAIU_MAIS_CEDO'
+                              ? 'bg-teal-700 text-white border-teal-800'
+                              : 'bg-white text-slate-700 border-slate-300'
+                          }`}
+                        >
+                          Saiu mais cedo
+                        </button>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-3 bg-slate-50 p-3 rounded-xl border border-slate-200">
+                        <div>
+                          <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                            {cellLateOrEarlyMode === 'ENTROU_MAIS_TARDE'
+                              ? 'Horário Previsto de Entrada'
+                              : 'Horário Previsto de Saída'}
+                          </label>
+                          <input
+                            type="time"
+                            value={
+                              cellLateOrEarlyMode === 'ENTROU_MAIS_TARDE'
+                                ? cellPlannedStart
+                                : cellPlannedEnd
+                            }
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              if (cellLateOrEarlyMode === 'ENTROU_MAIS_TARDE') {
+                                setCellPlannedStart(val);
+                                const diff = computeHoursDiffBetweenTimes(val, cellActualStart);
+                                if (diff > 0) setExtraHoursInput(diff);
+                              } else {
+                                setCellPlannedEnd(val);
+                                const diff = computeHoursDiffBetweenTimes(cellActualEnd, val);
+                                if (diff > 0) setExtraHoursInput(diff);
+                              }
+                            }}
+                            className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white text-base font-bold text-slate-900 tabular-nums"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[11px] font-bold text-teal-800 mb-1">
+                            {cellLateOrEarlyMode === 'ENTROU_MAIS_TARDE'
+                              ? 'Horário Real que Entrou'
+                              : 'Horário Real que Saiu'}
+                          </label>
+                          <input
+                            type="time"
+                            value={
+                              cellLateOrEarlyMode === 'ENTROU_MAIS_TARDE'
+                                ? cellActualStart
+                                : cellActualEnd
+                            }
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              if (cellLateOrEarlyMode === 'ENTROU_MAIS_TARDE') {
+                                setCellActualStart(val);
+                                const diff = computeHoursDiffBetweenTimes(cellPlannedStart, val);
+                                if (diff > 0) setExtraHoursInput(diff);
+                              } else {
+                                setCellActualEnd(val);
+                                const diff = computeHoursDiffBetweenTimes(val, cellPlannedEnd);
+                                if (diff > 0) setExtraHoursInput(diff);
+                              }
+                            }}
+                            className="w-full px-3 py-2 rounded-xl border-2 border-teal-600 bg-white text-base font-bold text-slate-900 tabular-nums"
+                          />
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-bold text-slate-700 mb-1.5">
+                          Horas Abonadas pela Declaração ({formatDecimalHoursPtBr(extraHoursInput)})
+                        </label>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <input
+                            type="number"
+                            min={0.25}
+                            max={12}
+                            step={0.25}
+                            value={extraHoursInput}
+                            onChange={(e) => setExtraHoursInput(Number(e.target.value))}
+                            className="w-24 px-3 py-2 rounded-xl border border-slate-300 bg-white text-base font-bold text-slate-900 tabular-nums"
+                          />
+                          {[0.5, 1, 1.5, 2, 3, 4].map((preset) => (
+                            <button
+                              key={preset}
+                              type="button"
+                              onClick={() => setExtraHoursInput(preset)}
+                              className={`px-2.5 py-1.5 rounded-lg text-xs font-bold border cursor-pointer tabular-nums ${
+                                extraHoursInput === preset
+                                  ? 'bg-teal-700 text-white border-teal-800'
+                                  : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                              }`}
+                            >
+                              {formatDecimalHoursPtBr(preset)}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setCellDeclarationDelivered(true)}
+                          className={`p-2.5 rounded-xl border text-left text-xs font-bold cursor-pointer flex items-center gap-2 ${
+                            cellDeclarationDelivered
+                              ? 'bg-teal-700 text-white border-teal-800'
+                              : 'bg-white text-slate-700 border-slate-300'
+                          }`}
+                        >
+                          <Check className="w-4 h-4 shrink-0" />
+                          <span>Entregou Declaração de Horas</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setCellDeclarationDelivered(false)}
+                          className={`p-2.5 rounded-xl border text-left text-xs font-bold cursor-pointer flex items-center gap-2 ${
+                            !cellDeclarationDelivered
+                              ? 'bg-amber-600 text-white border-amber-700'
+                              : 'bg-white text-slate-700 border-slate-300'
+                          }`}
+                        >
+                          <Clock className="w-4 h-4 shrink-0" />
+                          <span>Pendente entregar o papel</span>
+                        </button>
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-bold text-slate-700 mb-1">
+                          Observação (opcional)
+                        </label>
+                        <input
+                          type="text"
+                          value={cellNote}
+                          onChange={(e) => setCellNote(e.target.value)}
+                          placeholder="Ex: Consulta médica / exame laboratorial pela manhã..."
+                          className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900"
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {hourTabMode === 'ATRASO_BH' && (
+                    <div className="space-y-3">
+                      <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-xs text-red-950 flex items-start gap-2.5">
+                        <Clock className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                        <span>
+                          Registre quando {editingCell.employee.name.split(' ')[0]} entrou mais tarde ou saiu mais cedo <strong>sem declaração médica</strong>. As horas serão descontadas do Banco de Horas (Saldo atual:{' '}
+                          <strong>
+                            {editingCell.employee.hourBankBalance >= 0 ? '+' : ''}
+                            {editingCell.employee.hourBankBalance}h
+                          </strong>
+                          ).
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-3 bg-slate-50 p-3 rounded-xl border border-slate-200">
+                        <div>
+                          <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                            Horário Previsto de Entrada
+                          </label>
+                          <input
+                            type="time"
+                            value={cellPlannedStart}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setCellPlannedStart(val);
+                              const diff = computeHoursDiffBetweenTimes(val, cellActualStart);
+                              if (diff > 0) setExtraHoursInput(diff);
+                            }}
+                            className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white text-base font-bold text-slate-900 tabular-nums"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[11px] font-bold text-red-700 mb-1">
+                            Horário Real que Entrou
+                          </label>
+                          <input
+                            type="time"
+                            value={cellActualStart}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setCellActualStart(val);
+                              const diff = computeHoursDiffBetweenTimes(cellPlannedStart, val);
+                              if (diff > 0) setExtraHoursInput(diff);
+                            }}
+                            className="w-full px-3 py-2 rounded-xl border-2 border-red-500 bg-white text-base font-bold text-slate-900 tabular-nums"
+                          />
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-bold text-slate-700 mb-1.5">
+                          Horas a Descontar do Banco de Horas (-{formatDecimalHoursPtBr(extraHoursInput)})
+                        </label>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <input
+                            type="number"
+                            min={0.25}
+                            max={12}
+                            step={0.25}
+                            value={extraHoursInput}
+                            onChange={(e) => setExtraHoursInput(Number(e.target.value))}
+                            className="w-24 px-3 py-2 rounded-xl border border-slate-300 bg-white text-base font-bold text-slate-900 tabular-nums"
+                          />
+                          {[0.5, 1, 1.5, 2, 3, 4].map((preset) => (
+                            <button
+                              key={preset}
+                              type="button"
+                              onClick={() => setExtraHoursInput(preset)}
+                              className={`px-2.5 py-1.5 rounded-lg text-xs font-bold border cursor-pointer tabular-nums ${
+                                extraHoursInput === preset
+                                  ? 'bg-red-600 text-white border-red-700'
+                                  : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                              }`}
+                            >
+                              -{formatDecimalHoursPtBr(preset)}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-bold text-slate-700 mb-1">
+                          Observação (opcional)
+                        </label>
+                        <input
+                          type="text"
+                          value={cellNote}
+                          onChange={(e) => setCellNote(e.target.value)}
+                          placeholder="Ex: Entrou mais tarde por motivo particular (descontar do BH)"
+                          className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-base text-slate-900"
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {hourTabMode === 'DESCONTO_BH' && (
                     <>
                       <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-950 flex items-start gap-2.5">
                         <Clock className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
                         <span>
-                          Marca o dia na escala como <strong>BH (Banco de Horas)</strong> indicando que o colaborador foi dispensado e desconta automaticamente do saldo (Saldo atual:{' '}
+                          Marca o dia na escala como <strong>BH (Banco de Horas)</strong> indicando que o colaborador foi dispensado o dia todo e desconta automaticamente do saldo (Saldo atual:{' '}
                           <strong>
                             {editingCell.employee.hourBankBalance >= 0 ? '+' : ''}
                             {editingCell.employee.hourBankBalance}h
