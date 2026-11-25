@@ -50,6 +50,7 @@ import { CollaboratorsPage } from './components/CollaboratorsPage';
 import { HourBankPage } from './components/HourBankPage';
 import { ImportExportPage } from './components/ImportExportPage';
 import { SettingsPage } from './components/SettingsPage';
+import { Simulator5x2Page } from './components/Simulator5x2Page';
 import { EmployeeModal } from './components/EmployeeModal';
 import { QuickLeaveWizardModal } from './components/QuickLeaveWizardModal';
 import { usePWAInstall } from './hooks/usePWAInstall';
@@ -64,6 +65,7 @@ import {
   LayoutDashboard,
   LogOut,
   RefreshCw,
+  Scale,
   Settings,
   UserPlus,
   Users,
@@ -73,6 +75,7 @@ import {
 const NAV_ITEMS: { id: PageId; label: string; shortLabel: string; icon: React.FC<{ className?: string }> }[] = [
   { id: 'inicio', label: 'Início · Plantão Hoje', shortLabel: 'Início', icon: LayoutDashboard },
   { id: 'escala', label: 'Escala Mensal', shortLabel: 'Escala', icon: CalendarDays },
+  { id: 'simulador_5x2', label: 'Simulador 5x2 (Nova Lei)', shortLabel: 'Simular 5x2', icon: Scale },
   { id: 'colaboradores', label: 'Colaboradores', shortLabel: 'Equipe', icon: Users },
   { id: 'banco_horas', label: 'Banco de Horas', shortLabel: 'Banco', icon: Clock },
   { id: 'importar', label: 'Importar / Exportar', shortLabel: 'Arquivos', icon: FileUp },
@@ -1523,6 +1526,51 @@ export default function App() {
             />
           )}
 
+          {navContext.activePage === 'simulador_5x2' && (
+            <Simulator5x2Page
+              state={state}
+              onApplySimulated5x2ToMainSchedule={({
+                rows,
+                convertSelectedTo5x2Regime,
+                workHoursOverride,
+              }) => {
+                const payload = rows
+                  .map((r) => {
+                    const matched = state.employees.find(
+                      (e) =>
+                        e.active &&
+                        normalizeEmpLookup(e.name) === normalizeEmpLookup(r.name)
+                    );
+                    if (!matched) return null;
+                    const cells = Object.entries(r.dayShifts).map(([isoKey, status]) => {
+                      const { year, monthIndex0, day } = parseIsoDateParts(isoKey);
+                      return {
+                        ymKey: getYearMonthKey(year, monthIndex0),
+                        day,
+                        status,
+                        note: 'Aplicado pelo Simulador 5x2 (Nova Lei)',
+                      };
+                    });
+                    return {
+                      employeeId: matched.id,
+                      updatedRegime: convertSelectedTo5x2Regime
+                        ? ('5x2' as ScheduleRegime)
+                        : undefined,
+                      updatedWorkHours: convertSelectedTo5x2Regime
+                        ? workHoursOverride
+                        : undefined,
+                      cells,
+                    };
+                  })
+                  .filter((item): item is NonNullable<typeof item> => item !== null);
+
+                if (payload.length > 0) {
+                  handleApplyImportedSchedule(payload);
+                }
+              }}
+            />
+          )}
+
           {navContext.activePage === 'colaboradores' && (
             <CollaboratorsPage
               state={state}
@@ -1581,9 +1629,9 @@ export default function App() {
         </main>
       </div>
 
-      {/* BARRA DE NAVEGAÇÃO INFERIOR FIXA (BOTTOM TAB BAR COM 6 ABAS NO MOBILE < 768px) */}
+      {/* BARRA DE NAVEGAÇÃO INFERIOR FIXA (BOTTOM TAB BAR COM 7 ABAS NO MOBILE < 768px) */}
       <nav className="no-print md:hidden fixed bottom-0 left-0 right-0 z-30 bg-white/95 backdrop-blur-md border-t border-slate-200 pb-safe">
-        <div className="grid grid-cols-6 items-center h-16">
+        <div className="grid grid-cols-7 items-center h-16">
           {NAV_ITEMS.map((item) => {
             const Icon = item.icon;
             const isActive = navContext.activePage === item.id;
@@ -1597,7 +1645,7 @@ export default function App() {
                 }`}
               >
                 <Icon className="w-4 h-4" />
-                <span className="text-[10px] font-bold tracking-tight mt-1 whitespace-nowrap">
+                <span className="text-[9.5px] font-bold tracking-tight mt-1 whitespace-nowrap">
                   {item.shortLabel}
                 </span>
               </button>

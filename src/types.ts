@@ -1,6 +1,7 @@
 export type PageId =
   | 'inicio'
   | 'escala'
+  | 'simulador_5x2'
   | 'colaboradores'
   | 'banco_horas'
   | 'importar'
