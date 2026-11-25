@@ -11,9 +11,11 @@ import {
 } from '../types';
 import {
   buildFortnightCycleSlots,
+  computeHoursDiffBetweenTimes,
   getDaysInMonth,
   getNextYearMonth,
   getYearMonthKey,
+  parseEmployeeWorkHours,
 } from '../services/storageService';
 import {
   AlertTriangle,
@@ -208,7 +210,44 @@ export const Simulator5x2Page: React.FC<Simulator5x2PageProps> = ({
   );
   const [lawStageId, setLawStageId] = useState<LawStageId>('NOVA_LEI_36H_CONSECUTIVAS');
   const [operationWorkHours, setOperationWorkHours] = useState<string>('08:00 às 17:00');
+  const [manualStartTime, setManualStartTime] = useState<string>('08:00');
+  const [manualEndTime, setManualEndTime] = useState<string>('17:00');
   const [shiftCodeToAssign, setShiftCodeToAssign] = useState<'D' | 'N'>('D');
+
+  const handleManualTimePickerChange = (newStart: string, newEnd: string) => {
+    setManualStartTime(newStart);
+    setManualEndTime(newEnd);
+    if (newStart && newEnd) {
+      setOperationWorkHours(`${newStart} às ${newEnd}`);
+    }
+  };
+
+  const handleManualTextHoursChange = (val: string) => {
+    setOperationWorkHours(val);
+    const parsed = parseEmployeeWorkHours(val);
+    if (parsed.plannedStart && parsed.plannedEnd) {
+      setManualStartTime(parsed.plannedStart);
+      setManualEndTime(parsed.plannedEnd);
+    }
+  };
+
+  const activeLawRule = useMemo(
+    () => LAW_STAGES.find((s) => s.id === lawStageId) || LAW_STAGES[1],
+    [lawStageId]
+  );
+
+  const effectiveDailyShiftHours = useMemo(() => {
+    const parsed = parseEmployeeWorkHours(operationWorkHours);
+    const rawDiff = computeHoursDiffBetweenTimes(parsed.plannedStart, parsed.plannedEnd);
+    if (rawDiff > 0 && rawDiff <= 24) {
+      // Se o turno diário tiver 8h ou 9h brutas (ex: 08:00 às 17:00 com 1h de almoço), considera 1h de intervalo intrajornada acima de 8h30
+      if (rawDiff >= 8.5 && rawDiff <= 10) {
+        return Math.round((rawDiff - 1) * 10) / 10;
+      }
+      return Math.round(rawDiff * 10) / 10;
+    }
+    return activeLawRule.dailyShiftHours;
+  }, [operationWorkHours, activeLawRule.dailyShiftHours]);
 
   // Dias de atendimento da operação (0 = Dom .. 6 = Sáb) e Mínimo de pessoas por dia da semana
   const [operatingDays, setOperatingDays] = useState<Record<number, boolean>>({
@@ -251,11 +290,6 @@ export const Simulator5x2Page: React.FC<Simulator5x2PageProps> = ({
   // Feedback e confirmação de aplicação na escala oficial
   const [feedbackBanner, setFeedbackBanner] = useState<string | null>(null);
   const [convertRegimeTo5x2OnApply, setConvertRegimeTo5x2OnApply] = useState<boolean>(true);
-
-  const activeLawRule = useMemo(
-    () => LAW_STAGES.find((s) => s.id === lawStageId) || LAW_STAGES[1],
-    [lawStageId]
-  );
 
   // Slots do período selecionado (Ciclo Quinzenal 16..15 ou Mês Civil 01..30/31)
   const cycleSlots: ScheduleCycleSlot[] = useMemo(() => {
@@ -718,7 +752,7 @@ export const Simulator5x2Page: React.FC<Simulator5x2PageProps> = ({
 
       const avgWorkDaysPerWeek = workDays / totalWeeksInPeriod;
       const estimatedWeeklyHours =
-        Math.round(avgWorkDaysPerWeek * activeLawRule.dailyShiftHours * 10) / 10;
+        Math.round(avgWorkDaysPerWeek * effectiveDailyShiftHours * 10) / 10;
 
       if (estimatedWeeklyHours > activeLawRule.maxWeeklyHours + 1) {
         issues.push({
@@ -754,6 +788,7 @@ export const Simulator5x2Page: React.FC<Simulator5x2PageProps> = ({
     selectedSimEmployees,
     simGrid,
     activeLawRule,
+    effectiveDailyShiftHours,
   ]);
 
   // Exporta a simulação 5x2 para CSV (compatível com Excel)
@@ -978,8 +1013,8 @@ export const Simulator5x2Page: React.FC<Simulator5x2PageProps> = ({
               </p>
             </div>
 
-            {/* Setor, Período e Horário */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            {/* Setor e Turno */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">
                   Setor / Unidade
@@ -1000,23 +1035,6 @@ export const Simulator5x2Page: React.FC<Simulator5x2PageProps> = ({
 
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">
-                  Horário da Equipe 5x2
-                </label>
-                <select
-                  value={operationWorkHours}
-                  onChange={(e) => setOperationWorkHours(e.target.value)}
-                  className="w-full px-3 py-2.5 rounded-xl border border-slate-300 bg-white text-base font-semibold text-slate-900"
-                >
-                  {WORK_HOURS_PRESETS.map((wh) => (
-                    <option key={wh} value={wh}>
-                      {wh}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-700 mb-1">
                   Turno na Grade
                 </label>
                 <select
@@ -1027,6 +1045,96 @@ export const Simulator5x2Page: React.FC<Simulator5x2PageProps> = ({
                   <option value="D">Plantão Diurno (D)</option>
                   <option value="N">Plantão Noturno (N)</option>
                 </select>
+              </div>
+            </div>
+
+            {/* Horário da Equipe 5x2 (Entrada/Saída manual, digitação livre ou sugestão rápida) */}
+            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+                <label className="text-xs font-bold text-slate-800">
+                  Horário da Equipe 5x2 (Digite manualmente ou escolha abaixo)
+                </label>
+                <span className="text-[11px] font-bold text-teal-700 tabular-nums">
+                  Jornada estimada: ~{effectiveDailyShiftHours}h/dia
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5 items-end">
+                <div className="sm:col-span-3">
+                  <label className="block text-[11px] font-bold text-slate-600 mb-1">
+                    Entrada
+                  </label>
+                  <input
+                    type="time"
+                    value={manualStartTime}
+                    onChange={(e) =>
+                      handleManualTimePickerChange(e.target.value, manualEndTime)
+                    }
+                    className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-white text-base font-bold text-slate-900 tabular-nums"
+                  />
+                </div>
+
+                <div className="sm:col-span-3">
+                  <label className="block text-[11px] font-bold text-slate-600 mb-1">
+                    Saída
+                  </label>
+                  <input
+                    type="time"
+                    value={manualEndTime}
+                    onChange={(e) =>
+                      handleManualTimePickerChange(manualStartTime, e.target.value)
+                    }
+                    className="w-full px-2.5 py-2 rounded-xl border border-slate-300 bg-white text-base font-bold text-slate-900 tabular-nums"
+                  />
+                </div>
+
+                <div className="sm:col-span-6">
+                  <label className="block text-[11px] font-bold text-slate-600 mb-1">
+                    Horário Manual (Texto Livre)
+                  </label>
+                  <input
+                    type="text"
+                    list="work-hours-5x2-presets"
+                    value={operationWorkHours}
+                    onChange={(e) => handleManualTextHoursChange(e.target.value)}
+                    placeholder="Ex: 07:30 às 16:30 ou 08:00 às 17:00 (1h almoço)"
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 bg-white text-base font-semibold text-slate-900"
+                  />
+                  <datalist id="work-hours-5x2-presets">
+                    {WORK_HOURS_PRESETS.map((wh) => (
+                      <option key={wh} value={wh} />
+                    ))}
+                  </datalist>
+                </div>
+              </div>
+
+              {/* Atalhos rápidos de horário */}
+              <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                <span className="text-[11px] font-semibold text-slate-500 mr-1">
+                  Sugestões rápidas:
+                </span>
+                {[
+                  '08:00 às 17:00',
+                  '07:00 às 16:00',
+                  '07:30 às 16:30',
+                  '08:00 às 16:00',
+                  '07:00 às 13:00',
+                  '13:00 às 19:00',
+                  '14:00 às 22:00',
+                ].map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    onClick={() => handleManualTextHoursChange(preset)}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors cursor-pointer tabular-nums ${
+                      operationWorkHours === preset
+                        ? 'bg-[#0d9488] text-white'
+                        : 'bg-white hover:bg-slate-100 text-slate-700 border border-slate-200'
+                    }`}
+                  >
+                    {preset}
+                  </button>
+                ))}
               </div>
             </div>
 
